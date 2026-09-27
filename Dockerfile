@@ -23,11 +23,14 @@ RUN cargo build --release --locked -p remux-server \
 FROM ghcr.io/lostb1t/remux:latest
 
 # Do not set PORT here. RunxBuild injects the service port at runtime.
+#
+# RunxBuild persistent storage is mounted at /data, so every piece of Remux
+# state that must survive redeploys/restarts needs to live below /data.
 ENV HOST=0.0.0.0 \
-    DATA_DIR=/app/data \
-    DATABASE_URL=sqlite:///app/data/db.sqlite?mode=rwc \
-    LOG_FILE=/app/data/logs/remux.jsonl \
-    TORRENT_DATA_DIR=/app/data/torrents \
+    DATA_DIR=/data \
+    DATABASE_URL=sqlite:///data/db.sqlite?mode=rwc \
+    LOG_FILE=/data/logs/remux.jsonl \
+    TORRENT_DATA_DIR=/data/torrents \
     WEB_PATH=/app/jellyfin-web \
     DASHBOARD_PATH=/app/dashboard
 
@@ -35,15 +38,12 @@ WORKDIR /app
 
 COPY --from=server-builder /src/target/release/remux-server /app/remux-server
 
-# Free-tier test mode: no persistent volume is required.
-# Use /app/data rather than /tmp because the base image/platform may provide
-# special tmpfs semantics or permissions at runtime.
-RUN mkdir -p /app/data/logs /app/data/torrents \
-    && chmod -R 777 /app/data
-
 EXPOSE 3000
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=45s --retries=3 \
     CMD curl -fsS "http://127.0.0.1:3000/health" || exit 1
 
-CMD ["./remux-server"]
+# Create required directories after RunxBuild mounts the persistent /data volume,
+# then start Remux. This avoids creating them only in an image layer that can be
+# hidden by the runtime volume mount.
+CMD ["/bin/sh", "-c", "mkdir -p /data/logs /data/torrents && exec /app/remux-server"]
