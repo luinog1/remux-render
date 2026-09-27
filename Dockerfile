@@ -24,20 +24,24 @@ FROM ghcr.io/lostb1t/remux:latest
 
 ENV HOST=0.0.0.0 \
     PORT=3000 \
-    DATA_DIR=/tmp/remux \\
-    DATABASE_URL=sqlite:///tmp/remux/db.sqlite?mode=rwc \\
-    LOG_FILE=/tmp/remux/logs/remux.jsonl \\
-    DATA_DIR=/tmp/remux \\
+    DATA_DIR=/tmp/remux \
+    DATABASE_URL=sqlite:///tmp/remux/db.sqlite?mode=rwc \
+    LOG_FILE=/tmp/remux/logs/remux.jsonl \
+    TORRENT_DATA_DIR=/tmp/remux/torrents \
     WEB_PATH=/app/jellyfin-web \
     DASHBOARD_PATH=/app/dashboard
 
 WORKDIR /app
-COPY --from=server-builder /src/target/release/remux-server /app/remux-server
-RUN mkdir -p /tmp/remux/logs /tmp/remux/torrents && chmod -R 777 /tmp/remux
 
-# No VOLUME in the free/ephemeral test mode. Set DATA_DIR and DATABASE_URL to /data when persistent storage is attached.
+COPY --from=server-builder /src/target/release/remux-server /app/remux-server
+
+# Free-tier test mode: no persistent volume is required.
+RUN mkdir -p /tmp/remux/logs /tmp/remux/torrents \
+    && chmod -R 777 /tmp/remux
+
 EXPOSE 3000
+
 HEALTHCHECK --interval=30s --timeout=5s --start-period=45s --retries=3 \
-    CMD curl -fsS "http://127.0.0.1:${PORT}/health" || exit 1
+    CMD curl -fsS "http://127.0.0.1:3000/health" || exit 1
 
 CMD ["./remux-server"]
