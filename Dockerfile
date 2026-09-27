@@ -24,18 +24,18 @@ FROM ghcr.io/lostb1t/remux:latest
 
 ENV HOST=0.0.0.0 \
     PORT=3000 \
-    DATA_DIR=/data \
-    DATABASE_URL=sqlite:///data/db.sqlite?mode=rwc \
-    LOG_FILE=/data/logs/remux.jsonl \
-    TORRENT_DATA_DIR=/data/torrents \
+    DATA_DIR=/tmp/remux \\
+    DATABASE_URL=sqlite:///tmp/remux/db.sqlite?mode=rwc \\
+    LOG_FILE=/tmp/remux/logs/remux.jsonl \\
+    DATA_DIR=/tmp/remux \\
     WEB_PATH=/app/jellyfin-web \
     DASHBOARD_PATH=/app/dashboard
 
 WORKDIR /app
 COPY --from=server-builder /src/target/release/remux-server /app/remux-server
-RUN mkdir -p /data/logs /data/torrents
+RUN mkdir -p /tmp/remux/logs /tmp/remux/torrents && chmod -R 777 /tmp/remux
 
-VOLUME ["/data"]
+# No VOLUME in the free/ephemeral test mode. Set DATA_DIR and DATABASE_URL to /data when persistent storage is attached.
 EXPOSE 3000
 HEALTHCHECK --interval=30s --timeout=5s --start-period=45s --retries=3 \
     CMD curl -fsS "http://127.0.0.1:${PORT}/health" || exit 1
