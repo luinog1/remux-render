@@ -1,10 +1,25 @@
 # RunxBuild deployment
 
-This repository now includes a root `Dockerfile` specifically for RunxBuild.
+This repository includes a root `Dockerfile` for testing `remux-server` on RunxBuild.
+
+## Current free-tier test mode
+
+The Dockerfile intentionally uses a writable ephemeral directory:
+
+```
+DATA_DIR=/tmp/remux
+DATABASE_URL=sqlite:///tmp/remux/db.sqlite?mode=rwc
+LOG_FILE=/tmp/remux/logs/remux.jsonl
+TORRENT_DATA_DIR=/tmp/remux/torrents
+```
+
+This is because the first RunxBuild test is being performed **without Persistent Storage**. The application can therefore boot and be tested, but the database/configuration will not survive replacement of the container.
+
+Do **not** configure the service's `PORT` manually to another value. Let RunxBuild provide its runtime port; the image defaults to 3000.
 
 ## RunxBuild settings
 
-Create a **Web Service** from this GitHub repository and use:
+Create a Web Service from this repository:
 
 - Production branch: `main`
 - Build type: `Docker`
@@ -12,60 +27,42 @@ Create a **Web Service** from this GitHub repository and use:
 - Predeploy command: empty
 - Output directory: empty
 - Start command: empty
-- HTTP port: use the platform-provided `PORT`
 
-RunxBuild automatically builds the root `Dockerfile` and uses its `CMD`.
+RunxBuild builds the root `Dockerfile` and uses its `CMD`.
 
-## Persistent data
+## Persistent mode later
 
-Enable **Persistent Storage** for the service and mount the volume at:
+When a Persistent Storage volume is available, mount it at:
 
 ```
 /data
 ```
 
-The Remux configuration/database is already configured for this path:
+and set these environment variables in RunxBuild:
 
 ```
-DATABASE_URL=sqlite:///data/db.sqlite?mode=rwc
 DATA_DIR=/data
+DATABASE_URL=sqlite:///data/db.sqlite?mode=rwc
 LOG_FILE=/data/logs/remux.jsonl
 TORRENT_DATA_DIR=/data/torrents
 ```
 
-Do not move the database outside `/data`, otherwise it will be lost when the service is replaced.
-
-## What this Dockerfile does
-
-The repository's normal Docker workflow expects pre-built `remux-server`, dashboard and Jellyfin Web artifacts. That is inconvenient for a platform that builds directly from GitHub.
-
-The new root Dockerfile:
-
-1. builds `remux-server` from this fork;
-2. reuses the official Remux runtime image for ffmpeg, dashboard and Jellyfin Web assets;
-3. replaces the runtime server binary with the binary built from this repository;
-4. keeps all mutable application data under `/data`.
-
-This avoids rebuilding the large Jellyfin Web and dashboard projects inside every RunxBuild deployment.
+The Remux server uses SQLite and expects the database to be writable at that location.
 
 ## First test
 
-After the service is live, check:
+After deployment, verify:
 
 ```
 /health
 ```
 
-Then open the service URL. The Remux admin UI is normally available at:
+Then:
 
 ```
 /admin/
 ```
 
-Create the initial account/library configuration and restart/redeploy the service. The SQLite database at `/data/db.sqlite` should remain intact because `/data` is the persistent mount.
+The first test should confirm that the server starts, the dashboard is served, users can be created, and addons/libraries can be configured.
 
-## Important free-tier limitation
-
-RunxBuild's current Starter plan includes 350 instance-hours/month and 120 GB/month bandwidth. Its pricing page lists databases as unlimited, but that refers to managed database instances; this Remux build uses SQLite on the service's persistent storage instead.
-
-Persistent storage is listed separately as usage-based storage, so verify the storage charge shown by the RunxBuild dashboard before treating this setup as permanently zero-cost.
+After a restart/replacement, the current free-tier test data is expected to be lost because it lives in `/tmp/remux`.
