@@ -1,68 +1,105 @@
 # RunxBuild deployment
 
-This repository includes a root `Dockerfile` for testing `remux-server` on RunxBuild.
+This repository is prepared for RunxBuild with Remux state stored under /data.
 
-## Current free-tier test mode
+## Persistence layout
 
-The Dockerfile intentionally uses a writable ephemeral directory:
+RunxBuild Persistent Storage should be attached to:
 
-```
-DATA_DIR=/tmp/remux
-DATABASE_URL=sqlite:///tmp/remux/db.sqlite?mode=rwc
-LOG_FILE=/tmp/remux/logs/remux.jsonl
-TORRENT_DATA_DIR=/tmp/remux/torrents
-```
+    /data
 
-This is because the first RunxBuild test is being performed **without Persistent Storage**. The application can therefore boot and be tested, but the database/configuration will not survive replacement of the container.
+The Dockerfile already configures Remux to use the persistent path:
 
-Do **not** configure the service's `PORT` manually to another value. Let RunxBuild provide its runtime port; the image defaults to 3000.
+    DATA_DIR=/data
+    DATABASE_URL=sqlite:///data/db.sqlite?mode=rwc
+    LOG_FILE=/data/logs/remux.jsonl
+    TORRENT_DATA_DIR=/data/torrents
 
-## RunxBuild settings
+The SQLite database at /data/db.sqlite is the important state store: users, addons, libraries, settings, and other Remux configuration are persisted there.
 
-Create a Web Service from this repository:
+Transcode-session files and torrent data are also placed below /data.
 
-- Production branch: `main`
-- Build type: `Docker`
+## RunxBuild service settings
+
+Create/use a Web Service from this repository with:
+
+- Production branch: main
+- Build type: Docker
 - Build command: empty
 - Predeploy command: empty
 - Output directory: empty
 - Start command: empty
 
-RunxBuild builds the root `Dockerfile` and uses its `CMD`.
+RunxBuild builds the root Dockerfile and uses its Docker CMD.
 
-## Persistent mode later
+Do not override PORT. RunxBuild supplies the runtime service port.
 
-When a Persistent Storage volume is available, mount it at:
+The Dockerfile binds Remux to:
 
-```
-/data
-```
+    HOST=0.0.0.0
 
-and set these environment variables in RunxBuild:
+and exposes container port 3000.
 
-```
-DATA_DIR=/data
-DATABASE_URL=sqlite:///data/db.sqlite?mode=rwc
-LOG_FILE=/data/logs/remux.jsonl
-TORRENT_DATA_DIR=/data/torrents
-```
+## Persistent Storage
 
-The Remux server uses SQLite and expects the database to be writable at that location.
+Add a Persistent Storage volume in RunxBuild.
 
-## First test
+Use the storage path:
 
-After deployment, verify:
+    /data
 
-```
-/health
-```
+No application data should be configured under /app/data or /tmp/remux.
 
-Then:
+At container startup the Dockerfile creates:
 
-```
-/admin/
-```
+    /data/logs
+    /data/torrents
 
-The first test should confirm that the server starts, the dashboard is served, users can be created, and addons/libraries can be configured.
+after the persistent volume is mounted.
 
-After a restart/replacement, the current free-tier test data is expected to be lost because it lives in `/tmp/remux`.
+## Environment variables
+
+The persistence-related variables are already built into the image, so they do not need to be entered manually in RunxBuild.
+
+The effective values are:
+
+    DATA_DIR=/data
+    DATABASE_URL=sqlite:///data/db.sqlite?mode=rwc
+    LOG_FILE=/data/logs/remux.jsonl
+    TORRENT_DATA_DIR=/data/torrents
+
+Do not replace these with /app/data or /tmp/remux.
+
+## First deployment
+
+After deploying with Persistent Storage attached, verify:
+
+    /health
+    /admin/
+
+Then create/configure the Remux users, addons and libraries.
+
+To verify persistence, restart/redeploy the service without deleting the Persistent Storage volume. The same SQLite database at /data/db.sqlite must be reused, so Remux should come back with the existing configuration.
+
+## Important: Persistent Storage does not prevent OOM
+
+Persistent Storage protects the database/configuration from container replacement. It does not increase the service RAM limit.
+
+The free RunxBuild instance previously reached:
+
+    OOMKilled (exit 137)
+
+during heavy library-refresh activity. If that happens again, the container can restart, but the Remux state stored in /data remains intact as long as the Persistent Storage volume is preserved.
+
+For the 512 MB free instance, consider disabling expensive startup refresh tasks while testing:
+
+    DISABLE_STARTUP_TASKS=true
+
+This variable is optional and is not required for persistence.
+
+## Data migration from the previous ephemeral deployment
+
+If the previous deployment used /app/data, its database was outside the RunxBuild Persistent Storage path and therefore was ephemeral.
+
+After switching to /data, the old database is not automatically copied. A migration requires access to the old db.sqlite file before the old container/data is discarded.
+
