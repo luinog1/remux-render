@@ -22,12 +22,12 @@ RUN cargo build --release --locked -p remux-server \
 
 FROM ghcr.io/lostb1t/remux:latest
 
+# Do not set PORT here. RunxBuild injects the service port at runtime.
 ENV HOST=0.0.0.0 \
-    PORT=3000 \
-    DATA_DIR=/tmp/remux \
-    DATABASE_URL=sqlite:///tmp/remux/db.sqlite?mode=rwc \
-    LOG_FILE=/tmp/remux/logs/remux.jsonl \
-    TORRENT_DATA_DIR=/tmp/remux/torrents \
+    DATA_DIR=/app/data \
+    DATABASE_URL=sqlite:///app/data/db.sqlite?mode=rwc \
+    LOG_FILE=/app/data/logs/remux.jsonl \
+    TORRENT_DATA_DIR=/app/data/torrents \
     WEB_PATH=/app/jellyfin-web \
     DASHBOARD_PATH=/app/dashboard
 
@@ -36,8 +36,10 @@ WORKDIR /app
 COPY --from=server-builder /src/target/release/remux-server /app/remux-server
 
 # Free-tier test mode: no persistent volume is required.
-RUN mkdir -p /tmp/remux/logs /tmp/remux/torrents \
-    && chmod -R 777 /tmp/remux
+# Use /app/data rather than /tmp because the base image/platform may provide
+# special tmpfs semantics or permissions at runtime.
+RUN mkdir -p /app/data/logs /app/data/torrents \
+    && chmod -R 777 /app/data
 
 EXPOSE 3000
 
