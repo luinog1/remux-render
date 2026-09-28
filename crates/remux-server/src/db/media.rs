@@ -6297,6 +6297,29 @@ impl Media {
             .then(|| server_config.and_then(|c| c.release_date_threshold()))
             .flatten();
 
+        // Jellyfin list/catalog requests commonly ask for People/Genres/Studios
+        // via Fields even though the response is a page of many items. Loading
+        // every relation for a page turns a 16–500 item catalog request into
+        // thousands of relation rows (and a second image query for all related
+        // entities). The dedicated /Items/{id} detail path loads full relations
+        // when they are actually needed, so keep list queries lightweight.
+        let allow_relations_for_list = filter
+            .ids
+            .as_ref()
+            .map(|ids| ids.len() == 1)
+            .unwrap_or(false);
+        let requested_relations = filter
+            .fields
+            .as_deref()
+            .map(|f| {
+                f.contains(&api::ItemFields::People)
+                    || f.contains(&api::ItemFields::Genres)
+                    || f.contains(&api::ItemFields::Studios)
+                    || f.contains(&api::ItemFields::ProductionLocations)
+            })
+            .unwrap_or(false);
+        let include_relations = allow_relations_for_list && requested_relations;
+
         let user_policy_filter = user_policy.and_then(|p| {
             p.filter_rules
                 .as_ref()
@@ -6346,16 +6369,7 @@ impl Media {
                         .as_deref()
                         .map(|f| f.contains(&api::ItemFields::ChildCount))
                         .unwrap_or(false),
-                include_relations: filter
-                    .fields
-                    .as_deref()
-                    .map(|f| {
-                        f.contains(&api::ItemFields::People)
-                            || f.contains(&api::ItemFields::Genres)
-                            || f.contains(&api::ItemFields::Studios)
-                            || f.contains(&api::ItemFields::ProductionLocations)
-                    })
-                    .unwrap_or(false),
+                include_relations,
                 total_count,
                 user_state,
                 genre_ids,
