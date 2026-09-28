@@ -26,13 +26,21 @@ FROM ghcr.io/lostb1t/remux:latest
 #
 # RunxBuild persistent storage is mounted at /data, so every piece of Remux
 # state that must survive redeploys/restarts needs to live below /data.
+#
+# The free RunxBuild instance is resource-constrained. RefreshLibrary has a
+# StartupTrigger and can perform large catalog imports + metadata writes while
+# the Jellyfin API is already serving requests. On a slow SQLite volume this
+# can starve the API, producing the long query/pool waits seen in production.
+# Keep the daily trigger enabled; users can also start a refresh manually from
+# the Remux UI after the instance is idle.
 ENV HOST=0.0.0.0 \
     DATA_DIR=/data \
     DATABASE_URL=sqlite:///data/db.sqlite?mode=rwc \
     LOG_FILE=/data/logs/remux.jsonl \
     TORRENT_DATA_DIR=/data/torrents \
     WEB_PATH=/app/jellyfin-web \
-    DASHBOARD_PATH=/app/dashboard
+    DASHBOARD_PATH=/app/dashboard \
+    DISABLE_STARTUP_TASKS=true
 
 WORKDIR /app
 
