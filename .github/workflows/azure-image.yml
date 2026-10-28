@@ -2,6 +2,14 @@ name: Build Azure Docker Image
 
 on:
   workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "crates/**"
+      - "Dockerfile"
+      - ".github/workflows/azure-image.yml"
 
 permissions:
   contents: read
