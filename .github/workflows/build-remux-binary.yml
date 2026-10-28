@@ -1,0 +1,76 @@
+name: Build DockHosting Remux binary
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "crates/**"
+      - ".github/workflows/build-remux-binary.yml"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout current fork
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Apply AIOMetadata auto-library adaptation
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path("crates/remux-server/src/addons/stremio.rs")
+          src = path.read_text()
+          needle = """        Ok(manifest
+                      .catalogs
+                      .into_iter()"""
+          replacement = """        // DockHosting: auto-enable newly published AIOMetadata catalogs.
+                  // Persisted per-catalog overrides still win in resolve_catalogs().
+                  let auto_enable_catalogs = self
+                      .manifest_url
+                      .to_string()
+                      .contains("aiometadata.fortheweak.cloud");
+
+                  Ok(manifest
+                      .catalogs
+                      .into_iter()"""
+          if needle not in src:
+              raise SystemExit("upstream Stremio catalog layout changed")
+          src = src.replace(needle, replacement, 1)
+          needle = """                CatalogInfo {
+                              collection_media_kind:"""
+          replacement = """                CatalogInfo {
+                              default_enabled: auto_enable_catalogs,
+                              collection_media_kind:"""
+          if needle not in src:
+              raise SystemExit("upstream CatalogInfo layout changed")
+          path.write_text(src.replace(needle, replacement, 1))
+          PY
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends pkg-config libssl-dev
+
+      - name: Build remux-server
+        env:
+          SQLX_OFFLINE: "true"
+        run: cargo build --release --locked -p remux-server
+
+      - name: Publish DockHosting release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          strip target/release/remux-server
+          cp target/release/remux-server remux-server-linux-amd64
+          chmod +x remux-server-linux-amd64
+          sha256sum remux-server-linux-amd64 > remux-server-linux-amd64.sha256
+          gh release delete dockhosting-bin --repo "${GITHUB_REPOSITORY}" --yes --cleanup-tag || true
+          gh release create dockhosting-bin --repo "${GITHUB_REPOSITORY}" --title "DockHosting Remux binary" --notes "Current remux-render main with DockHosting AIOMetadata adaptation." --prerelease remux-server-linux-amd64 remux-server-linux-amd64.sha256
