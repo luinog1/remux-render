@@ -279,6 +279,11 @@ impl CatalogAddon for StremioAddon {
         let manifest = svc
             .get_manifest()
             .await?;
+        let auto_enable_catalogs = self
+            .manifest_url
+            .to_string()
+            .contains("aiometadata.fortheweak.cloud");
+
         Ok(manifest
             .catalogs
             .into_iter()
@@ -314,6 +319,7 @@ impl CatalogAddon for StremioAddon {
                         ),
                     );
                 CatalogInfo {
+                    default_enabled: auto_enable_catalogs,
                     collection_media_kind: matches!(
                         c.kind
                             .trim()
