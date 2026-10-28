@@ -22,38 +22,6 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Apply AIOMetadata auto-library adaptation
-        run: |
-          python3 - <<'PY'
-          from pathlib import Path
-          path = Path("crates/remux-server/src/addons/stremio.rs")
-          src = path.read_text()
-          needle = """        Ok(manifest
-                      .catalogs
-                      .into_iter()"""
-          replacement = """        // DockHosting: auto-enable newly published AIOMetadata catalogs.
-                  // Persisted per-catalog overrides still win in resolve_catalogs().
-                  let auto_enable_catalogs = self
-                      .manifest_url
-                      .to_string()
-                      .contains("aiometadata.fortheweak.cloud");
-
-                  Ok(manifest
-                      .catalogs
-                      .into_iter()"""
-          if needle not in src:
-              raise SystemExit("upstream Stremio catalog layout changed")
-          src = src.replace(needle, replacement, 1)
-          needle = """                CatalogInfo {
-                              collection_media_kind:"""
-          replacement = """                CatalogInfo {
-                              default_enabled: auto_enable_catalogs,
-                              collection_media_kind:"""
-          if needle not in src:
-              raise SystemExit("upstream CatalogInfo layout changed")
-          path.write_text(src.replace(needle, replacement, 1))
-          PY
-
       - name: Install build dependencies
         run: |
           sudo apt-get update
