@@ -92,6 +92,7 @@ where
                     | db::MediaKind::Series
                     | db::MediaKind::Artist
                     | db::MediaKind::TvChannel
+                    | db::MediaKind::TvProgram
                     | db::MediaKind::Album
                     | db::MediaKind::Track
                     | db::MediaKind::Playlist
@@ -181,6 +182,7 @@ where
         // they actually appeared in the catalog.
         let mut item_weights: Vec<(Uuid, i64)> = items
             .iter()
+            .filter(|item| item.kind != db::MediaKind::TvProgram)
             .map(|item| {
                 let w = catalog_position;
                 catalog_position += 1;
@@ -192,6 +194,13 @@ where
         let (new_items, existing_items): (Vec<db::Media>, Vec<db::Media>) = items
             .into_iter()
             .partition(|m| !existing_ids.contains(&m.id));
+        let new_item_kinds: Vec<db::MediaKind> = new_items
+            .iter()
+            .map(|item| {
+                item.kind
+                    .clone()
+            })
+            .collect();
 
         debug!(
             catalog = media_id,
@@ -213,17 +222,72 @@ where
         // so anything keyed on them (catalog membership rows below, the
         // stale-member diff, series reconciliation) must be remapped through
         // this or it silently targets a row that was never written.
-        let id_remap = match ctx
+        // Rows that point at a parent in the same chunk (a scheduled Stremio
+        // listing's program under its channel, local music's albums under their
+        // artist and tracks under their album) are persisted after it, so the
+        // parent foreign key is valid; `process_meta_batch` otherwise runs items
+        // concurrently. Each stage remaps its parent ids, since a parent can
+        // adopt an existing row's id.
+        let is_child = |item: &db::Media| {
+            item.parent_id
+                .is_some()
+                && matches!(
+                    item.kind,
+                    db::MediaKind::TvProgram
+                        | db::MediaKind::Album
+                        | db::MediaKind::Track
+                )
+        };
+        let (children, new_roots): (Vec<db::Media>, Vec<db::Media>) = new_items
+            .into_iter()
+            .partition(is_child);
+        let (tracks, albums_and_programs): (Vec<db::Media>, Vec<db::Media>) = children
+            .into_iter()
+            .partition(|item| item.kind == db::MediaKind::Track);
+        let mut id_remap = match ctx
             .addons
-            .process_meta_batch(new_items.clone(), ctx, true, None)
+            .process_meta_batch(new_roots, ctx, true, None)
             .await
         {
             Ok(map) => map,
             Err(e) => {
-                error!(catalog = media_id, error = %e, "failed to process new items chunk");
+                error!(catalog = media_id, error = %e, "failed to process new catalog roots chunk");
                 continue;
             }
         };
+        let mut failed = false;
+        for (stage, label) in [
+            (albums_and_programs, "albums and programs"),
+            (tracks, "tracks"),
+        ] {
+            let mut stage = stage;
+            for item in &mut stage {
+                for parent in [&mut item.parent_id, &mut item.grandparent_id] {
+                    if let Some(id) = *parent {
+                        *parent = Some(
+                            *id_remap
+                                .get(&id)
+                                .unwrap_or(&id),
+                        );
+                    }
+                }
+            }
+            match ctx
+                .addons
+                .process_meta_batch(stage, ctx, true, None)
+                .await
+            {
+                Ok(stage_remap) => id_remap.extend(stage_remap),
+                Err(e) => {
+                    error!(catalog = media_id, error = %e, "failed to process new catalog {label} chunk");
+                    failed = true;
+                    break;
+                }
+            }
+        }
+        if failed {
+            continue;
+        }
         let remap = |id: Uuid| {
             id_remap
                 .get(&id)
@@ -242,20 +306,23 @@ where
             db::reconcile_series_played_state(&ctx.db, remap(id)).await;
         }
 
-        // Re-upsert already-known TV channels too (skipping the metadata-fetch step
+        // Re-upsert already-known live-TV rows too (skipping the metadata-fetch step
         // `process_meta_batch` does for new items — a no-op for this kind anyway).
         // Without this, a channel's `updated_at` is frozen from its first import, so
         // the stale-channel prune in `prune_stale_iptv_channels` would treat every
-        // still-present channel as stale and delete it. Other kinds (movie/series/
+        // still-present channel or program as stale and delete it. Other kinds (movie/series/
         // etc.) deliberately skip this to avoid re-running their (real) metadata fetch.
-        let existing_tv_channels: Vec<db::Media> = existing_items
+        let existing_live_tv: Vec<db::Media> = existing_items
             .iter()
-            .filter(|m| m.kind == db::MediaKind::TvChannel)
+            .filter(|m| {
+                m.kind
+                    .is_live_tv()
+            })
             .cloned()
             .collect();
-        if !existing_tv_channels.is_empty() {
-            if let Err(e) = db::Media::upsert(&ctx.db, &existing_tv_channels).await {
-                warn!(catalog = media_id, error = %e, "failed to refresh existing tv channels");
+        if !existing_live_tv.is_empty() {
+            if let Err(e) = db::Media::upsert(&ctx.db, &existing_live_tv).await {
+                warn!(catalog = media_id, error = %e, "failed to refresh existing live TV rows");
             }
         }
 
@@ -349,13 +416,19 @@ where
             }
 
             if !catalog_tags.is_empty() {
-                let tag_rows: Vec<(Uuid, &String)> = new_items
+                let tag_rows: Vec<(Uuid, &String)> = item_weights
                     .iter()
-                    .chain(existing_items.iter())
-                    .flat_map(|item| {
+                    .map(|(item_id, _)| item_id)
+                    .chain(
+                        existing_items
+                            .iter()
+                            .filter(|item| item.kind != db::MediaKind::TvProgram)
+                            .map(|item| &item.id),
+                    )
+                    .flat_map(|item_id| {
                         catalog_tags
                             .iter()
-                            .map(move |tag| (item.id, tag))
+                            .map(move |tag| (*item_id, tag))
                     })
                     .collect();
 
@@ -383,23 +456,21 @@ where
         .instrument(debug_span!(target: "remux_server::metadata_refresh", "write_relations"))
         .await;
 
-        for item in new_items.iter() {
+        for kind in &new_item_kinds {
             *new_counts
-                .entry(
-                    item.kind
-                        .to_string(),
-                )
+                .entry(kind.to_string())
                 .or_insert(0) += 1;
         }
-        for item in new_items
+        for kind in new_item_kinds
             .iter()
-            .chain(existing_items.iter())
+            .chain(
+                existing_items
+                    .iter()
+                    .map(|item| &item.kind),
+            )
         {
             *counts
-                .entry(
-                    item.kind
-                        .to_string(),
-                )
+                .entry(kind.to_string())
                 .or_insert(0) += 1;
         }
         total = counts
@@ -740,5 +811,121 @@ mod tests {
         assert_eq!(new_counts.get(&db::MediaKind::Series.to_string()), Some(&1));
         let members: Vec<Uuid> = sqlx::query_scalar("SELECT right_media_id FROM media_relations WHERE left_media_id = ? AND role = 'catalog'").bind(collection_id).fetch_all(&ctx.db).await.unwrap();
         assert_eq!(members, vec![fresh_id]);
+    }
+
+    /// Local music emits an artist, its albums and their tracks in one chunk.
+    /// `process_meta_batch` runs items concurrently, so children must be saved
+    /// after their parents or the parent foreign key rejects them.
+    #[tokio::test]
+    async fn catalog_import_saves_music_parents_before_children() {
+        let (_server, guard) = crate::integration_test::new_test_server()
+            .await
+            .unwrap();
+        let ctx = &guard.0;
+        let addon_id = Uuid::new_v4();
+        let collection_id = Uuid::new_v5(&addon_id, b"music");
+        let catalog = ResolvedCatalog {
+            provider_catalog_id: "music".into(),
+            catalog_id: format!("addon:{addon_id}:music"),
+            collection_id,
+            name: "Music".into(),
+            media_kind: Some(db::MediaKind::Track),
+            collection_media_kind: None,
+            enabled: true,
+            max_items: None,
+            tags: vec![],
+        };
+        let mut collection = db::Media {
+            id: collection_id,
+            kind: db::MediaKind::Collection,
+            title: "Music".into(),
+            ..Default::default()
+        };
+        collection
+            .save(&ctx.db)
+            .await
+            .unwrap();
+
+        let custom = |key: &str| db::ExternalIds {
+            custom_stremio_id: Some(key.to_string()),
+            ..Default::default()
+        };
+        let artist = db::Media {
+            id: Uuid::new_v4(),
+            kind: db::MediaKind::Artist,
+            title: "Artist".into(),
+            external_ids: custom("test:artist"),
+            ..Default::default()
+        };
+        let albums: Vec<db::Media> = (0..3)
+            .map(|i| db::Media {
+                id: Uuid::new_v4(),
+                kind: db::MediaKind::Album,
+                title: format!("Album {i}"),
+                parent_id: Some(artist.id),
+                grandparent_id: Some(artist.id),
+                external_ids: custom(&format!("test:album:{i}")),
+                ..Default::default()
+            })
+            .collect();
+        let tracks: Vec<db::Media> = albums
+            .iter()
+            .flat_map(|album| {
+                (0..3).map(move |i| db::Media {
+                    id: Uuid::new_v4(),
+                    kind: db::MediaKind::Track,
+                    title: format!("{} Track {i}", album.title),
+                    parent_id: Some(album.id),
+                    grandparent_id: album.parent_id,
+                    external_ids: custom(&format!("test:track:{}:{i}", album.title)),
+                    ..Default::default()
+                })
+            })
+            .collect();
+        // Children first on purpose: the import must not depend on stream order.
+        let items: Vec<db::Media> = tracks
+            .iter()
+            .chain(albums.iter())
+            .chain(std::iter::once(&artist))
+            .cloned()
+            .collect();
+
+        let progress = ProgressReporter::new(Default::default());
+        import_catalog_items(
+            ctx,
+            &catalog,
+            &catalog.catalog_id,
+            100,
+            futures::stream::iter(items),
+            &progress,
+        )
+        .await
+        .unwrap();
+
+        let count = |kind: &'static str| {
+            let db = ctx
+                .db
+                .clone();
+            async move {
+                sqlx::query_scalar::<_, i64>(
+                    "SELECT COUNT(*) FROM media WHERE CAST(kind AS TEXT) = ?",
+                )
+                .bind(kind)
+                .fetch_one(&db)
+                .await
+                .unwrap()
+            }
+        };
+        assert_eq!(count("artist").await, 1);
+        assert_eq!(count("album").await, 3);
+        assert_eq!(count("track").await, 9);
+        let orphans: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM media t WHERE CAST(t.kind AS TEXT) = 'track' \
+             AND (t.parent_id IS NULL OR NOT EXISTS (SELECT 1 FROM media a WHERE a.id = t.parent_id))",
+        )
+        .fetch_one(&ctx.db)
+        .await
+        .unwrap();
+        assert_eq!(orphans, 0, "every track must link to a saved album");
     }
 }

@@ -416,8 +416,16 @@ pub struct AddonDto {
     #[serde(default)]
     pub http_redirect_stream: bool,
     #[serde(default)]
+    pub subtitle_extraction: bool,
+    #[serde(default)]
+    pub probe_on_scan: bool,
+    #[serde(default)]
     pub service_filter: Vec<String>,
     pub description: Option<String>,
+    /// The addon's manifest could not be fetched when it was loaded, so the
+    /// supported resources/types shown are the static fallback.
+    #[serde(default)]
+    pub manifest_unreachable: bool,
     pub created_at: NaiveDateTime,
     pub updated_at: NaiveDateTime,
 }
@@ -451,6 +459,8 @@ pub struct UpdateAddonRequest {
     pub priority: Option<i64>,
     pub is_default: Option<bool>,
     pub http_redirect_stream: Option<bool>,
+    pub subtitle_extraction: Option<bool>,
+    pub probe_on_scan: Option<bool>,
     pub service_filter: Option<Vec<String>>,
 }
 
@@ -517,17 +527,44 @@ where
 pub enum DefaultWebClient {
     #[default]
     Jellyfin,
+    Remux,
 }
 
 impl DefaultWebClient {
+    pub const ALL: [Self; 2] = [Self::Jellyfin, Self::Remux];
+
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Jellyfin => "jellyfin",
+            Self::Remux => "remux",
         }
     }
 
-    pub fn from_str_lossy(_value: &str) -> Self {
-        Self::Jellyfin
+    /// Where the server mounts this client.
+    pub const fn path(self) -> &'static str {
+        match self {
+            Self::Jellyfin => "/web/",
+            Self::Remux => "/remux/",
+        }
+    }
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Jellyfin => "Jellyfin Web",
+            Self::Remux => "Remux Web",
+        }
+    }
+
+    /// Unknown values (an older or hand-edited config) fall back to Jellyfin.
+    pub fn from_str_lossy(value: &str) -> Self {
+        match value
+            .trim()
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "remux" => Self::Remux,
+            _ => Self::Jellyfin,
+        }
     }
 }
 
@@ -907,8 +944,9 @@ pub struct EncodingOptions {
     /// policy flag.
     #[default(Some(true))]
     pub enable_audio_transcoding: Option<bool>,
-    /// Allow container remuxing (video=copy, audio=copy). When false, only
-    /// direct play is served. Stacks AND with the per-user EnablePlaybackRemuxing
+    /// Allow container remuxing (video=copy, audio=copy). When false, a pure
+    /// remux request falls back to direct play; permitted audio/video re-encoding
+    /// remains available. Stacks AND with the per-user EnablePlaybackRemuxing
     /// policy flag.
     #[default(Some(true))]
     pub enable_remuxing: Option<bool>,
@@ -917,9 +955,12 @@ pub struct EncodingOptions {
     /// Defaults to false.
     #[default(Some(false))]
     pub normalize_audio_loudness: Option<bool>,
-    /// Controls how embedded subtitle streams unsupported by the client are handled.
-    /// Burn: encode into video (default). Extract: serve via Stream.js/VTT endpoint.
-    /// Strip: remove from media source so the client never sees them.
+    /// Fallback for an unsupported embedded subtitle when extraction isn't
+    /// attempted — extraction only ever happens for local sources, so this
+    /// always applies to remote ones, and to local ones when extraction
+    /// itself failed.
+    /// Burn: encode into video (default). Strip: remove from media source so
+    /// the client never sees them.
     #[default(Some(EmbeddedSubtitleHandling::Burn))]
     pub subtitle_mode: Option<EmbeddedSubtitleHandling>,
 }
@@ -942,13 +983,19 @@ pub struct EncodingOptions {
 #[strum(serialize_all = "PascalCase")]
 pub enum EmbeddedSubtitleHandling {
     /// Burn unsupported embedded subtitles into the video during transcoding.
+    /// This is the fallback when extraction isn't attempted — extraction
+    /// itself is no longer a chosen mode, it's attempted automatically for
+    /// local files and never for remote ones.
     #[default]
     Burn,
-    /// Extract and deliver unsupported embedded subtitles via the subtitle stream
-    /// endpoint (Stream.js / Stream.vtt). May be slow for remote sources.
-    Extract,
-    /// Remove unsupported embedded subtitle streams from the media source entirely.
-    /// No transcoding is triggered for subtitles; they simply won't be available.
+    /// Remove unsupported embedded subtitle streams from the media source
+    /// entirely when extraction isn't attempted. No transcoding is triggered
+    /// for subtitles; they simply won't be available.
+    ///
+    /// Accepts the removed `Extract` value as a legacy alias for existing
+    /// installs — closest original intent, since both mean "don't burn in".
+    #[serde(alias = "Extract")]
+    #[strum(to_string = "Strip", serialize = "Extract")]
     Strip,
 }
 
@@ -1049,6 +1096,15 @@ pub struct JellyfinItem {
 
 impl ServerConfiguration {
     const DEFAULT_TMDB_KEY: &'static str = "eyJhbGciOiJIUzI1NiJ9.eyJhdWQiOiIwZDczZTBjYjkxZjM5ZTY3MGIwZWZhNjkxM2FmYmQ1OCIsIm5iZiI6MTUzMjkzOTA3My41MzcsInN1YiI6IjViNWVjYjQxMGUwYTI2MmU5MDA0NjNjMCIsInNjb3BlcyI6WyJhcGlfcmVhZCJdLCJ2ZXJzaW9uIjoxfQ.vfOGe8_35CxhjjZXdnR2iAwdOMIY0VFYMBQrLWuRqn8";
+
+    /// Cap on a single addon call, from `addon_fetch_timeout_secs` (default 5 s, at least 1 s).
+    pub fn addon_fetch_timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(
+            self.addon_fetch_timeout_secs
+                .unwrap_or(5)
+                .max(1) as u64,
+        )
+    }
 
     pub fn get_tmdb_key(&self) -> &str {
         self.tmdb_api_key
@@ -1526,8 +1582,13 @@ pub struct GetItemsQuery {
     #[serde(default, deserialize_with = "deserialize_option_bool_from_anything")]
     pub has_trailer: Option<bool>,
     pub adjacent_to: Option<String>,
+    pub season: Option<i64>,
+    pub parent_index_number: Option<i64>,
     pub index_number: Option<i64>,
     pub start_index: Option<u32>,
+    /// Defaults to [`DEFAULT_ITEMS_LIMIT`] when a request omits it, so a bare
+    /// `/items` cannot load the whole library.
+    #[serde(default = "default_items_limit")]
     pub limit: Option<u32>,
     pub search_term: Option<String>,
     /// Emby `AnyProviderIdEquals` — `Tmdb.123,Imdb.tt456,Tvdb.789`.
@@ -1727,6 +1788,52 @@ pub struct GetItemsQuery {
     /// Regular Jellyfin clients never send this; it is used by the admin dashboard.
     #[serde(default, deserialize_with = "deserialize_option_bool_from_anything")]
     pub include_childless: Option<bool>,
+    /// Remux extension: only items on (`true`) or off (`false`) the user's
+    /// watchlist. `Filters=IsWatchlist` is the same as `true`.
+    #[serde(default, deserialize_with = "deserialize_option_bool_from_anything")]
+    pub is_watchlist: Option<bool>,
+    /// Remux extension: only items the user ignores (`true`) or does not
+    /// ignore (`false`). `Filters=IsIgnored` is the same as `true`.
+    #[serde(default, deserialize_with = "deserialize_option_bool_from_anything")]
+    pub is_ignored: Option<bool>,
+}
+
+impl GetItemsQuery {
+    /// The watchlist constraint, from `IsWatchlist=` or `Filters=IsWatchlist`.
+    pub fn watchlist(&self) -> Option<bool> {
+        self.is_watchlist
+            .or_else(|| {
+                self.filters
+                    .as_deref()
+                    .unwrap_or(&[])
+                    .contains(&ItemFilter::IsWatchlist)
+                    .then_some(true)
+            })
+    }
+
+    /// The ignore constraint, from `IsIgnored=` or `Filters=IsIgnored`.
+    pub fn ignored(&self) -> Option<bool> {
+        self.is_ignored
+            .or_else(|| {
+                self.filters
+                    .as_deref()
+                    .unwrap_or(&[])
+                    .contains(&ItemFilter::IsIgnored)
+                    .then_some(true)
+            })
+    }
+
+    /// The favorite constraint, from `IsFavorite=` or `Filters=IsFavorite`.
+    pub fn favorite(&self) -> Option<bool> {
+        self.is_favorite
+            .or_else(|| {
+                self.filters
+                    .as_deref()
+                    .unwrap_or(&[])
+                    .contains(&ItemFilter::IsFavorite)
+                    .then_some(true)
+            })
+    }
 }
 
 impl GetItemsQuery {
@@ -2007,7 +2114,7 @@ where
 }
 
 #[query]
-#[derive(Default, Debug)]
+#[derive(Default, Debug, Serialize)]
 pub struct VideoStreamQuery {
     pub container: Option<String>,
     #[serde(alias = "static", alias = "Static")]
@@ -2059,14 +2166,14 @@ pub struct VideoStreamQuery {
     pub audio_stream_index: Option<i64>,
     pub video_stream_index: Option<i64>,
     pub context: Option<String>,
-    #[serde(skip_deserializing)]
+    #[serde(skip_deserializing, skip_serializing)]
     pub stream_options: Option<std::collections::HashMap<String, Option<String>>>,
     pub enable_audio_vbr_encoding: Option<bool>,
     pub always_burn_in_subtitle_when_transcoding: Option<bool>,
     pub live_stream_id: Option<String>,
 }
 
-#[derive(Default, Debug, Serialize, Deserialize, Clone)]
+#[derive(Default, Debug, Serialize, Deserialize, Clone, PartialEq)]
 #[serde(rename_all = "PascalCase", default)]
 pub struct TranscodingProfile {
     #[serde(deserialize_with = "deser_opt_video_container")]
@@ -2086,7 +2193,7 @@ pub struct TranscodingProfile {
     pub type_: Option<DlnaProfileType>,
 }
 
-#[derive(Default, Debug, Serialize, Deserialize, Clone)]
+#[derive(Default, Debug, Serialize, Deserialize, Clone, PartialEq)]
 #[serde(rename_all = "PascalCase", default)]
 pub struct DeviceProfile {
     pub name: Option<String>,
@@ -2101,7 +2208,7 @@ pub struct DeviceProfile {
     pub subtitle_profiles: Vec<SubtitleProfile>,
 }
 
-#[derive(Default, Debug, Serialize, Deserialize, Clone)]
+#[derive(Default, Debug, Serialize, Deserialize, Clone, PartialEq)]
 #[serde(rename_all = "PascalCase", default)]
 pub struct DirectPlayProfile {
     #[serde(
@@ -2123,7 +2230,7 @@ pub struct DirectPlayProfile {
     pub type_: Option<DlnaProfileType>,
 }
 
-#[derive(Default, Debug, Serialize, Deserialize, Clone)]
+#[derive(Default, Debug, Serialize, Deserialize, Clone, PartialEq)]
 #[serde(rename_all = "PascalCase", default)]
 pub struct ContainerProfile {
     #[serde(rename = "Type")]
@@ -2132,7 +2239,7 @@ pub struct ContainerProfile {
     pub conditions: Vec<ProfileCondition>,
 }
 
-#[derive(Default, Debug, Serialize, Deserialize, Clone)]
+#[derive(Default, Debug, Serialize, Deserialize, Clone, PartialEq)]
 #[serde(rename_all = "PascalCase", default)]
 pub struct CodecProfile {
     #[serde(rename = "Type")]
@@ -2144,7 +2251,7 @@ pub struct CodecProfile {
     pub apply_conditions: Vec<ProfileCondition>,
 }
 
-#[derive(Default, Debug, Serialize, Deserialize, Clone)]
+#[derive(Default, Debug, Serialize, Deserialize, Clone, PartialEq)]
 #[serde(rename_all = "PascalCase", default)]
 pub struct SubtitleProfile {
     pub format: Option<String>,
@@ -2248,7 +2355,7 @@ impl<'de> Deserialize<'de> for ProfileConditionProperty {
     }
 }
 
-#[derive(Default, Debug, Serialize, Deserialize, Clone)]
+#[derive(Default, Debug, Serialize, Deserialize, Clone, PartialEq)]
 #[serde(rename_all = "PascalCase", default)]
 pub struct ProfileCondition {
     pub condition: Option<ProfileConditionType>,
@@ -2292,7 +2399,7 @@ pub struct PlaybackInfoQuery {
 }
 
 #[query]
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Serialize)]
 pub struct ImageQuery {
     pub tag: Option<String>,
     /// Scale down to fit within box width, no upscale, maintain AR.
@@ -3473,6 +3580,34 @@ pub struct UserPolicy {
     pub sync_play_access: SyncPlayUserAccessType,
 }
 
+impl UserPolicy {
+    /// Whether this policy hides any content from the user: filter rules, a
+    /// parental rating limit, or blocked/allowed tags. `CollectionId` rules
+    /// only hide collection rows, not content, so they don't count.
+    pub fn restricts_content(&self) -> bool {
+        self.filter_rules
+            .iter()
+            .flat_map(|f| &f.groups)
+            .flat_map(|g| &g.rules)
+            .any(|r| !matches!(r, FilterRule::CollectionId { .. }))
+            || self
+                .max_parental_rating
+                .is_some()
+            || !self
+                .blocked_tags
+                .is_empty()
+            || !self
+                .allowed_tags
+                .is_empty()
+    }
+}
+
+pub const DEFAULT_ITEMS_LIMIT: u32 = 250;
+
+fn default_items_limit() -> Option<u32> {
+    Some(DEFAULT_ITEMS_LIMIT)
+}
+
 fn default_true() -> bool {
     true
 }
@@ -3776,7 +3911,7 @@ impl From<stremio::MediaType> for MediaKind {
             stremio::MediaType::Album => Self::Album,
             stremio::MediaType::Artist => Self::Artist,
             stremio::MediaType::Track => Self::Track,
-            stremio::MediaType::Events => Self::TvProgram,
+            stremio::MediaType::Events => Self::TvChannel,
             stremio::MediaType::Other(s) => match s.as_str() {
                 "episode" => Self::Episode,
                 "season" => Self::Season,
@@ -4123,6 +4258,22 @@ pub struct RemuxInfo {
     pub collection_default_sort: Option<Vec<ItemSortBy>>,
     pub collection_default_sort_order: Option<Vec<SortOrder>>,
     pub image_config: Option<CollectionImageConfig>,
+    /// Stored display order (`DisplayOrder` sort); `None` sorts last.
+    pub sort_order: Option<i64>,
+    /// Whether the requesting user has this item on their watchlist.
+    pub watchlist: Option<bool>,
+    /// Whether the requesting user ignores this item.
+    pub ignored: Option<bool>,
+}
+
+/// A user's remux-only marks on one item, as returned by the watchlist and
+/// ignore endpoints.
+#[dto]
+pub struct RemuxUserFlags {
+    #[default(false)]
+    pub watchlist: bool,
+    #[default(false)]
+    pub ignored: bool,
 }
 
 #[dto]
@@ -4345,6 +4496,12 @@ pub struct ClientCapabilitiesDto {
     pub supported_commands: Vec<String>,
     pub supports_media_control: bool,
     pub supports_persistent_identifier: bool,
+    #[serde(default)]
+    pub device_profile: Option<DeviceProfile>,
+    #[serde(default)]
+    pub app_store_url: Option<String>,
+    #[serde(default)]
+    pub icon_url: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, default2::Default, Serialize, Deserialize)]
@@ -4469,6 +4626,10 @@ pub enum ItemFilter {
     Likes,
     Dislikes,
     IsFavoriteOrLikes,
+    /// Remux extension.
+    IsWatchlist,
+    /// Remux extension.
+    IsIgnored,
 }
 
 #[derive(
@@ -4592,6 +4753,8 @@ pub enum ItemSortBy {
     AirTime,
     Studio,
     IsFavoriteOrLiked,
+    /// Remux extension: when the item was added to the user's watchlist.
+    DateWatchlisted,
     DateLastContentAdded,
     SeriesDatePlayed,
     ParentIndexNumber,
@@ -7021,6 +7184,17 @@ pub fn language_label(code: &str) -> String {
         .unwrap_or_else(|| code.to_string())
 }
 
+/// Human-readable label for a [`StreamRule::Bitrate`] condition, e.g. `"> 8.00 Mbps"`.
+pub fn format_bitrate_rule(op: NumericOp, value: i64) -> String {
+    let sym = match op {
+        NumericOp::Eq => "=",
+        NumericOp::NotEq => "≠",
+        NumericOp::Gt => ">",
+        NumericOp::Lt => "<",
+    };
+    format!("{sym} {:.2} Mbps", value as f64 / 1_000_000.0)
+}
+
 /// Human-readable label for a [`StreamRule::Size`] condition, e.g. `"> 18.63 GiB"`.
 pub fn format_size_rule(op: NumericOp, value: i64) -> String {
     let sym = match op {
@@ -7073,6 +7247,27 @@ pub enum StreamRule {
     Addon {
         op: SetOp,
         values: Vec<Uuid>,
+    },
+    /// Subtitle track language (ISO 639-2/B code). Matches if any embedded
+    /// subtitle stream in `probe_data`, or any subtitle the stream itself
+    /// advertises, has a listed language. With neither a match nor probe data
+    /// the stream passes the rule so unprobed sources are not silently dropped.
+    SubtitleLanguage {
+        op: SetOp,
+        values: Vec<String>,
+    },
+    /// Overall bitrate in bits per second: the probed bitrate, or the stream's
+    /// size over its runtime. A stream whose bitrate can't be worked out passes
+    /// the rule so it isn't silently dropped.
+    Bitrate {
+        op: NumericOp,
+        value: i64,
+    },
+    /// Whether the upstream service confirmed the stream is cached (`true`), or
+    /// confirmed it is not (`false`). A stream with no cache information
+    /// passes the rule so it isn't silently dropped.
+    Cached {
+        value: bool,
     },
 }
 
@@ -7257,6 +7452,649 @@ pub struct RefreshItemQuery {
 }
 
 // ---------------------------------------------------------------------------
+// Jellyfin client endpoints used by the web client
+// ---------------------------------------------------------------------------
+
+/// Marks (`favorite`) or unmarks an item as a favorite for a user.
+#[derive(Debug, Clone)]
+pub struct ToggleFavorite {
+    pub user_id: Uuid,
+    pub item_id: Uuid,
+    pub favorite: bool,
+}
+
+impl Endpoint for ToggleFavorite {
+    type Output = UserItemDataDto;
+
+    fn path(&self) -> String {
+        format!("/users/{}/favoriteitems/{}", self.user_id, self.item_id)
+    }
+
+    fn method(&self) -> Method {
+        if self.favorite {
+            Method::POST
+        } else {
+            Method::DELETE
+        }
+    }
+}
+
+/// Adds an item to (`watchlist`) or removes it from a user's watchlist.
+#[derive(Debug, Clone)]
+pub struct ToggleWatchlist {
+    pub user_id: Uuid,
+    pub item_id: Uuid,
+    pub watchlist: bool,
+}
+
+impl Endpoint for ToggleWatchlist {
+    type Output = RemuxUserFlags;
+
+    fn path(&self) -> String {
+        format!("/remux/users/{}/watchlist/{}", self.user_id, self.item_id)
+    }
+
+    fn method(&self) -> Method {
+        if self.watchlist {
+            Method::POST
+        } else {
+            Method::DELETE
+        }
+    }
+}
+
+/// Starts (`ignored`) or stops ignoring an item for a user.
+#[derive(Debug, Clone)]
+pub struct ToggleIgnored {
+    pub user_id: Uuid,
+    pub item_id: Uuid,
+    pub ignored: bool,
+}
+
+impl Endpoint for ToggleIgnored {
+    type Output = RemuxUserFlags;
+
+    fn path(&self) -> String {
+        format!("/remux/users/{}/ignored/{}", self.user_id, self.item_id)
+    }
+
+    fn method(&self) -> Method {
+        if self.ignored {
+            Method::POST
+        } else {
+            Method::DELETE
+        }
+    }
+}
+
+/// Marks (`played`) or unmarks an item as played for a user.
+#[derive(Debug, Clone)]
+pub struct TogglePlayed {
+    pub user_id: Uuid,
+    pub item_id: Uuid,
+    pub played: bool,
+}
+
+impl Endpoint for TogglePlayed {
+    type Output = UserItemDataDto;
+
+    fn path(&self) -> String {
+        format!("/users/{}/playeditems/{}", self.user_id, self.item_id)
+    }
+
+    fn method(&self) -> Method {
+        if self.played {
+            Method::POST
+        } else {
+            Method::DELETE
+        }
+    }
+}
+
+/// Query of `GET /Items/Filters` (Jellyfin `FilterController.GetQueryFiltersLegacy`).
+#[derive(Debug, Clone, Default, Serialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct ItemsFiltersQuery {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user_id: Option<Uuid>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_id: Option<Uuid>,
+    #[serde(
+        serialize_with = "serialize_comma_opt",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub include_item_types: Option<Vec<MediaType>>,
+    #[serde(
+        serialize_with = "serialize_comma_opt",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub media_types: Option<Vec<MediaType>>,
+}
+
+/// The genres, tags, years and official ratings available below a parent.
+#[derive(Debug, Clone, Default)]
+pub struct GetItemsFilters(pub ItemsFiltersQuery);
+
+impl Endpoint for GetItemsFilters {
+    type Output = QueryFiltersLegacy;
+
+    fn path(&self) -> String {
+        "/items/filters".into()
+    }
+
+    fn query_params(&self) -> impl serde::Serialize + '_ {
+        &self.0
+    }
+}
+
+/// Query of `GET /Items/Latest` (Jellyfin `UserLibraryController.GetLatestMedia`).
+#[derive(Debug, Clone, Default, Serialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct ItemsLatestQuery {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user_id: Option<Uuid>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_id: Option<Uuid>,
+    #[serde(
+        serialize_with = "serialize_comma_opt",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub fields: Option<Vec<ItemFields>>,
+    #[serde(
+        serialize_with = "serialize_comma_opt",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub include_item_types: Option<Vec<MediaType>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub is_played: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enable_images: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image_type_limit: Option<i64>,
+    #[serde(
+        serialize_with = "serialize_comma_opt",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub enable_image_types: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enable_user_data: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub group_items: Option<bool>,
+}
+
+/// Recently added items. Unlike the other list endpoints the response is a bare array.
+#[derive(Debug, Clone, Default)]
+pub struct GetItemsLatest(pub ItemsLatestQuery);
+
+impl Endpoint for GetItemsLatest {
+    type Output = Vec<BaseItemDto>;
+
+    fn path(&self) -> String {
+        "/items/latest".into()
+    }
+
+    fn query_params(&self) -> impl serde::Serialize + '_ {
+        &self.0
+    }
+}
+
+/// Query of `GET /Genres` (Jellyfin `GenresController.GetGenres`).
+#[derive(Debug, Clone, Default, Serialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct GenresQuery {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub start_index: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub search_term: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_id: Option<Uuid>,
+    #[serde(
+        serialize_with = "serialize_comma_opt",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub fields: Option<Vec<ItemFields>>,
+    #[serde(
+        serialize_with = "serialize_comma_opt",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub exclude_item_types: Option<Vec<MediaType>>,
+    #[serde(
+        serialize_with = "serialize_comma_opt",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub include_item_types: Option<Vec<MediaType>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub is_favorite: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image_type_limit: Option<i64>,
+    #[serde(
+        serialize_with = "serialize_comma_opt",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub enable_image_types: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user_id: Option<Uuid>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name_starts_with_or_greater: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name_starts_with: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name_less_than: Option<String>,
+    #[serde(
+        serialize_with = "serialize_comma_opt",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub sort_by: Option<Vec<ItemSortBy>>,
+    #[serde(
+        serialize_with = "serialize_comma_opt",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub sort_order: Option<Vec<SortOrder>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enable_images: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enable_total_record_count: Option<bool>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct GetGenres(pub GenresQuery);
+
+impl Endpoint for GetGenres {
+    type Output = QueryResult<BaseItemDto>;
+
+    fn path(&self) -> String {
+        "/genres".into()
+    }
+
+    fn query_params(&self) -> impl serde::Serialize + '_ {
+        &self.0
+    }
+}
+
+/// Query of `GET /Shows/NextUp` (Jellyfin `TvShowsController.GetNextUp`).
+#[derive(Debug, Clone, Default, Serialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct NextUpQuery {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user_id: Option<Uuid>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub start_index: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
+    #[serde(
+        serialize_with = "serialize_comma_opt",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub fields: Option<Vec<ItemFields>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub series_id: Option<Uuid>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_id: Option<Uuid>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enable_images: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image_type_limit: Option<i64>,
+    #[serde(
+        serialize_with = "serialize_comma_opt",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub enable_image_types: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enable_user_data: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_up_date_cutoff: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enable_total_record_count: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enable_resumable: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enable_rewatching: Option<bool>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct GetNextUp(pub NextUpQuery);
+
+impl Endpoint for GetNextUp {
+    type Output = QueryResult<BaseItemDto>;
+
+    fn path(&self) -> String {
+        "/shows/nextup".into()
+    }
+
+    fn query_params(&self) -> impl serde::Serialize + '_ {
+        &self.0
+    }
+}
+
+/// Body of `POST /Items/{id}/PlaybackInfo` (Jellyfin `PlaybackInfoDto`).
+#[skip_serializing_none]
+#[derive(Debug, Clone, Default, Serialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct PlaybackInfoRequest {
+    pub user_id: Option<Uuid>,
+    pub max_streaming_bitrate: Option<i64>,
+    pub start_time_ticks: Option<i64>,
+    pub audio_stream_index: Option<i32>,
+    pub subtitle_stream_index: Option<i32>,
+    pub max_audio_channels: Option<i32>,
+    pub media_source_id: Option<String>,
+    pub live_stream_id: Option<String>,
+    pub device_profile: Option<DeviceProfile>,
+    pub enable_direct_play: Option<bool>,
+    pub enable_direct_stream: Option<bool>,
+    pub enable_transcoding: Option<bool>,
+    pub allow_video_stream_copy: Option<bool>,
+    pub allow_audio_stream_copy: Option<bool>,
+    pub auto_open_live_stream: Option<bool>,
+}
+
+/// Named `GetPlaybackInfo` because [`PlaybackInfo`] is the playback *report* type.
+#[derive(Debug, Clone)]
+pub struct GetPlaybackInfo {
+    pub item_id: Uuid,
+    pub request: PlaybackInfoRequest,
+}
+
+impl Endpoint for GetPlaybackInfo {
+    type Output = PlaybackInfoResponse;
+
+    fn path(&self) -> String {
+        format!("/items/{}/playbackinfo", self.item_id)
+    }
+
+    fn method(&self) -> Method {
+        Method::POST
+    }
+
+    fn body(&self) -> Body {
+        Body::Json(serde_json::to_value(&self.request).unwrap_or_default())
+    }
+}
+
+/// Query shared by the display preferences endpoints. `client` is required by Jellyfin.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "PascalCase")]
+struct DisplayPreferencesQuery<'a> {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    user_id: Option<Uuid>,
+    client: &'a str,
+}
+
+#[derive(Debug, Clone)]
+pub struct GetDisplayPreferences {
+    pub id: String,
+    pub user_id: Option<Uuid>,
+    pub client: String,
+}
+
+impl Endpoint for GetDisplayPreferences {
+    type Output = DisplayPreferencesDto;
+
+    fn path(&self) -> String {
+        format!("/displaypreferences/{}", self.id)
+    }
+
+    fn query_params(&self) -> impl serde::Serialize + '_ {
+        DisplayPreferencesQuery {
+            user_id: self.user_id,
+            client: &self.client,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct SetDisplayPreferences {
+    pub id: String,
+    pub user_id: Option<Uuid>,
+    pub client: String,
+    pub preferences: DisplayPreferencesDto,
+}
+
+impl Endpoint for SetDisplayPreferences {
+    type Output = ();
+
+    fn path(&self) -> String {
+        format!("/displaypreferences/{}", self.id)
+    }
+
+    fn method(&self) -> Method {
+        Method::POST
+    }
+
+    fn query_params(&self) -> impl serde::Serialize + '_ {
+        DisplayPreferencesQuery {
+            user_id: self.user_id,
+            client: &self.client,
+        }
+    }
+
+    fn body(&self) -> Body {
+        Body::Json(serde_json::to_value(&self.preferences).unwrap_or_default())
+    }
+}
+
+/// Serializes a query struct with PascalCase keys, the way Jellyfin spells them.
+/// `#[query]` structs keep snake_case field names for serializing.
+fn pascal_case_query<T: Serialize>(query: &T) -> Vec<(String, String)> {
+    let encoded = serde_urlencoded::to_string(query).unwrap_or_default();
+    serde_urlencoded::from_str::<Vec<(String, String)>>(&encoded)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(key, value)| {
+            let key = key
+                .trim_end_matches('_')
+                .split('_')
+                .map(|word| {
+                    let mut chars = word.chars();
+                    chars
+                        .next()
+                        .map(|c| {
+                            c.to_ascii_uppercase()
+                                .to_string()
+                                + chars.as_str()
+                        })
+                        .unwrap_or_default()
+                })
+                .collect::<String>();
+            (key, value)
+        })
+        .collect()
+}
+
+fn url_with_query(mut url: url::Url, query: &[(String, String)]) -> url::Url {
+    if !query.is_empty() {
+        url.query_pairs_mut()
+            .extend_pairs(query);
+    }
+    url
+}
+
+/// `POST /sessions/playing`: the player started.
+#[derive(Debug, Clone)]
+pub struct ReportPlaybackStart(pub PlaybackInfo);
+
+impl Endpoint for ReportPlaybackStart {
+    type Output = ();
+
+    fn path(&self) -> String {
+        "/sessions/playing".into()
+    }
+
+    fn method(&self) -> Method {
+        Method::POST
+    }
+
+    fn body(&self) -> Body {
+        Body::Json(serde_json::to_value(&self.0).unwrap_or_default())
+    }
+}
+
+/// `POST /sessions/playing/progress`: periodic position/pause/stream updates.
+#[derive(Debug, Clone)]
+pub struct ReportPlaybackProgress(pub PlaybackInfo);
+
+impl Endpoint for ReportPlaybackProgress {
+    type Output = ();
+
+    fn path(&self) -> String {
+        "/sessions/playing/progress".into()
+    }
+
+    fn method(&self) -> Method {
+        Method::POST
+    }
+
+    fn body(&self) -> Body {
+        Body::Json(serde_json::to_value(&self.0).unwrap_or_default())
+    }
+}
+
+/// `POST /sessions/playing/stopped`: the player stopped.
+#[derive(Debug, Clone)]
+pub struct ReportPlaybackStopped(pub PlaybackInfo);
+
+impl Endpoint for ReportPlaybackStopped {
+    type Output = ();
+
+    fn path(&self) -> String {
+        "/sessions/playing/stopped".into()
+    }
+
+    fn method(&self) -> Method {
+        Method::POST
+    }
+
+    fn body(&self) -> Body {
+        Body::Json(serde_json::to_value(&self.0).unwrap_or_default())
+    }
+}
+
+#[derive(Serialize)]
+struct PingQuery<'a> {
+    #[serde(rename = "playSessionId")]
+    play_session_id: &'a str,
+}
+
+/// `POST /sessions/playing/ping`: keeps a play session alive while paused.
+#[derive(Debug, Clone)]
+pub struct PingPlayback {
+    pub play_session_id: String,
+}
+
+impl Endpoint for PingPlayback {
+    type Output = ();
+
+    fn path(&self) -> String {
+        "/sessions/playing/ping".into()
+    }
+
+    fn method(&self) -> Method {
+        Method::POST
+    }
+
+    fn query_params(&self) -> impl serde::Serialize + '_ {
+        PingQuery {
+            play_session_id: &self.play_session_id,
+        }
+    }
+}
+
+/// `GET /shows/{series_id}/episodes`. `start_item_id` counts from that item, inclusive.
+#[derive(Debug, Clone)]
+pub struct GetEpisodes {
+    pub series_id: Uuid,
+    pub query: GetItemsQuery,
+}
+
+impl Endpoint for GetEpisodes {
+    type Output = QueryResult<BaseItemDto>;
+
+    fn path(&self) -> String {
+        format!("/shows/{}/episodes", self.series_id)
+    }
+
+    fn query_params(&self) -> impl serde::Serialize + '_ {
+        &self.query
+    }
+}
+
+/// `GET /shows/{series_id}/seasons`.
+#[derive(Debug, Clone)]
+pub struct GetSeasons {
+    pub series_id: Uuid,
+    pub query: GetItemsQuery,
+}
+
+impl Endpoint for GetSeasons {
+    type Output = QueryResult<BaseItemDto>;
+
+    fn path(&self) -> String {
+        format!("/shows/{}/seasons", self.series_id)
+    }
+
+    fn query_params(&self) -> impl serde::Serialize + '_ {
+        &self.query
+    }
+}
+
+/// `GET /videos/{item}/{source}/subtitles/{index}/stream.{format}` as a URL for a
+/// `<track>` element. `api_key` goes in the query because a media element cannot
+/// send an auth header.
+pub fn subtitle_url(
+    base: &url::Url,
+    item_id: Uuid,
+    source_id: Uuid,
+    index: i64,
+    format: &str,
+    api_key: Option<&str>,
+) -> url::Url {
+    let url = base
+        .join(&format!(
+            "videos/{item_id}/{source_id}/subtitles/{index}/stream.{format}"
+        ))
+        .unwrap_or_else(|_| base.clone());
+    let pairs: Vec<(String, String)> = api_key
+        .map(|key| vec![("ApiKey".to_string(), key.to_string())])
+        .unwrap_or_default();
+    url_with_query(url, &pairs)
+}
+
+/// `GET /items/{id}/images/{type}` as a URL for an `<img>` tag. Nothing is fetched.
+pub fn item_image_url(
+    base: &url::Url,
+    item_id: Uuid,
+    image_type: ImageType,
+    query: &ImageQuery,
+) -> url::Url {
+    let url = base
+        .join(&format!("items/{item_id}/images/{image_type}"))
+        .unwrap_or_else(|_| base.clone());
+    url_with_query(url, &pascal_case_query(query))
+}
+
+/// `GET /videos/{id}/stream` as a URL for the player. `api_key` goes in the query
+/// because a media element cannot send an auth header.
+pub fn video_stream_url(
+    base: &url::Url,
+    item_id: Uuid,
+    query: &VideoStreamQuery,
+    api_key: Option<&str>,
+) -> url::Url {
+    let url = base
+        .join(&format!("videos/{item_id}/stream"))
+        .unwrap_or_else(|_| base.clone());
+    let mut pairs = pascal_case_query(query);
+    if let Some(key) = api_key {
+        pairs.push(("ApiKey".into(), key.into()));
+    }
+    url_with_query(url, &pairs)
+}
+
+// ---------------------------------------------------------------------------
 // Remux extension endpoints
 // ---------------------------------------------------------------------------
 
@@ -7303,6 +8141,18 @@ mod tests {
     use super::*;
 
     #[test]
+    fn items_query_limit_defaults_only_when_omitted() {
+        let omitted: GetItemsQuery = serde_json::from_str("{}").unwrap();
+        assert_eq!(omitted.limit, Some(DEFAULT_ITEMS_LIMIT));
+
+        let explicit: GetItemsQuery = serde_json::from_str(r#"{"Limit":7}"#).unwrap();
+        assert_eq!(explicit.limit, Some(7));
+
+        // Internal constructions are not limited.
+        assert_eq!(GetItemsQuery::default().limit, None);
+    }
+
+    #[test]
     fn branding_defaults_to_elegantfin_stylesheets() {
         let css = BrandingOptions::default()
             .custom_css
@@ -7346,6 +8196,14 @@ mod tests {
             .unwrap();
         assert_eq!(ids.tmdb, vec![27205]);
         assert_eq!(ids.imdb, vec!["tt1375666".to_string()]);
+    }
+
+    #[test]
+    fn get_items_query_deserializes_season_case_variants() {
+        for query in ["Season=2", "season=2"] {
+            let q: GetItemsQuery = serde_urlencoded::from_str(query).unwrap();
+            assert_eq!(q.season, Some(2));
+        }
     }
 
     #[test]
@@ -7397,7 +8255,6 @@ mod tests {
     fn embedded_subtitle_handling_display_round_trips() {
         for (variant, expected) in [
             (EmbeddedSubtitleHandling::Burn, "Burn"),
-            (EmbeddedSubtitleHandling::Extract, "Extract"),
             (EmbeddedSubtitleHandling::Strip, "Strip"),
         ] {
             assert_eq!(variant.to_string(), expected);
@@ -7409,10 +8266,23 @@ mod tests {
     }
 
     #[test]
+    fn embedded_subtitle_handling_accepts_legacy_extract_alias() {
+        // Existing installs may have persisted "Extract" before it was
+        // removed as a mode — both the strum EnumString parse and serde
+        // deserialize paths must still accept it, landing on Strip.
+        let parsed: EmbeddedSubtitleHandling = "Extract"
+            .parse()
+            .unwrap();
+        assert_eq!(parsed, EmbeddedSubtitleHandling::Strip);
+        let back: EmbeddedSubtitleHandling =
+            serde_json::from_str("\"Extract\"").unwrap();
+        assert_eq!(back, EmbeddedSubtitleHandling::Strip);
+    }
+
+    #[test]
     fn embedded_subtitle_handling_serde_round_trips() {
         for variant in [
             EmbeddedSubtitleHandling::Burn,
-            EmbeddedSubtitleHandling::Extract,
             EmbeddedSubtitleHandling::Strip,
         ] {
             let json = serde_json::to_string(&variant).unwrap();
@@ -7618,6 +8488,40 @@ mod tests {
         assert_eq!(format_size_rule(NumericOp::Lt, v), "< 20.00 GiB");
         assert_eq!(format_size_rule(NumericOp::Eq, v), "= 20.00 GiB");
         assert_eq!(format_size_rule(NumericOp::NotEq, v), "≠ 20.00 GiB");
+    }
+
+    #[test]
+    fn format_bitrate_rule_shows_megabits() {
+        assert_eq!(format_bitrate_rule(NumericOp::Gt, 8_000_000), "> 8.00 Mbps");
+        assert_eq!(format_bitrate_rule(NumericOp::Lt, 2_500_000), "< 2.50 Mbps");
+    }
+
+    #[test]
+    fn new_stream_rules_round_trip_through_json() {
+        let rules = [
+            (
+                StreamRule::SubtitleLanguage {
+                    op: SetOp::In,
+                    values: vec!["por".to_string()],
+                },
+                serde_json::json!({"field": "subtitle_language", "op": "in", "values": ["por"]}),
+            ),
+            (
+                StreamRule::Bitrate {
+                    op: NumericOp::Lt,
+                    value: 8_000_000,
+                },
+                serde_json::json!({"field": "bitrate", "op": "lt", "value": 8_000_000}),
+            ),
+            (
+                StreamRule::Cached { value: true },
+                serde_json::json!({"field": "cached", "value": true}),
+            ),
+        ];
+        for (rule, json) in rules {
+            assert_eq!(serde_json::to_value(&rule).unwrap(), json);
+            assert_eq!(serde_json::from_value::<StreamRule>(json).unwrap(), rule);
+        }
     }
 
     #[test]
@@ -8044,6 +8948,199 @@ mod tests {
                 .to_query_value()
                 .as_deref(),
             Some("VideoRotationNotSupported,AudioChannelsNotSupported")
+        );
+    }
+
+    fn id(n: u128) -> Uuid {
+        Uuid::from_u128(n)
+    }
+
+    #[test]
+    fn watchlist_and_ignored_toggle_between_post_and_delete() {
+        let (user_id, item_id) = (id(1), id(2));
+        let watch = ToggleWatchlist {
+            user_id,
+            item_id,
+            watchlist: true,
+        };
+        assert_eq!(watch.method(), Method::POST);
+        assert_eq!(
+            ToggleWatchlist {
+                watchlist: false,
+                ..watch.clone()
+            }
+            .method(),
+            Method::DELETE
+        );
+        assert_eq!(
+            watch.path(),
+            format!("/remux/users/{user_id}/watchlist/{item_id}")
+        );
+        let ignore = ToggleIgnored {
+            user_id,
+            item_id,
+            ignored: false,
+        };
+        assert_eq!(ignore.method(), Method::DELETE);
+        assert_eq!(
+            ignore.path(),
+            format!("/remux/users/{user_id}/ignored/{item_id}")
+        );
+    }
+
+    #[test]
+    fn items_query_reads_watchlist_and_ignored_from_either_form() {
+        let filtered = |filter| GetItemsQuery {
+            filters: Some(vec![filter]),
+            ..Default::default()
+        };
+        assert_eq!(filtered(ItemFilter::IsWatchlist).watchlist(), Some(true));
+        assert_eq!(filtered(ItemFilter::IsIgnored).ignored(), Some(true));
+        let explicit = GetItemsQuery {
+            is_watchlist: Some(false),
+            is_ignored: Some(false),
+            filters: Some(vec![ItemFilter::IsWatchlist, ItemFilter::IsIgnored]),
+            ..Default::default()
+        };
+        assert_eq!(explicit.watchlist(), Some(false));
+        assert_eq!(explicit.ignored(), Some(false));
+        let bare = GetItemsQuery::default();
+        assert_eq!((bare.watchlist(), bare.ignored()), (None, None));
+    }
+
+    #[test]
+    fn favorite_and_played_toggle_between_post_and_delete() {
+        let (user_id, item_id) = (id(1), id(2));
+        let on = ToggleFavorite {
+            user_id,
+            item_id,
+            favorite: true,
+        };
+        let off = ToggleFavorite {
+            favorite: false,
+            ..on.clone()
+        };
+        assert_eq!(on.method(), Method::POST);
+        assert_eq!(off.method(), Method::DELETE);
+        assert_eq!(
+            on.path(),
+            format!("/users/{user_id}/favoriteitems/{item_id}")
+        );
+
+        let played = TogglePlayed {
+            user_id,
+            item_id,
+            played: true,
+        };
+        assert_eq!(played.method(), Method::POST);
+        assert_eq!(
+            TogglePlayed {
+                played: false,
+                ..played.clone()
+            }
+            .method(),
+            Method::DELETE
+        );
+        assert_eq!(
+            played.path(),
+            format!("/users/{user_id}/playeditems/{item_id}")
+        );
+    }
+
+    #[test]
+    fn latest_query_uses_jellyfin_parameter_names() {
+        let ep = GetItemsLatest(ItemsLatestQuery {
+            parent_id: Some(id(3)),
+            include_item_types: Some(vec![MediaType::Movie, MediaType::Series]),
+            limit: Some(12),
+            group_items: Some(false),
+            ..Default::default()
+        });
+        let query = ep.query();
+        let get = |k: &str| {
+            query
+                .iter()
+                .find(|(key, _)| key == k)
+                .map(|(_, v)| v.as_str())
+        };
+        assert_eq!(get("Limit"), Some("12"));
+        assert_eq!(get("GroupItems"), Some("false"));
+        assert_eq!(get("IncludeItemTypes"), Some("Movie%2CSeries"));
+        assert_eq!(query.len(), 4, "unset options must not be sent: {query:?}");
+    }
+
+    #[test]
+    fn display_preferences_send_client_and_user_as_query() {
+        let get = GetDisplayPreferences {
+            id: "usersettings".into(),
+            user_id: Some(id(4)),
+            client: "remux-web".into(),
+        };
+        assert_eq!(get.path(), "/displaypreferences/usersettings");
+        assert_eq!(
+            get.query(),
+            vec![
+                ("UserId".to_string(), id(4).to_string()),
+                ("Client".to_string(), "remux-web".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn playback_info_body_is_pascal_case_and_skips_unset_fields() {
+        let body = serde_json::to_value(PlaybackInfoRequest {
+            enable_direct_play: Some(true),
+            max_streaming_bitrate: Some(8_000_000),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(
+            body,
+            serde_json::json!({"EnableDirectPlay": true, "MaxStreamingBitrate": 8000000})
+        );
+        let ep = GetPlaybackInfo {
+            item_id: id(5),
+            request: PlaybackInfoRequest::default(),
+        };
+        assert_eq!(ep.method(), Method::POST);
+        assert_eq!(ep.path(), format!("/items/{}/playbackinfo", id(5)));
+    }
+
+    #[test]
+    fn image_url_spells_query_keys_like_jellyfin() {
+        let base = url::Url::parse("http://remux.local:3000/").unwrap();
+        let url = item_image_url(
+            &base,
+            id(6),
+            ImageType::Primary,
+            &ImageQuery {
+                max_width: Some(300),
+                fill_height: Some(450),
+                quality: Some(80),
+                ..Default::default()
+            },
+        );
+        assert_eq!(url.path(), format!("/items/{}/images/primary", id(6)));
+        assert_eq!(url.query(), Some("FillHeight=450&MaxWidth=300&Quality=80"));
+    }
+
+    #[test]
+    fn video_stream_url_carries_static_flag_and_api_key() {
+        let base = url::Url::parse("http://remux.local:3000/").unwrap();
+        let url = video_stream_url(
+            &base,
+            id(7),
+            &VideoStreamQuery {
+                static_: Some(true),
+                media_source_id: Some(id(8)),
+                ..Default::default()
+            },
+            Some("secret"),
+        );
+        assert_eq!(url.path(), format!("/videos/{}/stream", id(7)));
+        assert_eq!(
+            url.query(),
+            Some(format!("Static=true&MediaSourceId={}&ApiKey=secret", id(8)).as_str())
         );
     }
 }

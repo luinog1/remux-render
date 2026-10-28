@@ -312,6 +312,81 @@ impl Endpoint for MediaMetricsEndpoint {
     }
 }
 
+/// Result of one metrics lookup, keeping "RemuxDB has nothing for this title"
+/// apart from "RemuxDB could not answer right now" so callers can retry the latter.
+#[derive(Debug, Clone)]
+pub enum MetricsLookup {
+    Found(MediaMetrics),
+    /// The title is unknown to RemuxDB (404), or RemuxDB does not understand
+    /// its id (400). Retrying will not help, and the answer is about this
+    /// title alone, so it is safe to remember.
+    NotFound,
+    /// The request failed for a reason that says nothing about the title:
+    /// 401/403/422, an unparseable response or an invalid base url. A
+    /// systemic problem such as a Cloudflare 403 lands here for every title,
+    /// so callers must not remember it as "RemuxDB has nothing". Retrying
+    /// will not help either.
+    Rejected,
+    /// Rate limited, 5xx (including Cloudflare's 52x) or a transport error,
+    /// still failing after the client's own short retries.
+    Unavailable,
+}
+
+/// Whether `error` is the kind of failure that may clear up if we wait.
+fn is_transient(error: &ClientError) -> bool {
+    match error {
+        ClientError::Http { status, .. } => *status == 429 || *status >= 500,
+        ClientError::RateLimited { .. } | ClientError::Transport(_) => true,
+        _ => false,
+    }
+}
+
+fn classify_metrics(result: Result<MediaMetrics, ClientError>) -> MetricsLookup {
+    match result {
+        Ok(metrics) => MetricsLookup::Found(metrics),
+        Err(ClientError::Http { status: 404, .. }) => MetricsLookup::NotFound,
+        Err(error) if is_transient(&error) => {
+            debug!(%error, "remuxdb: metrics temporarily unavailable");
+            MetricsLookup::Unavailable
+        }
+        // 400 means RemuxDB does not understand the id; same as the probe
+        // path, where it is deliberately treated like a 404.
+        Err(error @ ClientError::Http { status: 400, .. }) => {
+            debug!(%error, "remuxdb: metrics request rejected");
+            MetricsLookup::NotFound
+        }
+        Err(error) => {
+            warn!(%error, "remuxdb: metrics fetch failed");
+            MetricsLookup::Rejected
+        }
+    }
+}
+
+/// Fetch RemuxDB's canonical popularity, trending, and rating data for an IMDb title.
+/// Unlike [`fetch_media_metrics`] this reports whether a miss is worth retrying.
+pub async fn lookup_media_metrics(
+    base_url: &str,
+    client_id: &str,
+    imdb_id: &str,
+) -> MetricsLookup {
+    let client = match RestClient::new(base_url.trim_end_matches('/')) {
+        Ok(client) => client
+            .with_retry(crate::ExponentialBackoff::builder().build_with_max_retries(3)),
+        Err(error) => {
+            warn!(%error, "remuxdb: invalid base url");
+            return MetricsLookup::Rejected;
+        }
+    };
+    classify_metrics(
+        client
+            .execute(MediaMetricsEndpoint {
+                imdb_id: imdb_id.to_string(),
+                client_id: client_id.to_string(),
+            })
+            .await,
+    )
+}
+
 /// Fetch RemuxDB's canonical popularity, trending, and rating data for an IMDb title.
 /// Returns `None` for a missing title or an unavailable service.
 pub async fn fetch_media_metrics(
@@ -319,25 +394,11 @@ pub async fn fetch_media_metrics(
     client_id: &str,
     imdb_id: &str,
 ) -> Option<MediaMetrics> {
-    let client = match RestClient::new(base_url.trim_end_matches('/')) {
-        Ok(client) => client
-            .with_retry(crate::ExponentialBackoff::builder().build_with_max_retries(3)),
-        Err(error) => {
-            warn!(%error, "remuxdb: invalid base url");
-            return None;
-        }
-    };
-    match client
-        .execute(MediaMetricsEndpoint {
-            imdb_id: imdb_id.to_string(),
-            client_id: client_id.to_string(),
-        })
-        .await
-    {
-        Ok(metrics) => Some(metrics),
-        Err(ClientError::Http { status: 404, .. }) => None,
-        Err(error) => {
-            warn!(%imdb_id, %error, "remuxdb: metrics fetch failed");
+    match lookup_media_metrics(base_url, client_id, imdb_id).await {
+        MetricsLookup::Found(metrics) => Some(metrics),
+        MetricsLookup::NotFound => None,
+        MetricsLookup::Rejected | MetricsLookup::Unavailable => {
+            warn!(%imdb_id, "remuxdb: metrics fetch failed");
             None
         }
     }
@@ -356,16 +417,14 @@ impl Endpoint for MediaInfoEndpoint {
     type Output = Vec<MediaInfo>;
 
     fn path(&self) -> String {
-        let mut path = format!("/api/media/{}/versions", self.external_id);
-        let mut sep = '?';
-        if let Some(s) = self.season {
-            path.push_str(&format!("{sep}season={s}"));
-            sep = '&';
+        // The server reads season/episode from the id itself (`tt0903747:1:1`);
+        // a bare id is a series-level lookup.
+        match (self.season, self.episode) {
+            (Some(s), Some(e)) => {
+                format!("/api/media/{}:{s}:{e}/versions", self.external_id)
+            }
+            _ => format!("/api/media/{}/versions", self.external_id),
         }
-        if let Some(e) = self.episode {
-            path.push_str(&format!("{sep}episode={e}"));
-        }
-        path
     }
 
     fn headers(&self) -> HeaderMap {
@@ -388,6 +447,7 @@ impl Endpoint for MediaInfoEndpoint {
 /// `external_id` is the item's imdb id (e.g. `tt0113277`) or, absent that, a
 /// `tmdb:{id}`-prefixed id — imdb takes priority when both are known, per
 /// `db::ExternalIds::stremio_lookup_id`, which callers should use to build it.
+/// For an episode pass the *series* id plus `season` and `episode`.
 /// Returns `None` on 404 or any error (failures are logged at debug level).
 pub async fn fetch_probe(
     base_url: &str,
@@ -421,7 +481,11 @@ pub async fn fetch_probe(
             debug!(count = versions.len(), "remuxdb: probe versions fetched");
             Some(versions)
         }
-        Err(ClientError::Http { status: 404, .. }) => None,
+        // 400 means RemuxDB does not understand the id (it rejects some
+        // `tmdb:` ids as "invalid media_id format"); nothing to retry or warn about.
+        Err(ClientError::Http {
+            status: 400 | 404, ..
+        }) => None,
         Err(e) => {
             warn!(error = %e, "remuxdb: probe fetch failed");
             None
@@ -835,7 +899,8 @@ mod tests {
     }
 
     #[test]
-    fn media_info_endpoint_path_carries_tmdb_prefixed_ids_and_season_episode() {
+    fn media_info_endpoint_path_carries_tmdb_prefixed_ids_with_season_episode_in_the_id()
+     {
         let ep = MediaInfoEndpoint {
             external_id: "tmdb:603".into(),
             season: Some(1),
@@ -843,7 +908,7 @@ mod tests {
             token: None,
             client_id: None,
         };
-        assert_eq!(ep.path(), "/api/media/tmdb:603/versions?season=1&episode=2");
+        assert_eq!(ep.path(), "/api/media/tmdb:603:1:2/versions");
     }
 
     #[test]
@@ -871,5 +936,105 @@ mod tests {
         };
         let stream = MediaStream::from(&track);
         assert_eq!(stream.title, None);
+    }
+
+    fn versions_endpoint(
+        season: Option<i32>,
+        episode: Option<i32>,
+    ) -> MediaInfoEndpoint {
+        MediaInfoEndpoint {
+            external_id: "tt0903747".to_string(),
+            season,
+            episode,
+            token: None,
+            client_id: None,
+        }
+    }
+
+    #[test]
+    fn versions_path_puts_season_and_episode_in_the_id() {
+        assert_eq!(
+            versions_endpoint(Some(1), Some(2)).path(),
+            "/api/media/tt0903747:1:2/versions"
+        );
+    }
+
+    #[test]
+    fn versions_path_is_a_bare_id_without_a_full_season_and_episode() {
+        assert_eq!(
+            versions_endpoint(None, None).path(),
+            "/api/media/tt0903747/versions"
+        );
+        assert_eq!(
+            versions_endpoint(Some(1), None).path(),
+            "/api/media/tt0903747/versions"
+        );
+    }
+
+    fn http_error(status: u16) -> ClientError {
+        ClientError::Http {
+            status,
+            message: String::new(),
+            endpoint: None,
+            body: None,
+        }
+    }
+
+    #[test]
+    fn gateway_and_rate_limit_statuses_are_unavailable_not_missing() {
+        for status in [429, 500, 502, 503, 504, 521, 525] {
+            assert!(
+                matches!(
+                    classify_metrics(Err(http_error(status))),
+                    MetricsLookup::Unavailable
+                ),
+                "status {status}"
+            );
+        }
+    }
+
+    #[test]
+    fn not_found_maps_to_not_found() {
+        assert!(matches!(
+            classify_metrics(Err(http_error(404))),
+            MetricsLookup::NotFound
+        ));
+    }
+
+    /// 400 is how RemuxDB says it does not understand the id, which is the
+    /// same as not knowing the title (the probe path treats it that way too).
+    #[test]
+    fn bad_request_maps_to_not_found() {
+        assert!(matches!(
+            classify_metrics(Err(http_error(400))),
+            MetricsLookup::NotFound
+        ));
+    }
+
+    #[test]
+    fn blocked_and_unparseable_responses_are_rejected_not_not_found() {
+        for status in [401, 403, 422] {
+            assert!(
+                matches!(
+                    classify_metrics(Err(http_error(status))),
+                    MetricsLookup::Rejected
+                ),
+                "status {status}"
+            );
+        }
+        let parse = ClientError::Json {
+            status: 200,
+            source: serde_json::from_str::<u8>("not json").unwrap_err(),
+            endpoint: None,
+            body: None,
+        };
+        assert!(matches!(
+            classify_metrics(Err(parse)),
+            MetricsLookup::Rejected
+        ));
+        assert!(matches!(
+            classify_metrics(Err(ClientError::Unauthorized)),
+            MetricsLookup::Rejected
+        ));
     }
 }

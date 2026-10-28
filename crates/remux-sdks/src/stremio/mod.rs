@@ -86,6 +86,7 @@ impl Endpoint for ManifestEndpoint {
 
 #[skip_serializing_none]
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Manifest {
     pub id: String,
     pub name: String,
@@ -306,22 +307,23 @@ impl Endpoint for MetaEndpoint {
 #[skip_serializing_none]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MetaResponse {
-    pub meta: Meta,
+    /// Absent (or null) when the addon does not know the id: Cinemeta answers
+    /// 200 `{}` for those.
+    #[serde(default)]
+    pub meta: Option<Meta>,
 }
 
-// TODO: The Stremio subtitles protocol accepts a `filename` extra prop for
-// better addon-side matching, but this is still unimplemented — subtitle
-// fetches happen once per item (`stremio_subtitles(media: &db::Media)`), and
-// a single item can have multiple sources with different filenames, so there
-// isn't yet a single filename to send here. Client-side is_release_match
-// filtering (subtitle_selection.rs) works around this by ranking whatever
-// the addon returns, not by asking it for release-specific results.
+/// `/subtitles/{type}/{id}/{extraArgs}.json`. The optional `filename` and
+/// `videoSize` extras let addons match the subtitle to the exact release being
+/// played; without them an addon can only return a list for the title.
 #[derive(Debug, Clone)]
 pub struct SubtitlesEndpoint {
     pub media_type: MediaType,
     pub imdb_id: String,
     pub season: Option<i64>,
     pub episode: Option<i64>,
+    pub filename: Option<String>,
+    pub video_size: Option<i64>,
 }
 
 impl Endpoint for SubtitlesEndpoint {
@@ -334,7 +336,27 @@ impl Endpoint for SubtitlesEndpoint {
                 .imdb_id
                 .clone(),
         };
-        format!("/subtitles/{}/{}.json", self.media_type, id)
+        let mut extras = Vec::new();
+        if let Some(size) = self.video_size {
+            extras.push(format!("videoSize={size}"));
+        }
+        if let Some(name) = self
+            .filename
+            .as_deref()
+            .filter(|name| !name.is_empty())
+        {
+            extras.push(format!("filename={}", urlencoding::encode(name)));
+        }
+        if extras.is_empty() {
+            format!("/subtitles/{}/{}.json", self.media_type, id)
+        } else {
+            format!(
+                "/subtitles/{}/{}/{}.json",
+                self.media_type,
+                id,
+                extras.join("&")
+            )
+        }
     }
 }
 
@@ -547,7 +569,7 @@ impl Meta {
     /// Catalog responses are often partial (missing `imdb_id` etc.); calling
     /// this upgrades the item to complete metadata before DB conversion.
     pub async fn resolve(&mut self, client: &RestClient) -> Result<()> {
-        *self = client
+        let response = client
             .execute(
                 MetaEndpoint {
                     media_type: self
@@ -561,8 +583,11 @@ impl Meta {
                 }
                 .with_cache(std::time::Duration::from_secs(3600)),
             )
-            .await?
-            .meta;
+            .await?;
+        // The addon does not know this id: keep the partial item as is.
+        if let Some(meta) = response.meta {
+            *self = meta;
+        }
         Ok(())
     }
 
@@ -1099,8 +1124,60 @@ pub fn client(base: &str) -> Result<RestClient, url::ParseError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{MediaType, Meta, ReleaseInfo, Stream, parse_duration_lossy};
+    use super::{
+        Endpoint, MediaType, Meta, MetaResponse, ReleaseInfo, Stream,
+        SubtitlesEndpoint, parse_duration_lossy,
+    };
     use std::time::Duration;
+
+    #[test]
+    fn meta_response_accepts_an_empty_body() {
+        // Cinemeta answers 200 `{}` for ids it does not know.
+        for body in ["{}", r#"{"meta": null}"#] {
+            let response: MetaResponse = serde_json::from_str(body)
+                .unwrap_or_else(|e| panic!("{body} should deserialize: {e}"));
+            assert_eq!(
+                serde_json::to_value(&response).unwrap(),
+                serde_json::json!({})
+            );
+        }
+    }
+
+    fn subtitles_path(filename: Option<&str>, video_size: Option<i64>) -> String {
+        SubtitlesEndpoint {
+            media_type: MediaType::Movie,
+            imdb_id: "tt0133093".into(),
+            season: None,
+            episode: None,
+            filename: filename.map(String::from),
+            video_size,
+        }
+        .path()
+    }
+
+    #[test]
+    fn subtitles_path_without_extras_has_no_extra_segment() {
+        assert_eq!(
+            subtitles_path(None, None),
+            "/subtitles/movie/tt0133093.json"
+        );
+        assert_eq!(
+            subtitles_path(Some(""), None),
+            "/subtitles/movie/tt0133093.json"
+        );
+    }
+
+    #[test]
+    fn subtitles_path_sends_size_and_encoded_filename() {
+        assert_eq!(
+            subtitles_path(Some("The Matrix (1999) 1080p&x=1.mkv"), Some(1234)),
+            "/subtitles/movie/tt0133093/videoSize=1234&filename=The%20Matrix%20%281999%29%201080p%26x%3D1.mkv.json"
+        );
+        assert_eq!(
+            subtitles_path(None, Some(1234)),
+            "/subtitles/movie/tt0133093/videoSize=1234.json"
+        );
+    }
 
     #[test]
     fn cached_status_uses_behavior_hint_when_service_status_is_missing() {

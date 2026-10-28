@@ -72,19 +72,18 @@ impl PlaybackContext {
                             .clone()
                     })
                 }),
-            play_method: data
-                .play_method
-                .clone()
+            play_method: playback
+                .and_then(|p| {
+                    p.play_method
+                        .as_deref()
+                })
+                .and_then(|m| {
+                    m.parse()
+                        .ok()
+                })
                 .or_else(|| {
-                    playback
-                        .and_then(|p| {
-                            p.play_method
-                                .as_deref()
-                        })
-                        .and_then(|m| {
-                            m.parse()
-                                .ok()
-                        })
+                    data.play_method
+                        .clone()
                 }),
             audio_stream_index: data
                 .audio_stream_index
@@ -128,6 +127,14 @@ pub struct MarkFavoriteInfo {
 pub struct UnmarkFavoriteInfo {
     pub user_id: Uuid,
     pub media_id: Uuid,
+}
+
+#[derive(Debug, Clone)]
+pub struct UserFlagChangedInfo {
+    pub user_id: Uuid,
+    pub media_id: Uuid,
+    pub flag: crate::db::UserFlag,
+    pub on: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -175,6 +182,7 @@ pub enum Event {
     MarkUnplayed(MarkUnplayedInfo),
     MarkFavorite(MarkFavoriteInfo),
     UnmarkFavorite(UnmarkFavoriteInfo),
+    UserFlagChanged(UserFlagChangedInfo),
     Rating(RatingInfo),
     UserUpdated(UserUpdatedInfo),
     UserDeleted(UserDeletedInfo),
@@ -195,6 +203,7 @@ pub enum EventType {
     MarkUnplayed,
     MarkFavorite,
     UnmarkFavorite,
+    UserFlagChanged,
     Rating,
     UserUpdated,
     UserDeleted,
@@ -216,6 +225,7 @@ impl Event {
             Event::MarkUnplayed(_) => EventType::MarkUnplayed,
             Event::MarkFavorite(_) => EventType::MarkFavorite,
             Event::UnmarkFavorite(_) => EventType::UnmarkFavorite,
+            Event::UserFlagChanged(_) => EventType::UserFlagChanged,
             Event::Rating(_) => EventType::Rating,
             Event::UserUpdated(_) => EventType::UserUpdated,
             Event::UserDeleted(_) => EventType::UserDeleted,

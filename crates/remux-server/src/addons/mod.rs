@@ -20,7 +20,7 @@ pub mod ytdlp;
 use anyhow::{Result, anyhow};
 use arc_swap::ArcSwap;
 use async_trait::async_trait;
-use futures::Stream;
+use futures::{Stream, StreamExt};
 use sqlx::SqlitePool;
 use std::{
     collections::HashMap,
@@ -518,8 +518,25 @@ fn series_is_active(status: &Option<db::MediaStatus>) -> bool {
     )
 }
 
+/// Whether an episode is still recent (or upcoming) enough to be re-fetched on
+/// every pass instead of only until it has been refreshed once.
+///
+/// The row coming out of a tree fetch is freshly parsed, so it usually has no
+/// `digital_released_at` (TMDB episodes only carry their air date in
+/// `released_at`). Look at the stored digital date first, then the fetched one,
+/// then the air date; an episode with no date at all is treated as active.
 fn episode_in_active_window(child: &db::Media) -> bool {
-    match child.digital_released_at {
+    episode_in_active_window_with(child, None)
+}
+
+fn episode_in_active_window_with(
+    child: &db::Media,
+    stored_digital: Option<chrono::NaiveDateTime>,
+) -> bool {
+    match stored_digital
+        .or(child.digital_released_at)
+        .or(child.released_at)
+    {
         None => true,
         Some(dt) => {
             let cutoff = chrono::Utc::now().naive_utc() - chrono::Duration::days(180);
@@ -835,12 +852,38 @@ pub struct SubtitleInfo {
     pub ai_translated: Option<bool>,
 }
 
+/// The release being played, so an addon can return subtitles made for that
+/// exact file instead of a generic list for the title. All fields are optional;
+/// addons that can't use them ignore the query.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SubtitleQuery {
+    pub filename: Option<String>,
+    pub video_size: Option<i64>,
+}
+
+impl SubtitleQuery {
+    fn cache_suffix(&self) -> String {
+        if self == &Self::default() {
+            return String::new();
+        }
+        format!(
+            ":{}:{}",
+            self.filename
+                .as_deref()
+                .unwrap_or(""),
+            self.video_size
+                .map_or(String::new(), |size| size.to_string())
+        )
+    }
+}
+
 #[async_trait]
 pub trait SubtitleAddon: Send + Sync {
     fn supports(&self, media: &db::Media) -> bool;
     async fn subtitle_fetch(
         &self,
         media: &db::Media,
+        query: &SubtitleQuery,
         db: &SqlitePool,
     ) -> Result<Vec<SubtitleInfo>>;
 }
@@ -897,6 +940,11 @@ pub trait LyricAddon: Send + Sync {
 #[derive(Clone, Default)]
 pub struct AddonCapabilities {
     pub metadata: AddonMetadata,
+    /// The live manifest could not be fetched when the addon was loaded, so
+    /// `metadata` is the preset's static fallback. Such an addon re-checks its
+    /// manifest per request (see `AddonRuntime::live_id_prefixes`) and is
+    /// skipped while that still fails.
+    pub manifest_unreachable: bool,
     pub kind: Option<Arc<dyn AddonKind>>,
     pub catalog: Option<Arc<dyn CatalogAddon>>,
     pub meta: Option<Arc<dyn MetaAddon>>,
@@ -1020,6 +1068,45 @@ impl AddonRuntime {
                     .as_deref()
             })
     }
+
+    /// The id prefixes `kind` is limited to, or `Err` when the addon's manifest
+    /// couldn't be loaded and it should be skipped. An addon whose manifest
+    /// failed at load is asked again here; it answers from its cache, and
+    /// after a failure only retries once per cooldown.
+    async fn live_id_prefixes(
+        &self,
+        kind: &ResourceType,
+    ) -> Result<Option<std::borrow::Cow<'_, [String]>>> {
+        if !self
+            .caps
+            .manifest_unreachable
+        {
+            return Ok(self
+                .resource_id_prefixes(kind)
+                .map(std::borrow::Cow::Borrowed));
+        }
+        let info = match &self
+            .caps
+            .kind
+        {
+            Some(k) => {
+                k.available_info()
+                    .await?
+            }
+            None => None,
+        };
+        let Some((resources, _)) = info else {
+            return Ok(None);
+        };
+        let resource = resources
+            .iter()
+            .find(|r| &r.name == kind)
+            .ok_or_else(|| anyhow!("manifest does not declare {kind}"))?;
+        Ok(resource
+            .id_prefixes
+            .clone()
+            .map(std::borrow::Cow::Owned))
+    }
 }
 
 /// Returns true when `runtime` should run for the given user context.
@@ -1066,8 +1153,9 @@ pub(crate) fn recognized_manifest_media_kind(
         MT::Album => MK::Album,
         MT::Artist => MK::Artist,
         MT::Track => MK::Track,
-        MT::Events => MK::TvProgram,
+        MT::Events => MK::TvChannel,
         MT::Other(s) => match s.as_str() {
+            t if crate::db::is_live_tv_type_alias(t) => MK::TvChannel,
             "episode" => MK::Episode,
             "season" => MK::Season,
             "person" => MK::Person,
@@ -1088,9 +1176,90 @@ fn kind_in_type_list(kind: &db::MediaKind, list: &[db::MediaKind]) -> bool {
             && list.contains(&db::MediaKind::Series))
 }
 
+pub(crate) type ManifestInfo = (
+    Vec<remux_sdks::stremio::ResourceRef>,
+    Vec<remux_sdks::stremio::MediaType>,
+);
+
+const MANIFEST_FAILURE_COOLDOWN: Duration = Duration::from_secs(30);
+
+enum ManifestState {
+    Empty,
+    Loaded(ManifestInfo),
+    Failed { at: Instant, error: String },
+}
+
+/// Remembers an addon's manifest once it loaded, and after a failure answers
+/// from the failure until the cooldown passes, so an unreachable addon is
+/// retried at most once per cooldown however often it is asked.
+pub(crate) struct ManifestCache {
+    state: tokio::sync::Mutex<ManifestState>,
+}
+
+impl Default for ManifestCache {
+    fn default() -> Self {
+        Self {
+            state: tokio::sync::Mutex::new(ManifestState::Empty),
+        }
+    }
+}
+
+impl ManifestCache {
+    pub(crate) async fn get_or_fetch<F, Fut>(&self, fetch: F) -> Result<ManifestInfo>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = Result<ManifestInfo>>,
+    {
+        let mut state = self
+            .state
+            .lock()
+            .await;
+        match &*state {
+            ManifestState::Loaded(info) => return Ok(info.clone()),
+            ManifestState::Failed { at, error }
+                if at.elapsed() < MANIFEST_FAILURE_COOLDOWN =>
+            {
+                return Err(anyhow!("{error}"));
+            }
+            _ => {}
+        }
+        match fetch().await {
+            Ok(info) => {
+                *state = ManifestState::Loaded(info.clone());
+                Ok(info)
+            }
+            Err(e) => {
+                *state = ManifestState::Failed {
+                    at: Instant::now(),
+                    error: format!("{e:#}"),
+                };
+                Err(e)
+            }
+        }
+    }
+}
+
+fn apply_manifest_info(
+    caps: &mut AddonCapabilities,
+    resource_refs: Vec<remux_sdks::stremio::ResourceRef>,
+    raw_types: Vec<remux_sdks::stremio::MediaType>,
+) {
+    caps.metadata
+        .supported_resources = resource_refs;
+    if !raw_types.is_empty() {
+        caps.metadata
+            .supported_types = raw_types
+            .into_iter()
+            .filter_map(recognized_manifest_media_kind)
+            .collect();
+    }
+}
+
 // ---------------------------------------------------------------------------
 // AddonService
 // ---------------------------------------------------------------------------
+
+const MANIFEST_FETCH_CONCURRENCY: usize = 25;
 
 #[derive(Clone)]
 pub struct AddonService {
@@ -1119,7 +1288,13 @@ impl PickCap<dyn MetaAddon> for AddonRuntime {
         else {
             return false;
         };
-        if let Some(prefixes) = self.resource_id_prefixes(&ResourceType::Meta) {
+        let Ok(prefixes) = self
+            .live_id_prefixes(&ResourceType::Meta)
+            .await
+        else {
+            return false;
+        };
+        if let Some(prefixes) = prefixes.as_deref() {
             let gp_ext = media
                 .grandparent
                 .as_deref()
@@ -1151,7 +1326,13 @@ impl PickCap<dyn StreamAddon> for AddonRuntime {
         {
             return false;
         }
-        if let Some(prefixes) = self.resource_id_prefixes(&ResourceType::Stream) {
+        let Ok(prefixes) = self
+            .live_id_prefixes(&ResourceType::Stream)
+            .await
+        else {
+            return false;
+        };
+        if let Some(prefixes) = prefixes.as_deref() {
             let gp_ext = media
                 .grandparent
                 .as_deref()
@@ -1189,7 +1370,13 @@ impl PickCap<dyn SubtitleAddon> for AddonRuntime {
         {
             return false;
         }
-        if let Some(prefixes) = self.resource_id_prefixes(&ResourceType::Subtitles) {
+        let Ok(prefixes) = self
+            .live_id_prefixes(&ResourceType::Subtitles)
+            .await
+        else {
+            return false;
+        };
+        if let Some(prefixes) = prefixes.as_deref() {
             let gp_ext = media
                 .grandparent
                 .as_deref()
@@ -1241,16 +1428,22 @@ impl AddonService {
         let all = self
             .inner
             .load();
-        let mut out = Vec::new();
-        for r in all
+        let candidates: Vec<&AddonRuntime> = all
             .iter()
             .filter(|r| r.supports_type(&media.kind))
             .filter(|r| user_scoped(r, override_ids.as_deref()))
-        {
-            if PickCap::<T>::pick(r, media).await {
-                out.push(r.clone());
-            }
-        }
+            .collect();
+        let picks = futures::future::join_all(
+            candidates
+                .iter()
+                .map(|r| PickCap::<T>::pick(*r, media)),
+        )
+        .await;
+        let mut out: Vec<AddonRuntime> = candidates
+            .into_iter()
+            .zip(picks)
+            .filter_map(|(r, picked)| picked.then(|| r.clone()))
+            .collect();
         if let Some(ids) = &override_ids {
             out.sort_by_key(|r| {
                 ids.iter()
@@ -1363,7 +1556,7 @@ impl AddonService {
     ) -> Result<Vec<AddonRuntime>> {
         let presets = registered_presets();
         let addons = Addon::list(db).await?;
-        let mut runtimes = Vec::new();
+        let mut pending = Vec::new();
 
         for mut addon in addons
             .into_iter()
@@ -1396,34 +1589,7 @@ impl AddonService {
                 Ok(mut caps) => {
                     // Start with the preset's static metadata, then upgrade with live manifest data.
                     caps.metadata = preset.metadata();
-                    if let Some(ref kind) = caps.kind {
-                        match kind
-                            .available_info()
-                            .await
-                        {
-                            Ok(Some((resource_refs, raw_types))) => {
-                                caps.metadata
-                                    .supported_resources = resource_refs;
-                                if !raw_types.is_empty() {
-                                    caps.metadata
-                                        .supported_types = raw_types
-                                        .into_iter()
-                                        .filter_map(recognized_manifest_media_kind)
-                                        .collect();
-                                }
-                            }
-                            Ok(None) => {}
-                            Err(e) => {
-                                warn!(
-                                    addon_id = %addon.id,
-                                    name = %addon.name,
-                                    error = %e,
-                                    "failed to fetch addon manifest at load time"
-                                );
-                            }
-                        }
-                    }
-                    runtimes.push(AddonRuntime { row: addon, caps });
+                    pending.push((addon, caps));
                 }
                 Err(e) => warn!(
                     addon_id = %addon.id,
@@ -1433,6 +1599,44 @@ impl AddonService {
                 ),
             }
         }
+
+        // Manifests are fetched concurrently so N stalled addons cost one
+        // timeout window, not N.
+        let runtimes = futures::future::join_all(
+            pending
+                .into_iter()
+                .map(|(addon, mut caps)| async move {
+                    if let Some(kind) = caps
+                        .kind
+                        .clone()
+                    {
+                        match kind
+                            .available_info()
+                            .await
+                        {
+                            Ok(Some((resource_refs, raw_types))) => {
+                                apply_manifest_info(
+                                    &mut caps,
+                                    resource_refs,
+                                    raw_types,
+                                );
+                            }
+                            Ok(None) => {}
+                            Err(e) => {
+                                caps.manifest_unreachable = true;
+                                warn!(
+                                    addon_id = %addon.id,
+                                    name = %addon.name,
+                                    error = %e,
+                                    "failed to fetch addon manifest at load time"
+                                );
+                            }
+                        }
+                    }
+                    AddonRuntime { row: addon, caps }
+                }),
+        )
+        .await;
         Ok(runtimes)
     }
 
@@ -1737,12 +1941,7 @@ impl AddonService {
         // hang up to their own ~30s upstream timeout under load; without
         // this, one bad addon stalls the whole item even though the other
         // addons in the same fan-out already finished.
-        let addon_fetch_timeout = Duration::from_secs(
-            config
-                .addon_fetch_timeout_secs
-                .unwrap_or(5)
-                .max(1) as u64,
-        );
+        let addon_fetch_timeout = config.addon_fetch_timeout();
         let media_ref: &db::Media = media;
         let results = async {
         futures::future::join_all(
@@ -1776,24 +1975,15 @@ impl AddonService {
                             );
                             return Ok(None);
                         }
-                        // A single flaky addon (observed: AIO/aiometadata hanging up to
-                        // its own 30s upstream timeout) must not stall an entire item's
-                        // refresh — the other addons in this join_all already finished.
-                        match tokio::time::timeout(
+                        fetch_meta_with_retry(
+                            meta_addon.as_ref(),
+                            &addon,
+                            media_ref,
+                            ctx,
+                            config,
                             addon_fetch_timeout,
-                            meta_addon.meta_fetch(media_ref, ctx, config),
                         )
                         .await
-                        {
-                            Ok(result) => result,
-                            Err(_) => {
-                                meta_addon.on_meta_fetch_timeout(media_ref);
-                                Err(anyhow!(
-                                    "addon meta_fetch timed out after {:?}",
-                                    addon_fetch_timeout
-                                ))
-                            }
-                        }
                     }
                     .instrument(span)
                 }),
@@ -2029,12 +2219,7 @@ impl AddonService {
         ctx: &AppContext,
         config: &api::ServerConfiguration,
     ) -> Vec<db::Media> {
-        let fetch_timeout = Duration::from_secs(
-            config
-                .addon_fetch_timeout_secs
-                .unwrap_or(5)
-                .max(1) as u64,
-        );
+        let fetch_timeout = config.addon_fetch_timeout();
         let applicable: Vec<Arc<dyn TreeAddon>> = self
             .inner
             .load()
@@ -2379,7 +2564,11 @@ impl AddonService {
         // doc comment for why leaving it behind defeats child_refresh_force.
         let existing_l2: std::collections::HashMap<
             (Uuid, String, i64),
-            (Uuid, Option<chrono::NaiveDateTime>),
+            (
+                Uuid,
+                Option<chrono::NaiveDateTime>,
+                Option<chrono::NaiveDateTime>,
+            ),
         > = sqlx::query_as::<
             _,
             (
@@ -2388,9 +2577,10 @@ impl AddonService {
                 Option<i64>,
                 Uuid,
                 Option<chrono::NaiveDateTime>,
+                Option<chrono::NaiveDateTime>,
             ),
         >(
-            "SELECT parent_id, CAST(kind AS TEXT), idx, id, refreshed_at
+            "SELECT parent_id, CAST(kind AS TEXT), idx, id, refreshed_at, digital_released_at
              FROM media WHERE grandparent_id = ? AND idx IS NOT NULL",
         )
         .bind(actual_root_id)
@@ -2398,8 +2588,8 @@ impl AddonService {
         .await
         .unwrap_or_default()
         .into_iter()
-        .filter_map(|(pid, k, idx, id, refreshed_at)| {
-            idx.map(|i| ((pid, k, i), (id, refreshed_at)))
+        .filter_map(|(pid, k, idx, id, refreshed_at, digital)| {
+            idx.map(|i| ((pid, k, i), (id, refreshed_at, digital)))
         })
         .collect();
 
@@ -2554,6 +2744,7 @@ impl AddonService {
                         // has no concept of refreshed_at — without adopting it here too,
                         // child_refresh_force below always treats this episode as never
                         // refreshed, refetching it on every single pass.
+                        let mut stored_digital = None;
                         if let Some(idx) = gc.idx {
                             let key = (
                                 actual_child_id,
@@ -2561,17 +2752,21 @@ impl AddonService {
                                     .to_string(),
                                 idx,
                             );
-                            if let Some(&(existing_id, existing_refreshed_at)) =
-                                existing_l2.get(&key)
+                            if let Some(&(
+                                existing_id,
+                                existing_refreshed_at,
+                                existing_digital,
+                            )) = existing_l2.get(&key)
                             {
                                 gc.id = existing_id;
                                 gc.refreshed_at = existing_refreshed_at;
+                                stored_digital = existing_digital;
                             }
                         }
 
                         let in_active_window = is_continuing
                             && matches!(gc.kind, db::MediaKind::Episode)
-                            && episode_in_active_window(&gc);
+                            && episode_in_active_window_with(&gc, stored_digital);
                         if let Some(effective_force) =
                             child_refresh_force(force_refresh, in_active_window, &gc)
                         {
@@ -2664,42 +2859,54 @@ impl AddonService {
             .cloned()
             .collect();
 
-        for r in addons {
-            if !r
-                .search
-                .as_ref()
-                .unwrap()
-                .search_supports(kind)
-                .await
+        // Ask every eligible addon concurrently and merge, so an empty answer
+        // (Stremio addons always answer) can't hide the others' results.
+        // Every addon gets the full configured timeout, even once others have
+        // answered, so which results show up doesn't depend on timing races.
+        let config = db::Settings::get_config_or_default(&ctx.db).await;
+        let addon_fetch_timeout = config.addon_fetch_timeout();
+        let mut searches = Vec::with_capacity(addons.len());
+        for r in &addons {
+            if let Some(search) = &r.search
+                && search
+                    .search_supports(kind)
+                    .await
             {
-                continue;
-            }
-            match r
-                .search
-                .as_ref()
-                .unwrap()
-                .search(kind, query, limit, ctx)
-                .await
-            {
-                Ok(Some(mut results)) => {
-                    db::Media::adopt_existing_rows(&ctx.db, &mut results).await;
-                    for m in &results {
-                        ctx.store
-                            .save(
-                                m.id.to_string(),
-                                m.clone(),
-                                Duration::from_secs(3600),
-                            );
-                    }
-                    return Ok(results);
-                }
-                Ok(None) => continue,
-                Err(e) => {
-                    warn!(addon = %r.row.name, error = %e, "search addon error")
-                }
+                searches.push((r, search));
             }
         }
-        Ok(vec![])
+        // `join_all` keeps priority order; on a duplicate the first
+        // (higher-priority) copy wins below.
+        let mut results: Vec<db::Media> = futures::future::join_all(
+            searches
+                .iter()
+                .map(|(r, search)| async move {
+                    let answer = search.search(kind, query, limit, ctx);
+                    match tokio::time::timeout(addon_fetch_timeout, answer).await {
+                        Ok(Ok(results)) => return results.unwrap_or_default(),
+                        Ok(Err(e)) => {
+                            warn!(addon = %r.row.name, error = %e, "search addon error")
+                        }
+                        Err(_) => warn!(addon = %r.row.name, "search addon timed out"),
+                    }
+                    vec![]
+                }),
+        )
+        .await
+        .into_iter()
+        .flatten()
+        .collect();
+        // Adopt before deduping: two addons' copies of a stored item end up
+        // with the same id even when they carry different external ids.
+        db::Media::adopt_existing_rows(&ctx.db, &mut results).await;
+        // Dedupe before truncating, so duplicates don't eat into the limit.
+        let mut merged = db::Media::dedupe_by_identity(results);
+        merged.truncate(limit);
+        for m in &merged {
+            ctx.store
+                .save(m.id.to_string(), m.clone(), Duration::from_secs(3600));
+        }
+        Ok(merged)
     }
 
     #[tracing::instrument(skip_all, fields(title = %media.title, kind = %media.kind))]
@@ -2736,15 +2943,20 @@ impl AddonService {
     /// Items detail fetch racing a PlaybackInfo call for the same item used
     /// to each pay the full addon fetch independently and concurrently.
     /// Cache the result briefly and serialize concurrent callers the same way.
+    /// `query` asks addons for subtitles made for one release; the default
+    /// query asks for the title's generic list. Each distinct query is cached
+    /// on its own.
     #[tracing::instrument(skip_all, fields(title = %media.title, kind = %media.kind))]
     pub async fn fetch_subtitles(
         &self,
         media: &mut db::Media,
+        query: &SubtitleQuery,
         ctx: &AppContext,
         background: bool,
         user_id: Option<Uuid>,
     ) -> Vec<SubtitleInfo> {
         const SUBTITLES_TTL: Duration = Duration::from_secs(5 * 60);
+        const SUBTITLE_ADDON_TIMEOUT: Duration = Duration::from_secs(5);
         static SUBTITLE_LOCKS: KeyedLock<String> = KeyedLock::new();
 
         if media.kind == db::MediaKind::Episode {
@@ -2755,11 +2967,12 @@ impl AddonService {
         }
 
         let cache_key = format!(
-            "addon-subtitles:{}:{}",
+            "addon-subtitles:{}:{}{}",
             media.id,
             user_id
                 .map(|id| id.to_string())
-                .unwrap_or_else(|| "anon".to_string())
+                .unwrap_or_else(|| "anon".to_string()),
+            query.cache_suffix()
         );
         if let Some(cached) = ctx
             .store
@@ -2786,22 +2999,39 @@ impl AddonService {
 
         debug!(count = addons.len(), "subtitle addons matched");
         let instant = Instant::now();
+        // Addons are queried concurrently so the slowest one sets the wait
+        // instead of the sum, and each is capped so one hung addon can't
+        // stall playback. Results keep addon order.
+        let media_ref: &db::Media = media;
+        let fetched = futures::future::join_all(
+            addons
+                .iter()
+                .map(|r| async move {
+                    debug!(addon = %r.row.name, "fetching subtitles from addon");
+                    let result = tokio::time::timeout(
+                        SUBTITLE_ADDON_TIMEOUT,
+                        r.subtitle
+                            .as_ref()
+                            .unwrap()
+                            .subtitle_fetch(media_ref, query, &ctx.db),
+                    )
+                    .await;
+                    (r, result)
+                }),
+        )
+        .await;
         let mut subs = vec![];
-        for r in &addons {
-            debug!(addon = %r.row.name, "fetching subtitles from addon");
-            match r
-                .subtitle
-                .as_ref()
-                .unwrap()
-                .subtitle_fetch(media, &ctx.db)
-                .await
-            {
-                Ok(s) => {
+        for (r, result) in fetched {
+            match result {
+                Ok(Ok(s)) => {
                     debug!(addon = %r.row.name, count = s.len(), "subtitle addon returned results");
                     subs.extend(s);
                 }
-                Err(e) => {
+                Ok(Err(e)) => {
                     warn!(addon = %r.row.name, error = %e, "subtitle addon failed")
+                }
+                Err(_) => {
+                    warn!(addon = %r.row.name, timeout = ?SUBTITLE_ADDON_TIMEOUT, "subtitle addon timed out")
                 }
             }
         }
@@ -2810,8 +3040,33 @@ impl AddonService {
         } else {
             info!(subs = subs.len(), addons = addons.len(), elapsed = ?instant.elapsed(), "subtitles fetched");
         }
-        ctx.store
-            .save(cache_key, subs.clone(), SUBTITLES_TTL);
+        // An addon skipped while its manifest is unreachable would be missing
+        // from this result until the cache expires, even once it recovers.
+        let mut skipped_unreachable = false;
+        for r in self
+            .inner
+            .load()
+            .iter()
+            .filter(|r| {
+                r.caps
+                    .manifest_unreachable
+                    && r.row
+                        .resources
+                        .contains(&ResourceType::Subtitles)
+            })
+        {
+            if r.live_id_prefixes(&ResourceType::Subtitles)
+                .await
+                .is_err()
+            {
+                skipped_unreachable = true;
+                break;
+            }
+        }
+        if !skipped_unreachable {
+            ctx.store
+                .save(cache_key, subs.clone(), SUBTITLES_TTL);
+        }
         subs
     }
 
@@ -2837,9 +3092,16 @@ impl AddonService {
             .map(|r| async move {
                 let name = &r.row.name;
                 let t = std::time::Instant::now();
-                let id_prefixes = r
-                    .resource_id_prefixes(&ResourceType::Stream)
-                    .map(|p| p.to_vec());
+                let id_prefixes = match r
+                    .live_id_prefixes(&ResourceType::Stream)
+                    .await
+                {
+                    Ok(p) => p.map(|p| p.into_owned()),
+                    Err(e) => {
+                        warn!(addon = %name, error = %e, "stream addon manifest unavailable");
+                        return vec![];
+                    }
+                };
                 match r
                     .stream
                     .as_ref()
@@ -3124,17 +3386,14 @@ impl AddonService {
             else {
                 return None;
             };
+            // RemuxDB stores episodes under the series id, so an episode's own
+            // id would look up the wrong thing: no series id, no lookup.
             let external_id = if media.kind == db::MediaKind::Episode {
                 media
                     .grandparent
                     .as_deref()
                     .and_then(|gp| {
                         gp.external_ids
-                            .stremio_lookup_id()
-                    })
-                    .or_else(|| {
-                        media
-                            .external_ids
                             .stremio_lookup_id()
                     })
             } else {
@@ -3153,14 +3412,12 @@ impl AddonService {
                 return None;
             }
             let (season, episode) = if media.kind == db::MediaKind::Episode {
-                (
-                    media
-                        .parent_idx
-                        .map(|v| v as i32),
-                    media
-                        .idx
-                        .map(|v| v as i32),
-                )
+                let (Some(season), Some(episode)) = (media.parent_idx, media.idx)
+                else {
+                    // Without both, the lookup would be series-wide.
+                    return None;
+                };
+                (Some(season as i32), Some(episode as i32))
             } else {
                 (None, None)
             };
@@ -3474,6 +3731,64 @@ impl RemoteMediaStream for AddonCatalogStream {
                 anyhow!("catalog addon does not serve catalog '{}'", self.local_id)
             })
     }
+}
+
+/// Runs one addon's `meta_fetch` under `timeout`, and tries once more if that
+/// first attempt timed out.
+///
+/// A single flaky addon (observed: AIO/aiometadata hanging up to its own 30s
+/// upstream timeout) must not stall an entire item's refresh, hence the cap.
+/// But a timeout is final for the item, not just the call:
+/// `on_meta_fetch_timeout` blacklists the whole series for the rest of the
+/// run, so every episode under it silently skips the addon. During a large
+/// library refresh a burst of fetches can stall for a few seconds at once
+/// while the runtime is busy (Cinemeta answers in ~0.1s when idle), and one
+/// slow moment shouldn't cost a series its metadata. The second attempt gets
+/// the same timeout, so a genuinely hung addon costs at most twice the cap.
+async fn fetch_meta_with_retry(
+    addon: &dyn MetaAddon,
+    addon_name: &str,
+    media: &db::Media,
+    ctx: &AppContext,
+    config: &api::ServerConfiguration,
+    timeout: Duration,
+) -> Result<Option<db::Media>> {
+    if let Ok(result) =
+        tokio::time::timeout(timeout, addon.meta_fetch(media, ctx, config)).await
+    {
+        return result;
+    }
+
+    // The cooldown can have started while the first attempt was waiting.
+    // Same reasoning as the check before the first attempt: a retry that
+    // would only sit out the cooldown is a guaranteed timeout, so don't.
+    let cooldown = addon
+        .rate_limit_cooldown()
+        .await;
+    if cooldown >= timeout {
+        debug!(
+            id = %media.id,
+            addon = %addon_name,
+            cooldown = ?cooldown,
+            "not retrying addon meta_fetch: shared rate limit cooldown exceeds timeout"
+        );
+    } else {
+        let started = std::time::Instant::now();
+        let retried =
+            tokio::time::timeout(timeout, addon.meta_fetch(media, ctx, config)).await;
+        info!(
+            id = %media.id,
+            addon = %addon_name,
+            outcome = if retried.is_ok() { "answered" } else { "timed out again" },
+            elapsed = ?started.elapsed(),
+            "addon meta_fetch timed out, retried once"
+        );
+        if let Ok(result) = retried {
+            return result;
+        }
+    }
+    addon.on_meta_fetch_timeout(media);
+    Err(anyhow!("addon meta_fetch timed out after {:?}", timeout))
 }
 
 pub fn make_media_id(addon_id: Uuid, local_id: &str) -> String {
@@ -3865,6 +4180,52 @@ mod tests {
         assert!(!episode_in_active_window(&child));
     }
 
+    // A freshly fetched TMDB episode carries its air date in `released_at` and
+    // never a digital date, so an old episode must read as inactive from the
+    // air date alone, not be refreshed every night forever.
+    #[test]
+    fn old_air_date_without_digital_date_is_inactive() {
+        let child = db::Media {
+            released_at: Some(days_ago(400)),
+            ..Default::default()
+        };
+        assert!(!episode_in_active_window(&child));
+    }
+
+    #[test]
+    fn recent_air_date_without_digital_date_is_active() {
+        let child = db::Media {
+            released_at: Some(days_ago(10)),
+            ..Default::default()
+        };
+        assert!(episode_in_active_window(&child));
+    }
+
+    #[test]
+    fn upcoming_air_date_without_digital_date_is_active() {
+        let child = db::Media {
+            released_at: Some(days_from_now(7)),
+            ..Default::default()
+        };
+        assert!(episode_in_active_window(&child));
+    }
+
+    // The stored digital date wins over the freshly fetched row, which has none.
+    #[test]
+    fn stored_old_digital_date_makes_fresh_row_inactive() {
+        let child = db::Media::default();
+        assert!(!episode_in_active_window_with(&child, Some(days_ago(300))));
+    }
+
+    #[test]
+    fn stored_recent_digital_date_makes_fresh_row_active() {
+        let child = db::Media {
+            released_at: Some(days_ago(400)),
+            ..Default::default()
+        };
+        assert!(episode_in_active_window_with(&child, Some(days_ago(5))));
+    }
+
     // --- series_is_active ---
 
     #[test]
@@ -4219,6 +4580,8 @@ mod tests {
                 system: false,
                 is_default: false,
                 http_redirect_stream: false,
+                subtitle_extraction: false,
+                probe_on_scan: false,
                 service_filter: vec![],
             },
             caps: AddonCapabilities {
@@ -4266,6 +4629,27 @@ mod tests {
         );
     }
 
+    #[test]
+    fn subtitle_query_cache_suffix_keeps_default_keys_and_separates_releases() {
+        let release = |filename: &str, size| SubtitleQuery {
+            filename: Some(filename.into()),
+            video_size: size,
+        };
+        assert_eq!(SubtitleQuery::default().cache_suffix(), "");
+        assert_ne!(
+            release("a.mkv", Some(1)).cache_suffix(),
+            release("b.mkv", Some(1)).cache_suffix()
+        );
+        assert_ne!(
+            release("a.mkv", Some(1)).cache_suffix(),
+            release("a.mkv", Some(2)).cache_suffix()
+        );
+        assert_ne!(
+            release("a.mkv", None).cache_suffix(),
+            SubtitleQuery::default().cache_suffix()
+        );
+    }
+
     struct CountingSubtitleAddon {
         calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     }
@@ -4279,6 +4663,7 @@ mod tests {
         async fn subtitle_fetch(
             &self,
             _media: &db::Media,
+            _query: &SubtitleQuery,
             _db: &SqlitePool,
         ) -> Result<Vec<SubtitleInfo>> {
             self.calls
@@ -4324,6 +4709,8 @@ mod tests {
                 system: true,
                 is_default: false,
                 http_redirect_stream: false,
+                subtitle_extraction: false,
+                probe_on_scan: false,
                 service_filter: vec![],
             },
             caps: AddonCapabilities {
@@ -4354,9 +4741,10 @@ mod tests {
         let mut media_b = media_a.clone();
         let user_id = uuid::Uuid::new_v4();
 
+        let query = SubtitleQuery::default();
         let (subs_a, subs_b) = tokio::join!(
-            service.fetch_subtitles(&mut media_a, &ctx, false, Some(user_id)),
-            service.fetch_subtitles(&mut media_b, &ctx, false, Some(user_id)),
+            service.fetch_subtitles(&mut media_a, &query, &ctx, false, Some(user_id),),
+            service.fetch_subtitles(&mut media_b, &query, &ctx, false, Some(user_id),),
         );
 
         assert_eq!(
@@ -4366,6 +4754,418 @@ mod tests {
         );
         assert_eq!(subs_a.len(), 1);
         assert_eq!(subs_b.len(), 1);
+    }
+
+    fn unreachable_runtime(
+        resources: Vec<ResourceType>,
+        kind: Option<Arc<dyn AddonKind>>,
+    ) -> AddonRuntime {
+        let now = chrono::Utc::now().naive_utc();
+        AddonRuntime {
+            row: addon::Addon {
+                id: uuid::Uuid::new_v4(),
+                name: "unreachable".into(),
+                preset: AddonPresetRef {
+                    kind: "scripted".into(),
+                    config: serde_json::Value::Null.into(),
+                },
+                resources,
+                types: vec![],
+                enabled: true,
+                priority: 0,
+                created_at: now,
+                updated_at: now,
+                system: true,
+                is_default: false,
+                http_redirect_stream: false,
+                subtitle_extraction: false,
+                probe_on_scan: false,
+                service_filter: vec![],
+            },
+            caps: AddonCapabilities {
+                manifest_unreachable: true,
+                kind,
+                ..Default::default()
+            },
+        }
+    }
+
+    struct RecoveredManifestKind;
+
+    #[async_trait]
+    impl AddonKind for RecoveredManifestKind {
+        fn id(&self) -> &'static str {
+            "recovered"
+        }
+
+        async fn available_info(
+            &self,
+        ) -> Result<
+            Option<(
+                Vec<remux_sdks::stremio::ResourceRef>,
+                Vec<remux_sdks::stremio::MediaType>,
+            )>,
+        > {
+            Ok(Some((
+                vec![remux_sdks::stremio::ResourceRef {
+                    name: ResourceType::Meta,
+                    types: vec![],
+                    id_prefixes: Some(vec!["tt".into()]),
+                }],
+                vec![],
+            )))
+        }
+    }
+
+    struct FailingManifestKind;
+
+    #[async_trait]
+    impl AddonKind for FailingManifestKind {
+        fn id(&self) -> &'static str {
+            "failing"
+        }
+
+        async fn available_info(&self) -> Result<Option<ManifestInfo>> {
+            Err(anyhow!("manifest unreachable"))
+        }
+    }
+
+    fn media_with_imdb(imdb: &str) -> db::Media {
+        db::Media {
+            kind: db::MediaKind::Movie,
+            external_ids: db::ExternalIds {
+                imdb: db::NonEmptyString::try_new(imdb.to_string()).ok(),
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn unreachable_addon_is_skipped_until_its_manifest_loads() {
+        let mut runtime = unreachable_runtime(
+            vec![ResourceType::Meta],
+            Some(Arc::new(FailingManifestKind)),
+        );
+        runtime
+            .caps
+            .meta = Some(Arc::new(AlwaysMeta));
+        let media = media_with_imdb("tt0111161");
+        assert!(!PickCap::<dyn MetaAddon>::pick(&runtime, &media).await);
+    }
+
+    #[tokio::test]
+    async fn recovered_addon_applies_its_manifest_id_prefixes() {
+        let mut runtime = unreachable_runtime(
+            vec![ResourceType::Meta],
+            Some(Arc::new(RecoveredManifestKind)),
+        );
+        runtime
+            .caps
+            .meta = Some(Arc::new(AlwaysMeta));
+        assert!(
+            PickCap::<dyn MetaAddon>::pick(&runtime, &media_with_imdb("tt0111161"))
+                .await
+        );
+        assert!(
+            !PickCap::<dyn MetaAddon>::pick(&runtime, &media_with_imdb("xx0111161"))
+                .await
+        );
+    }
+
+    struct AlwaysMeta;
+
+    #[async_trait]
+    impl MetaAddon for AlwaysMeta {
+        async fn supports(&self, _media: &db::Media) -> bool {
+            true
+        }
+
+        async fn meta_fetch(
+            &self,
+            _media: &db::Media,
+            _ctx: &AppContext,
+            _config: &crate::api::ServerConfiguration,
+        ) -> Result<Option<db::Media>> {
+            Ok(None)
+        }
+    }
+
+    /// Hangs on the first call, answers on the next ones: a stall that is
+    /// over by the time the call is repeated.
+    struct StallsOnce {
+        calls: std::sync::atomic::AtomicUsize,
+        timeouts: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait]
+    impl MetaAddon for StallsOnce {
+        async fn supports(&self, _media: &db::Media) -> bool {
+            true
+        }
+
+        async fn meta_fetch(
+            &self,
+            media: &db::Media,
+            _ctx: &AppContext,
+            _config: &crate::api::ServerConfiguration,
+        ) -> Result<Option<db::Media>> {
+            let n = self
+                .calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if n == 0 {
+                std::future::pending::<()>().await;
+            }
+            Ok(Some(db::Media {
+                title: media
+                    .title
+                    .clone(),
+                ..Default::default()
+            }))
+        }
+
+        fn on_meta_fetch_timeout(&self, _media: &db::Media) {
+            self.timeouts
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_single_stalled_meta_fetch_is_retried_instead_of_failing_the_item() {
+        let (_server, guard) = crate::integration_test::new_test_server()
+            .await
+            .unwrap();
+        let ctx = &guard.0;
+        let config = db::Settings::get_config_or_default(&ctx.db).await;
+        let addon = StallsOnce {
+            calls: Default::default(),
+            timeouts: Default::default(),
+        };
+        let media = db::Media {
+            kind: db::MediaKind::Episode,
+            title: "Pilot".into(),
+            ..Default::default()
+        };
+
+        let patch = fetch_meta_with_retry(
+            &addon,
+            "stalls-once",
+            &media,
+            ctx,
+            &config,
+            Duration::from_millis(100),
+        )
+        .await
+        .expect("second attempt succeeds")
+        .expect("addon returned a patch");
+
+        assert_eq!(patch.title, "Pilot");
+        assert_eq!(
+            addon
+                .timeouts
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a recovered fetch must not blacklist the series"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_meta_fetch_that_keeps_stalling_still_times_out() {
+        struct Hangs {
+            calls: std::sync::atomic::AtomicUsize,
+            timeouts: std::sync::atomic::AtomicUsize,
+        }
+
+        #[async_trait]
+        impl MetaAddon for Hangs {
+            async fn supports(&self, _media: &db::Media) -> bool {
+                true
+            }
+            async fn meta_fetch(
+                &self,
+                _media: &db::Media,
+                _ctx: &AppContext,
+                _config: &crate::api::ServerConfiguration,
+            ) -> Result<Option<db::Media>> {
+                self.calls
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                std::future::pending().await
+            }
+            fn on_meta_fetch_timeout(&self, _media: &db::Media) {
+                self.timeouts
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+
+        let (_server, guard) = crate::integration_test::new_test_server()
+            .await
+            .unwrap();
+        let ctx = &guard.0;
+        let config = db::Settings::get_config_or_default(&ctx.db).await;
+        let addon = Hangs {
+            calls: Default::default(),
+            timeouts: Default::default(),
+        };
+        let err = fetch_meta_with_retry(
+            &addon,
+            "hangs",
+            &db::Media::default(),
+            ctx,
+            &config,
+            Duration::from_millis(50),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("timed out")
+        );
+        assert_eq!(
+            addon
+                .calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "a first timeout is retried once"
+        );
+        assert_eq!(
+            addon
+                .timeouts
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn no_retry_when_the_rate_limit_cooldown_outlasts_the_timeout() {
+        struct Cooling {
+            calls: std::sync::atomic::AtomicUsize,
+            timeouts: std::sync::atomic::AtomicUsize,
+        }
+
+        #[async_trait]
+        impl MetaAddon for Cooling {
+            async fn supports(&self, _media: &db::Media) -> bool {
+                true
+            }
+            async fn meta_fetch(
+                &self,
+                _media: &db::Media,
+                _ctx: &AppContext,
+                _config: &crate::api::ServerConfiguration,
+            ) -> Result<Option<db::Media>> {
+                self.calls
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                std::future::pending().await
+            }
+            fn on_meta_fetch_timeout(&self, _media: &db::Media) {
+                self.timeouts
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+            async fn rate_limit_cooldown(&self) -> Duration {
+                Duration::from_secs(60)
+            }
+        }
+
+        let (_server, guard) = crate::integration_test::new_test_server()
+            .await
+            .unwrap();
+        let ctx = &guard.0;
+        let config = db::Settings::get_config_or_default(&ctx.db).await;
+        let addon = Cooling {
+            calls: Default::default(),
+            timeouts: Default::default(),
+        };
+        let err = fetch_meta_with_retry(
+            &addon,
+            "cooling",
+            &db::Media::default(),
+            ctx,
+            &config,
+            Duration::from_millis(50),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("timed out")
+        );
+        assert_eq!(
+            addon
+                .calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the retry must be skipped during a cooldown"
+        );
+        assert_eq!(
+            addon
+                .timeouts
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn manifest_cache_remembers_success_and_throttles_failure() {
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let failing = ManifestCache::default();
+        for _ in 0..3 {
+            let res = failing
+                .get_or_fetch(|| async {
+                    calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Err(anyhow!("down"))
+                })
+                .await;
+            assert!(res.is_err());
+        }
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        let loaded = ManifestCache::default();
+        for _ in 0..3 {
+            loaded
+                .get_or_fetch(|| async {
+                    calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Ok((vec![], vec![]))
+                })
+                .await
+                .unwrap();
+        }
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn subtitles_are_not_cached_while_a_subtitle_addon_is_unreachable() {
+        let mut runtime = unreachable_runtime(
+            vec![ResourceType::Subtitles],
+            Some(Arc::new(FailingManifestKind)),
+        );
+        runtime
+            .caps
+            .manifest_unreachable = true;
+        let service = AddonService {
+            inner: Arc::new(ArcSwap::from_pointee(vec![runtime])),
+        };
+        let (_, guard) = crate::integration_test::new_test_server()
+            .await
+            .unwrap();
+        let ctx = guard
+            .0
+            .clone();
+        let mut media = db::Media {
+            id: uuid::Uuid::new_v4(),
+            kind: db::MediaKind::Movie,
+            title: "Unreachable Subtitles".into(),
+            ..Default::default()
+        };
+
+        service
+            .fetch_subtitles(&mut media, &SubtitleQuery::default(), &ctx, false, None)
+            .await;
+
+        assert!(
+            ctx.store
+                .get::<Vec<SubtitleInfo>>(&format!("addon-subtitles:{}:anon", media.id))
+                .is_none()
+        );
     }
 
     /// Remote search mints a fresh id (and fresh, possibly-drifted data) per
@@ -4500,5 +5300,252 @@ mod tests {
             results[0].title, stored.title,
             "a deezer-only match is replaced wholesale too"
         );
+    }
+
+    /// Answers with its hits (or an error if `fail`) after sleeping `delay`
+    /// and, if gated, once the test opens the gate.
+    #[derive(Default)]
+    struct FixedSearch {
+        hits: Vec<db::Media>,
+        fail: bool,
+        delay: Duration,
+        gate: Option<Arc<tokio::sync::Notify>>,
+    }
+
+    #[async_trait]
+    impl SearchAddon for FixedSearch {
+        async fn search_supports(&self, _kind: &db::MediaKind) -> bool {
+            true
+        }
+
+        async fn search(
+            &self,
+            _kind: &db::MediaKind,
+            _query: &str,
+            _limit: usize,
+            _ctx: &AppContext,
+        ) -> Result<Option<Vec<db::Media>>> {
+            tokio::time::sleep(self.delay).await;
+            if let Some(gate) = &self.gate {
+                gate.notified()
+                    .await;
+            }
+            if self.fail {
+                return Err(anyhow!("search addon down"));
+            }
+            Ok(Some(
+                self.hits
+                    .clone(),
+            ))
+        }
+    }
+
+    fn search_runtime(results: Vec<db::Media>) -> AddonRuntime {
+        fixed_search_runtime(Arc::new(FixedSearch {
+            hits: results,
+            ..Default::default()
+        }))
+    }
+
+    fn fixed_search_runtime(search: Arc<FixedSearch>) -> AddonRuntime {
+        let mut runtime = unreachable_runtime(vec![ResourceType::Search], None);
+        runtime
+            .caps
+            .search = Some(search);
+        runtime
+    }
+
+    fn search_hit(title: &str, imdb: &str) -> db::Media {
+        db::Media {
+            id: Uuid::new_v4(),
+            title: title.into(),
+            ..media_with_imdb(imdb)
+        }
+    }
+
+    async fn search_titles(
+        service: &AddonService,
+        ctx: &AppContext,
+        query: &str,
+        limit: usize,
+    ) -> Vec<String> {
+        service
+            .search(&db::MediaKind::Movie, query, limit, ctx, None)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|m| m.title)
+            .collect()
+    }
+
+    async fn search_with(runtimes: Vec<AddonRuntime>, limit: usize) -> Vec<String> {
+        let service = AddonService {
+            inner: Arc::new(ArcSwap::from_pointee(runtimes)),
+        };
+        let (_, guard) = crate::integration_test::new_test_server()
+            .await
+            .unwrap();
+        search_titles(&service, &guard.0, "query", limit).await
+    }
+
+    /// Results from every search addon are appended in priority order; the
+    /// same item from two addons (shared imdb id) appears once, as the
+    /// higher-priority copy.
+    #[tokio::test]
+    async fn search_appends_addons_in_priority_order_and_dedupes() {
+        let titles = search_with(
+            vec![
+                search_runtime(vec![]),
+                search_runtime(vec![
+                    search_hit("Shared (high)", "tt9900001"),
+                    search_hit("High 2", "tt9900002"),
+                    search_hit("High 3", "tt9900004"),
+                ]),
+                search_runtime(vec![
+                    search_hit("Shared (low)", "tt9900001"),
+                    search_hit("Low 2", "tt9900003"),
+                ]),
+            ],
+            20,
+        )
+        .await;
+        assert_eq!(titles, ["Shared (high)", "High 2", "High 3", "Low 2"]);
+    }
+
+    /// A higher-priority addon having answered doesn't cut off a slower
+    /// lower-priority one: every addon is awaited up to the timeout.
+    #[tokio::test]
+    async fn search_waits_for_slower_lower_priority_addon() {
+        let titles = search_with(
+            vec![
+                search_runtime(vec![search_hit("Fast", "tt9900001")]),
+                fixed_search_runtime(Arc::new(FixedSearch {
+                    hits: vec![search_hit("Slow", "tt9900002")],
+                    delay: Duration::from_millis(300),
+                    ..Default::default()
+                })),
+            ],
+            20,
+        )
+        .await;
+        assert_eq!(titles, ["Fast", "Slow"]);
+    }
+
+    /// An addon that doesn't answer within the configured
+    /// `addon_fetch_timeout_secs` is left out of the results.
+    #[tokio::test]
+    async fn search_leaves_out_addon_exceeding_timeout() {
+        let service = AddonService {
+            inner: Arc::new(ArcSwap::from_pointee(vec![
+                fixed_search_runtime(Arc::new(FixedSearch {
+                    hits: vec![search_hit("Never", "tt9900002")],
+                    gate: Some(Arc::new(tokio::sync::Notify::new())),
+                    ..Default::default()
+                })),
+                search_runtime(vec![search_hit("Fast", "tt9900001")]),
+            ])),
+        };
+        let (_, guard) = crate::integration_test::new_test_server()
+            .await
+            .unwrap();
+        db::Settings::set_config(
+            &guard
+                .0
+                .db,
+            &crate::api::ServerConfiguration {
+                addon_fetch_timeout_secs: Some(1),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let started = tokio::time::Instant::now();
+        assert_eq!(
+            search_titles(&service, &guard.0, "query", 20).await,
+            ["Fast"]
+        );
+        assert!(started.elapsed() >= Duration::from_secs(1));
+    }
+
+    /// Results that share an external id only through a chain are one item:
+    /// `{tmdb}`, `{tmdb, imdb}`, `{imdb}` collapses to the first, also when
+    /// the linking result comes last and joins two earlier groups. An
+    /// unrelated result stays separate.
+    #[tokio::test]
+    async fn search_dedupes_results_linked_through_a_chain_of_ids() {
+        let hit = |title: &str, tmdb: Option<i64>, imdb: Option<&str>| db::Media {
+            id: Uuid::new_v4(),
+            title: title.into(),
+            kind: db::MediaKind::Movie,
+            external_ids: db::ExternalIds {
+                tmdb,
+                imdb: imdb
+                    .and_then(|i| db::NonEmptyString::try_new(i.to_string()).ok()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let tmdb_only = hit("First", Some(9900101), None);
+        let both = hit("Both", Some(9900101), Some("tt9900101"));
+        let imdb_only = hit("Imdb", None, Some("tt9900101"));
+        let other = hit("Other", Some(9900102), Some("tt9900102"));
+        for chain in [
+            [tmdb_only.clone(), both.clone(), imdb_only.clone()],
+            [tmdb_only.clone(), imdb_only.clone(), both.clone()],
+        ] {
+            let mut runtimes: Vec<AddonRuntime> = chain
+                .into_iter()
+                .map(|m| search_runtime(vec![m]))
+                .collect();
+            runtimes.push(search_runtime(vec![other.clone()]));
+            assert_eq!(search_with(runtimes, 20).await, ["First", "Other"]);
+        }
+    }
+
+    /// An addon whose search failed doesn't hide the others' results.
+    #[tokio::test]
+    async fn failed_search_addon_does_not_hide_other_results() {
+        let titles = search_with(
+            vec![
+                fixed_search_runtime(Arc::new(FixedSearch {
+                    fail: true,
+                    ..Default::default()
+                })),
+                search_runtime(vec![search_hit("Found", "tt9900001")]),
+            ],
+            20,
+        )
+        .await;
+        assert_eq!(titles, ["Found"]);
+    }
+
+    /// A TMDB result and a Stremio result for the same title (a `tmdb:` id, as
+    /// AIOStreams' search sends) collapse to the first occurrence.
+    #[tokio::test]
+    async fn search_dedupes_tmdb_and_stremio_copies() {
+        let tmdb = db::Media {
+            id: Uuid::new_v4(),
+            title: "Inception (TMDB)".into(),
+            kind: db::MediaKind::Movie,
+            external_ids: db::ExternalIds {
+                tmdb: Some(27205),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let meta: remux_sdks::stremio::Meta =
+            serde_json::from_value(serde_json::json!({
+                "id": "tmdb:27205",
+                "type": "movie",
+                "name": "Inception (Stremio)",
+            }))
+            .unwrap();
+        let stremio = db::Media::try_from(meta).unwrap();
+        let titles = search_with(
+            vec![search_runtime(vec![tmdb]), search_runtime(vec![stremio])],
+            20,
+        )
+        .await;
+        assert_eq!(titles, ["Inception (TMDB)"]);
     }
 }

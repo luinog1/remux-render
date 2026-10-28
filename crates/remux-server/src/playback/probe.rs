@@ -22,7 +22,11 @@ fn should_retry_with_relaxed_hls_extensions(stderr: &str) -> bool {
         || stderr.contains("mismatches allowed extensions")
 }
 
-fn ffprobe_args(url: &str, allow_nonstandard_hls_extensions: bool) -> Vec<String> {
+fn ffprobe_args(
+    url: &str,
+    allow_nonstandard_hls_extensions: bool,
+    headers: Option<&str>,
+) -> Vec<String> {
     let mut args = vec![
         "-v".into(),
         "error".into(),
@@ -41,6 +45,9 @@ fn ffprobe_args(url: &str, allow_nonstandard_hls_extensions: bool) -> Vec<String
             "-extension_picky".into(),
             "0".into(),
         ]);
+    }
+    if let Some(headers) = headers {
+        args.extend(["-headers".into(), headers.into()]);
     }
     args.push(url.into());
     args
@@ -65,7 +72,8 @@ mod extension_retry_tests {
 
     #[test]
     fn retry_uses_hls_extension_compatibility_options() {
-        let args = super::ffprobe_args("https://relay.example/hls?url=playlist", true);
+        let args =
+            super::ffprobe_args("https://relay.example/hls?url=playlist", true, None);
 
         assert!(
             args.windows(2)
@@ -605,16 +613,109 @@ fn apply_video_bitrate_fallback(
     }
 }
 
+/// Reduces an HTTP(S) URL to `scheme://host[:port]/…` for logs and errors:
+/// signed query tokens, credentials and path segments can all be secrets.
+/// Filesystem paths and other inputs pass through unchanged.
+pub(crate) fn redact_url(url: &str) -> String {
+    match url::Url::parse(url) {
+        Ok(parsed) if matches!(parsed.scheme(), "http" | "https") => {
+            let host = parsed
+                .host_str()
+                .unwrap_or("");
+            match parsed.port() {
+                Some(port) => format!("{}://{host}:{port}/…", parsed.scheme()),
+                None => format!("{}://{host}/…", parsed.scheme()),
+            }
+        }
+        _ => url.to_string(),
+    }
+}
+
+/// Runs ffprobe to completion, killing the process once `deadline` passes so a
+/// hung source can't leave it running after the caller has given up.
+fn run_ffprobe(
+    args: &[String],
+    deadline: Option<std::time::Instant>,
+) -> Result<std::process::Output> {
+    use std::{io::Read, process::Stdio};
+
+    let mut child = std::process::Command::new(ffprobe_bin())
+        .args(args)
+        .hide_console()
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| anyhow!("Failed to run ffprobe: {}", e))?;
+
+    fn drain<R: Read + Send + 'static>(
+        pipe: Option<R>,
+    ) -> std::thread::JoinHandle<Vec<u8>> {
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            if let Some(mut pipe) = pipe {
+                let _ = pipe.read_to_end(&mut buf);
+            }
+            buf
+        })
+    }
+    let stdout = drain(
+        child
+            .stdout
+            .take(),
+    );
+    let stderr = drain(
+        child
+            .stderr
+            .take(),
+    );
+
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break Some(status);
+        }
+        if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+            let _ = child.kill();
+            let _ = child.wait();
+            break None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    };
+    let stdout = stdout
+        .join()
+        .unwrap_or_default();
+    let stderr = stderr
+        .join()
+        .unwrap_or_default();
+    match status {
+        Some(status) => Ok(std::process::Output {
+            status,
+            stdout,
+            stderr,
+        }),
+        None => Err(anyhow!("ffprobe timed out")),
+    }
+}
+
 /// Probe a media URL with ffprobe and return a Jellyfin `MediaSourceInfo`
 /// alongside any chapter-derived `MediaSegments`.
 pub fn probe_media(url: &str) -> Result<(api::MediaSourceInfo, MediaSegments)> {
-    debug!(url, "probing media");
+    probe_media_with(url, None, None)
+}
 
-    let mut output = std::process::Command::new(ffprobe_bin())
-        .args(ffprobe_args(url, false))
-        .hide_console()
-        .output()
-        .map_err(|e| anyhow!("Failed to run ffprobe: {}", e))?;
+/// `headers` is an ffmpeg `-headers` value (`"Name: value\r\n"` lines) sent with
+/// HTTP requests, e.g. for a WebDAV source that needs basic auth. `timeout`
+/// bounds the whole probe; ffprobe is killed when it expires.
+pub fn probe_media_with(
+    url: &str,
+    headers: Option<&str>,
+    timeout: Option<std::time::Duration>,
+) -> Result<(api::MediaSourceInfo, MediaSegments)> {
+    let shown = redact_url(url);
+    debug!(url = %shown, "probing media");
+    let deadline = timeout.map(|t| std::time::Instant::now() + t);
+
+    let mut output = run_ffprobe(&ffprobe_args(url, false, headers), deadline)?;
 
     if !output
         .status
@@ -623,19 +724,15 @@ pub fn probe_media(url: &str) -> Result<(api::MediaSourceInfo, MediaSegments)> {
             &output.stderr,
         ))
     {
-        output = std::process::Command::new(ffprobe_bin())
-            .args(ffprobe_args(url, true))
-            .hide_console()
-            .output()
-            .map_err(|e| anyhow!("Failed to rerun ffprobe: {}", e))?;
+        output = run_ffprobe(&ffprobe_args(url, true, headers), deadline)?;
     }
 
     if !output
         .status
         .success()
     {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(anyhow!("ffprobe failed for {}: {}", url, stderr));
+        let stderr = String::from_utf8_lossy(&output.stderr).replace(url, &shown);
+        return Err(anyhow!("ffprobe failed for {}: {}", shown, stderr));
     }
 
     let probe: FfprobeOutput = serde_json::from_slice(&output.stdout)
@@ -1151,6 +1248,45 @@ fn can_fallback_to_stale_probe_cache(cached: &api::MediaSourceInfo) -> bool {
                 .is_some())
 }
 
+/// How long a probe of another file than listed is reused before probing
+/// again, in case the resolver now serves the listed file.
+const MISMATCHED_PROBE_TTL: std::time::Duration =
+    std::time::Duration::from_secs(10 * 60);
+
+fn mismatched_probe_key(stream: &db::Media) -> String {
+    let listed = stream
+        .stream_info
+        .as_ref()
+        .and_then(|si| si.size)
+        .unwrap_or_default();
+    format!("probe_mismatch:{}:{listed}", stream.id)
+}
+
+/// A probe of another file than listed is reused only while its marker
+/// lasts, so a later probe of the listed file replaces it and reaches RemuxDB.
+fn reuses_cached_probe(
+    stream: &db::Media,
+    cached: &api::MediaSourceInfo,
+    store: &remux_utils::Store,
+) -> bool {
+    is_reusable_probe_cache(cached)
+        && (!stream
+            .stream_info
+            .as_ref()
+            .is_some_and(|si| si.is_other_file(cached.size))
+            || store
+                .get::<()>(mismatched_probe_key(stream))
+                .is_some())
+}
+
+/// Whether `probe_stream` ran ffprobe for this request; only then is the
+/// result new to RemuxDB. Stored metadata and filename guesses are `Cached`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProbeOutcome {
+    Cached,
+    Probed,
+}
+
 /// Resolve probe data for a single source: cache hit → skip → live probe with fallback.
 pub(crate) async fn probe_stream(
     stream: &db::Media,
@@ -1163,7 +1299,8 @@ pub(crate) async fn probe_stream(
     restrict_resolution: bool,
     port: u16,
     db: &sqlx::SqlitePool,
-) -> axum_anyhow::ApiResult<(api::MediaSourceInfo, db::Media)> {
+    store: &remux_utils::Store,
+) -> axum_anyhow::ApiResult<(api::MediaSourceInfo, db::Media, ProbeOutcome)> {
     if skip_probe {
         let mut info = api::MediaSourceInfo::from(stream.clone());
         // No real probe (RemuxDB miss, and this candidate isn't the one that
@@ -1178,14 +1315,19 @@ pub(crate) async fn probe_stream(
                 warn!(id = %stream.id, error = %e, "failed to persist filename-guessed probe data");
             }
         }
-        return Ok((info, stream.clone()));
+        return Ok((info, stream.clone(), ProbeOutcome::Cached));
     }
+    // A reusable probe of another file still beats failing playback.
     let can_fallback_to_stale = stream
         .probe_data
         .as_ref()
-        .is_some_and(can_fallback_to_stale_probe_cache);
+        .is_some_and(|cached| {
+            can_fallback_to_stale_probe_cache(cached)
+                || (is_reusable_probe_cache(cached)
+                    && !reuses_cached_probe(stream, cached, store))
+        });
     if let Some(cached) = &stream.probe_data {
-        if is_reusable_probe_cache(cached) {
+        if reuses_cached_probe(stream, cached, store) {
             let alive = match stream
                 .stream_info
                 .as_ref()
@@ -1201,11 +1343,11 @@ pub(crate) async fn probe_stream(
                 debug!(id = %stream.id, "probe cache hit, url alive");
                 let mut info = api::MediaSourceInfo::from(stream.clone());
                 apply_video_bitrate_fallback(&mut info.media_streams, info.bitrate);
-                return Ok((info, stream.clone()));
+                return Ok((info, stream.clone(), ProbeOutcome::Cached));
             }
             debug!(id = %stream.id, "probe cache hit but url dead, falling through to fallback");
         } else {
-            debug!(id = %stream.id, "probe cache stale or filename-guess only, re-probing");
+            debug!(id = %stream.id, "probe cache stale, filename-guess only or of another file, re-probing");
         }
     }
     let result = probe_with_fallback(
@@ -1218,12 +1360,32 @@ pub(crate) async fn probe_stream(
         restrict_resolution,
         port,
         db,
-        |url| probe_media(&url),
+        move |url| {
+            probe_media_with(
+                &url,
+                None,
+                Some(std::time::Duration::from_secs(timeout_secs)),
+            )
+        },
     )
     .await;
 
+    if let Ok((probed, effective)) = &result
+        && effective
+            .stream_info
+            .as_ref()
+            .is_some_and(|si| si.is_other_file(probed.size))
+    {
+        info!(
+            id = %effective.id,
+            listed_size = ?effective.stream_info.as_ref().and_then(|si| si.size),
+            probed_size = ?probed.size,
+            "probed file is not the listed release"
+        );
+        store.save(mismatched_probe_key(effective), (), MISMATCHED_PROBE_TTL);
+    }
     match result {
-        Ok(result) => Ok(result),
+        Ok((info, effective)) => Ok((info, effective, ProbeOutcome::Probed)),
         Err(error) if can_fallback_to_stale => {
             warn!(
                 id = %stream.id,
@@ -1232,7 +1394,7 @@ pub(crate) async fn probe_stream(
             );
             let mut info = api::MediaSourceInfo::from(stream.clone());
             apply_video_bitrate_fallback(&mut info.media_streams, info.bitrate);
-            Ok((info, stream.clone()))
+            Ok((info, stream.clone(), ProbeOutcome::Cached))
         }
         Err(error) => Err(error),
     }
@@ -2238,5 +2400,82 @@ mod probe_tests {
                 sibling.id
             );
         }
+    }
+
+    #[test]
+    fn probe_of_another_file_is_reused_only_while_marked() {
+        let store = remux_utils::Store::new(16);
+        let mut stream = http_media("http://a.example.com");
+        stream
+            .stream_info
+            .as_mut()
+            .unwrap()
+            .size = Some(12_811_223_977);
+        let (mut cached, _) = video_probe().unwrap();
+        cached.size = Some(8_657_935_338);
+        // Not a cache hit: a re-probe may find the listed file, new to RemuxDB.
+        assert!(!reuses_cached_probe(&stream, &cached, &store));
+        store.save(mismatched_probe_key(&stream), (), MISMATCHED_PROBE_TTL);
+        assert!(reuses_cached_probe(&stream, &cached, &store));
+    }
+}
+
+#[cfg(test)]
+mod timeout_tests {
+    use super::*;
+
+    #[test]
+    fn probe_of_a_hung_source_is_killed_at_the_timeout() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!(
+            "http://{}/video.mkv",
+            listener
+                .local_addr()
+                .unwrap()
+        );
+        let started = std::time::Instant::now();
+        let result =
+            probe_media_with(&url, None, Some(std::time::Duration::from_millis(700)));
+        let err = result
+            .unwrap_err()
+            .to_string();
+        if err.contains("Failed to run ffprobe") {
+            eprintln!("ffprobe unavailable, skipping");
+            return;
+        }
+        assert!(err.contains("timed out"), "unexpected error: {err}");
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    }
+}
+
+#[cfg(test)]
+mod redact_tests {
+    use super::redact_url;
+
+    #[test]
+    fn http_urls_lose_credentials_path_and_query() {
+        assert_eq!(
+            redact_url("https://user:pw@cdn.example:8443/dl/abc123/f.mkv?token=s3cret"),
+            "https://cdn.example:8443/…"
+        );
+        assert_eq!(redact_url("http://host/a.mkv"), "http://host/…");
+    }
+
+    #[test]
+    fn filesystem_paths_pass_through() {
+        assert_eq!(redact_url("/media/Movies/a.mkv"), "/media/Movies/a.mkv");
+    }
+
+    #[test]
+    fn failure_error_does_not_contain_the_url() {
+        let url = "http://127.0.0.1:1/secret-path/f.mkv?token=s3cret";
+        let err =
+            super::probe_media_with(url, None, Some(std::time::Duration::from_secs(5)))
+                .unwrap_err()
+                .to_string();
+        assert!(
+            !err.contains("s3cret") && !err.contains("secret-path"),
+            "{err}"
+        );
     }
 }

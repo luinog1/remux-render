@@ -72,6 +72,9 @@ pub async fn new_test_server() -> Result<(TestServer, TestGuard)> {
         torrent_http_port: None, // OS picks a free ephemeral port
         torrent_peer_port: None, // avoid the default 6881..6891 range in tests
         disable_dht: true,       // no DHT needed in tests; avoids socket conflicts
+        // Startup tasks (default catalog imports) hit the real TMDB API and write
+        // studios, people and movies into the test DB while a test is running.
+        disable_startup_tasks: true,
         ..Default::default()
     })
     .await
@@ -123,6 +126,7 @@ pub async fn insert_test_source_with_external_subtitle(ctx: &AppContext) -> db::
             language: Some("eng".to_string()),
             ..Default::default()
         }],
+        VideoContainer::Mp4,
     )
     .await
 }
@@ -133,13 +137,24 @@ pub async fn insert_test_source_of_kind(
     ctx: &AppContext,
     kind: db::MediaKind,
 ) -> db::Media {
-    insert_source(ctx, kind, vec![]).await
+    insert_source(ctx, kind, vec![], VideoContainer::Mp4).await
+}
+
+/// [`insert_test_source_of_kind`] with a container other than mp4, e.g. the
+/// raw MPEG-TS a live-TV proxy serves.
+pub async fn insert_test_source_with_container(
+    ctx: &AppContext,
+    kind: db::MediaKind,
+    container: VideoContainer,
+) -> db::Media {
+    insert_source(ctx, kind, vec![], container).await
 }
 
 async fn insert_source(
     ctx: &AppContext,
     kind: db::MediaKind,
     extra_streams: Vec<MediaStream>,
+    container: VideoContainer,
 ) -> db::Media {
     let now = Utc::now().naive_utc();
 
@@ -147,7 +162,7 @@ async fn insert_source(
     // without needing ffprobe or a live network connection.
     let probe = MediaSourceInfo {
         id: Uuid::new_v4(),
-        container: Some(VideoContainer::Mp4),
+        container: Some(container),
         bitrate: Some(8_000_000),
         run_time_ticks: Some(100_000_000),
         media_streams: vec![
@@ -377,6 +392,8 @@ pub async fn register_media_tracker(
         system: false,
         is_default: true,
         http_redirect_stream: false,
+        subtitle_extraction: false,
+        probe_on_scan: false,
         service_filter: vec![],
     };
     row.insert(&ctx.db)
@@ -397,4 +414,87 @@ pub async fn register_media_tracker(
     ctx.addons
         .replace_runtimes_for_test(runtimes);
     row
+}
+
+/// A movie whose PlaybackInfo probe rejected one local source and fell over
+/// to another, recorded under `play_session_id` for the device `token`
+/// belongs to, exactly like PlaybackInfo (which always has a real session)
+/// would. Each file holds "<name> stream"; the rejected source has no probe
+/// data and the fallback's video stream has codec `fallback_video_codec`.
+pub struct ProbeFallbackFixture {
+    pub owner: db::Media,
+    pub rejected: db::Media,
+    pub fallback: db::Media,
+    pub fallback_path: std::path::PathBuf,
+    _dir: tempfile::TempDir,
+}
+
+pub async fn seed_probe_fallback(
+    ctx: &AppContext,
+    token: &str,
+    play_session_id: &str,
+    fallback_video_codec: &str,
+) -> ProbeFallbackFixture {
+    use crate::services::stream_service::{StreamService, StreamServiceConfig};
+
+    let owner = seed_movie(ctx).await;
+    let dir = tempfile::tempdir().unwrap();
+    let mut local_source = async |name: &str| {
+        let path = dir
+            .path()
+            .join(format!("{name}.mkv"));
+        tokio::fs::write(&path, format!("{name} stream"))
+            .await
+            .unwrap();
+        let mut source = insert_test_source(ctx).await;
+        source
+            .stream_info
+            .as_mut()
+            .unwrap()
+            .descriptor = crate::stream::StreamDescriptor::Local(path.clone());
+        (source, path)
+    };
+    let (mut rejected, _) = local_source("rejected").await;
+    let (mut fallback, fallback_path) = local_source("fallback").await;
+    rejected.probe_data = None;
+    fallback
+        .probe_data
+        .as_mut()
+        .unwrap()
+        .media_streams[0]
+        .codec = Some(fallback_video_codec.to_string());
+    for source in [&mut rejected, &mut fallback] {
+        source
+            .save(&ctx.db)
+            .await
+            .unwrap();
+    }
+
+    let device = db::auth::Device::get_by_access_token(&ctx.db, token)
+        .await
+        .unwrap()
+        .unwrap();
+    StreamService::new(StreamServiceConfig {
+        ctx: ctx.clone(),
+        item_id: owner.id,
+        requested_id: Some(rejected.id),
+        show_ungrouped: true,
+        stream_filter: None,
+        user_id: Some(device.user_id),
+    })
+    .save_selected_stream(
+        play_session_id,
+        &device.id,
+        true,
+        rejected.id,
+        fallback.id,
+    );
+
+    ProbeFallbackFixture {
+        owner,
+        rejected,
+        fallback,
+        fallback_path,
+        _dir: dir,
+    }
 }

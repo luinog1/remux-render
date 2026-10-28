@@ -4,6 +4,23 @@ use crate::{common, db};
 use anyhow::Result;
 use chrono::Datelike;
 
+pub fn fields_include_relations(fields: Option<&[ItemFields]>) -> bool {
+    fields.is_some_and(|fields| {
+        fields.contains(&ItemFields::People)
+            || fields.contains(&ItemFields::Genres)
+            || fields.contains(&ItemFields::Studios)
+            || fields.contains(&ItemFields::ProductionLocations)
+    })
+}
+
+pub fn fields_include_people(fields: Option<&[ItemFields]>) -> bool {
+    fields.is_some_and(|fields| fields.contains(&ItemFields::People))
+}
+
+pub fn fields_include_tags(fields: Option<&[ItemFields]>) -> bool {
+    fields.is_some_and(|fields| fields.contains(&ItemFields::Tags))
+}
+
 pub fn inject_lyric_stream(source: &mut MediaSourceInfo) {
     let next_idx = source
         .media_streams
@@ -319,7 +336,45 @@ fn stub_sources(media: &db::Media) -> Vec<MediaSourceInfo> {
     ]
 }
 
+/// The rating shown to clients. The stored `rating_audience` is weighted
+/// towards a prior, which suits sorting but pulls an episode, which has few
+/// votes, to nearly the same score as every other episode. Episodes show the
+/// provider's own score instead.
+fn community_rating(media: &db::Media) -> Option<f64> {
+    let provider = media
+        .external_ratings
+        .as_ref()
+        .filter(|ratings| {
+            ratings
+                .tmdb
+                .is_some()
+        });
+    match (&media.kind, provider) {
+        (db::MediaKind::Episode, Some(ratings)) => ratings.provider_rating(),
+        _ => media.rating_audience,
+    }
+}
+
 pub fn db_media_to_item(media: db::Media, hide_sources: bool) -> BaseItemDto {
+    db_media_to_item_inner(media, hide_sources, true)
+}
+
+pub fn db_media_to_item_for_list(
+    media: db::Media,
+    hide_sources: bool,
+    fields: Option<&[ItemFields]>,
+) -> BaseItemDto {
+    let include_sources = fields.is_some_and(|fields| {
+        fields.contains(&ItemFields::MediaSources) || fields.contains(&ItemFields::Path)
+    });
+    db_media_to_item_inner(media, hide_sources, include_sources)
+}
+
+fn db_media_to_item_inner(
+    media: db::Media,
+    hide_sources: bool,
+    include_sources: bool,
+) -> BaseItemDto {
     use crate::common::{IntoVec, ToRunTimeTicks};
 
     let type_ = media
@@ -465,9 +520,7 @@ pub fn db_media_to_item(media: db::Media, hide_sources: bool) -> BaseItemDto {
         production_year: media
             .released_at
             .map(|d| d.year() as i64),
-        community_rating: media
-            .rating_audience
-            .map(|r| (r * 10.0).round() / 10.0),
+        community_rating: community_rating(&media).map(|r| (r * 10.0).round() / 10.0),
         critic_rating: media
             .rating_critic
             .clone(),
@@ -875,12 +928,26 @@ pub fn db_media_to_item(media: db::Media, hide_sources: bool) -> BaseItemDto {
                 })
                 .unwrap_or_else(|| match media.kind {
                     db::MediaKind::Episode
+                    | db::MediaKind::TvChannel
+                    | db::MediaKind::TvProgram
                     | db::MediaKind::Collection
                     | db::MediaKind::Folder => 16.0 / 9.0,
                     _ => 0.6,
                 }),
         ),
         remux: Some(RemuxInfo {
+            watchlist: Some(
+                media
+                    .user_state
+                    .as_ref()
+                    .is_some_and(|s| s.watchlist),
+            ),
+            ignored: Some(
+                media
+                    .user_state
+                    .as_ref()
+                    .is_some_and(|s| s.ignored),
+            ),
             collection_kind: media
                 .collection_kind
                 .as_ref()
@@ -916,6 +983,7 @@ pub fn db_media_to_item(media: db::Media, hide_sources: bool) -> BaseItemDto {
             image_config: media
                 .collection_image_config
                 .clone(),
+            sort_order: media.sort_order,
         }),
         enable_media_source_display: Some(true),
         date_created: Some(
@@ -1056,41 +1124,43 @@ pub fn db_media_to_item(media: db::Media, hide_sources: bool) -> BaseItemDto {
             || media.kind == db::MediaKind::Track)
     {
         item.can_download = Some(true);
-        item.media_sources = match media
-            .sources
-            .clone()
-        {
-            Some(sources) if sources.is_empty() => Some(stub_sources(&media)),
-            Some(sources) => {
-                let mut infos: Vec<MediaSourceInfo> = sources
-                    .into_iter()
-                    .map(MediaSourceInfo::from)
-                    .collect();
-                // Clients expect the first source's ID to equal the parent item's ID.
-                if !infos.is_empty() {
-                    infos[0].id = media.id;
-                    infos[0].e_tag = media.id;
-                }
-                Some(infos)
-            }
-            None => Some(stub_sources(&media)),
-        };
-        item.path = item
-            .media_sources
-            .as_ref()
-            .and_then(|s| s.first())
-            .and_then(|s| {
-                s.path
-                    .as_deref()
-            })
-            .map(|p| format!("{}.strm", p));
-        item.bitrate = item
-            .media_sources
-            .as_ref()
-            .and_then(|s| s.first())
-            .and_then(|s| s.bitrate);
         if media.kind != db::MediaKind::Track {
             item.video_type = Some(VideoType::VideoFile);
+        }
+        if include_sources {
+            item.media_sources = match media
+                .sources
+                .clone()
+            {
+                Some(sources) if sources.is_empty() => Some(stub_sources(&media)),
+                Some(sources) => {
+                    let mut infos: Vec<MediaSourceInfo> = sources
+                        .into_iter()
+                        .map(MediaSourceInfo::from)
+                        .collect();
+                    // Clients expect the first source's ID to equal the parent item's ID.
+                    if !infos.is_empty() {
+                        infos[0].id = media.id;
+                        infos[0].e_tag = media.id;
+                    }
+                    Some(infos)
+                }
+                None => Some(stub_sources(&media)),
+            };
+            item.path = item
+                .media_sources
+                .as_ref()
+                .and_then(|s| s.first())
+                .and_then(|s| {
+                    s.path
+                        .as_deref()
+                })
+                .map(|p| format!("{}.strm", p));
+            item.bitrate = item
+                .media_sources
+                .as_ref()
+                .and_then(|s| s.first())
+                .and_then(|s| s.bitrate);
         }
     }
 
@@ -1121,33 +1191,35 @@ pub fn db_media_to_item(media: db::Media, hide_sources: bool) -> BaseItemDto {
         item.can_download = Some(false);
         item.lock_data = Some(false);
         item.is_place_holder = Some(false);
-        // Channels use direct-play passthrough — no GStreamer probe needed.
-        item.media_sources = Some(vec![MediaSourceInfo {
-            id: media.id,
-            e_tag: media.id,
-            name: Some(
-                media
-                    .title
-                    .clone(),
-            ),
-            path: media
-                .stream_info
-                .as_ref()
-                .and_then(|si| {
-                    si.descriptor
-                        .as_http_url()
-                        .map(str::to_owned)
-                }),
-            protocol: MediaProtocol::Http,
-            is_remote: true,
-            is_infinite_stream: true,
-            supports_direct_play: true,
-            supports_direct_stream: true,
-            supports_transcoding: true,
-            type_: MediaSourceType::Placeholder,
-            video_type: VideoType::VideoFile,
-            ..Default::default()
-        }]);
+        if include_sources {
+            // Channels use direct-play passthrough — no GStreamer probe needed.
+            item.media_sources = Some(vec![MediaSourceInfo {
+                id: media.id,
+                e_tag: media.id,
+                name: Some(
+                    media
+                        .title
+                        .clone(),
+                ),
+                path: media
+                    .stream_info
+                    .as_ref()
+                    .and_then(|si| {
+                        si.descriptor
+                            .as_http_url()
+                            .map(str::to_owned)
+                    }),
+                protocol: MediaProtocol::Http,
+                is_remote: true,
+                is_infinite_stream: true,
+                supports_direct_play: true,
+                supports_direct_stream: true,
+                supports_transcoding: true,
+                type_: MediaSourceType::Placeholder,
+                video_type: VideoType::VideoFile,
+                ..Default::default()
+            }]);
+        }
     }
 
     if media.kind == db::MediaKind::Collection {
@@ -1226,4 +1298,53 @@ pub struct RemoteSubtitleInfo {
     pub is_hash_match: Option<bool>,
     pub ai_translated: Option<bool>,
     pub machine_translated: Option<bool>,
+}
+
+#[cfg(test)]
+mod community_rating_tests {
+    use super::*;
+
+    fn media(
+        kind: db::MediaKind,
+        weighted: f64,
+        tmdb: Option<(f64, u32)>,
+    ) -> db::Media {
+        db::Media {
+            kind,
+            rating_audience: Some(weighted),
+            external_ratings: tmdb.map(|(score, votes)| db::ExternalRatings {
+                tmdb: Some(db::Rating {
+                    score,
+                    vote_count: Some(votes),
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn episodes_show_the_provider_score() {
+        let episode = media(db::MediaKind::Episode, 6.57, Some((8.25, 22)));
+        assert_eq!(community_rating(&episode), Some(8.25));
+        assert_eq!(db_media_to_item(episode, false).community_rating, Some(8.3));
+    }
+
+    #[test]
+    fn other_kinds_keep_the_stored_rating() {
+        let movie = media(db::MediaKind::Movie, 7.1, Some((8.0, 5)));
+        assert_eq!(community_rating(&movie), Some(7.1));
+    }
+
+    #[test]
+    fn episodes_without_a_provider_rating_keep_the_stored_one() {
+        let episode = media(db::MediaKind::Episode, 7.0, None);
+        assert_eq!(community_rating(&episode), Some(7.0));
+    }
+
+    #[test]
+    fn unvoted_episodes_have_no_rating() {
+        let episode = media(db::MediaKind::Episode, 6.5, Some((0.0, 0)));
+        assert_eq!(community_rating(&episode), None);
+    }
 }
