@@ -1,3 +1,4 @@
+use crate::ids::UserId;
 use std::sync::Arc;
 
 use axum::{
@@ -16,23 +17,18 @@ use uuid::Uuid;
 use remux_sdks::remux::{AudioCodec, HardwareAccelerationType};
 
 use crate::{
-    AppState, IntoApiError, OptionExt, ResultExt, api, common,
+    AppState, IntoApiError, OptionExt, api, common,
     common::{TickUnit, ToRunTimeTicks},
     db,
     db::auth,
     playback::{
+        codec::CodecTarget,
         decision::{PlaybackPermissions, audio_is_passthrough, selected_audio_stream},
         hw_accel,
         session::{SegmentContainer, TranscodeSession, TranscodeState},
     },
-    playback_session::{FfmpegTrack, ServedPlayback},
+    playback_session::{FfmpegTrack, ServedPlayback, TRANSCODE_CREATE_LOCKS},
 };
-
-/// Serializes the lookup-or-create-transcode sequence per play_session_id so
-/// two racing requests for the same session can't each spawn their own
-/// ffmpeg process.
-static TRANSCODE_CREATE_LOCKS: crate::keyed_lock::KeyedLock<String> =
-    crate::keyed_lock::KeyedLock::new();
 
 enum HlsSessionResult {
     Transcode(Arc<tokio::sync::RwLock<TranscodeSession>>, String),
@@ -42,11 +38,40 @@ enum HlsSessionResult {
 
 /// Shared session setup: look up or create the transcode session for an HLS
 /// request. Returns the session handle and the resolved play_session_id.
+/// Whether a request for `requested_start_secs` on a running transcode is a
+/// seek. A live stream has nothing to seek to, and a player refreshing its
+/// playlist repeats the URL it started with: neither is one.
+fn is_seek(requested_start_secs: u32, is_live: bool, running_start_secs: u32) -> bool {
+    !is_live && requested_start_secs != running_start_secs
+}
+
+/// A picked version held as the item id plays its owner with that version as
+/// the source, same as PlaybackInfo and the static stream.
+async fn version_as_source(
+    state: &AppState,
+    auth: &auth::AuthSession,
+    id: Uuid,
+    q: &mut api::HlsVideoQuery,
+) -> Uuid {
+    let (id, media_source_id) = crate::services::StreamService::version_target(
+        &state.ctx,
+        Some(UserId(
+            auth.user
+                .id,
+        )),
+        id,
+        q.media_source_id,
+    )
+    .await;
+    q.media_source_id = media_source_id;
+    id
+}
+
 async fn create_hls_session(
     state: &AppState,
     auth: &auth::AuthSession,
     id: Uuid,
-    q: &api::HlsVideoQuery,
+    q: &mut api::HlsVideoQuery,
 ) -> Result<HlsSessionResult> {
     let play_session_id = q
         .play_session_id
@@ -56,6 +81,15 @@ async fn create_hls_session(
                 .as_simple()
                 .to_string()
         });
+    // Serialize the whole stop/lookup/create/attach sequence per
+    // play_session_id, from before the first await: the lookup-or-create path
+    // awaits DB queries and filesystem ops, so two requests racing for the
+    // same session would otherwise each spawn their own ffmpeg process, and
+    // a stop arriving meanwhile would miss the transcode being created.
+    let _create_guard = TRANSCODE_CREATE_LOCKS
+        .lock(play_session_id.clone())
+        .await;
+    let id = version_as_source(state, auth, id, q).await;
 
     debug!("Using play session ID: {}", play_session_id);
 
@@ -99,7 +133,7 @@ async fn create_hls_session(
             "HLS playback requires remuxing",
         ));
     }
-    let video_codec = resolved_codecs.video;
+    let video_codec = crate::playback::codec::CodecTarget::from(resolved_codecs.video);
     let audio_codec = resolved_codecs.audio;
     let burn_subtitle = resolved_codecs.burn_subtitle;
     let segment_length = q
@@ -111,38 +145,68 @@ async fn create_hls_session(
     // StartTimeTicks.  In that case we must stop the old transcode job and
     // restart from the requested position — otherwise the player waits for
     // segments that the old job will never produce at the new offset.
-    //
-    // Serialize the whole stop/lookup/create/attach sequence per
-    // play_session_id: the lookup-or-create path below awaits DB queries and
-    // filesystem ops with no lock held, so two requests racing for the same
-    // session would otherwise both see no existing transcode and each spawn
-    // their own ffmpeg process, with the loser's session silently overwritten
-    // (and its ffmpeg process orphaned) by attach_transcode.
-    let _create_guard = TRANSCODE_CREATE_LOCKS
-        .lock(play_session_id.clone())
-        .await;
-    let is_seeking = q
+    let requested_start_secs = q
         .start_time_ticks
-        .is_some_and(|t| t > 0);
-    if is_seeking {
-        if state
+        .filter(|&t| t > 0)
+        .map(|t| (t / 10_000_000) as u32);
+    if let Some(requested_start_secs) = requested_start_secs {
+        if let Some(existing) = state
             .ctx
             .sessions
             .get_transcode(&play_session_id)
-            .is_some()
         {
-            debug!(
-                play_session_id = %play_session_id,
-                start_time_ticks = ?q.start_time_ticks,
-                "seek detected — stopping old transcode session and restarting"
-            );
-            state
-                .ctx
-                .sessions
-                .stop_transcode(&play_session_id)
-                .await;
+            let (is_live, running_start_secs) = {
+                let s = existing
+                    .read()
+                    .await;
+                (s.is_live, s.start_time_secs)
+            };
+            if !is_seek(requested_start_secs, is_live, running_start_secs) {
+                debug!(
+                    play_session_id = %play_session_id,
+                    start_time_ticks = ?q.start_time_ticks,
+                    is_live,
+                    "keeping the running transcode"
+                );
+            } else {
+                debug!(
+                    play_session_id = %play_session_id,
+                    start_time_ticks = ?q.start_time_ticks,
+                    "seek detected — stopping old transcode session and restarting"
+                );
+                state
+                    .ctx
+                    .sessions
+                    .stop_transcode(&play_session_id)
+                    .await;
+            }
         }
     }
+    // Burned-in subtitles are part of the video, so a different track (or
+    // turning them off) needs a new transcode; a seek check alone misses it
+    // for live, which ignores the start time.
+    restart_on_subtitle_change(
+        &state
+            .ctx
+            .sessions,
+        &play_session_id,
+        burn_subtitle,
+        q.subtitle_stream_index,
+    )
+    .await;
+    // A client that switches audio track keeps the PlaySessionId. Reusing the
+    // session would keep the old track (and the codec decided for it), so
+    // restart it for the requested one. Runs under `_create_guard`, so two
+    // requests for the same session cannot both stop and recreate it.
+    restart_on_audio_switch(
+        &state
+            .ctx
+            .sessions,
+        &play_session_id,
+        q.audio_stream_index
+            .map(|v| v as i32),
+    )
+    .await;
     let session = if let Some(existing) = state
         .ctx
         .sessions
@@ -293,7 +357,7 @@ async fn create_hls_session(
             .join(&play_session_id);
         // Keep the API stable (no RunId in URLs) by reusing one on-disk path per
         // PlaySessionId and clearing stale segments when a transcode restarts.
-        let _ = std::fs::remove_dir_all(&output_dir);
+        let _ = tokio::fs::remove_dir_all(&output_dir).await;
         // Use the URL-path item (`id`) to determine liveness so that a specific
         // stream source (MediaSourceId = stream child, kind = Stream) doesn't
         // incorrectly produce is_live = false for live-TV sessions.
@@ -326,14 +390,56 @@ async fn create_hls_session(
             s.codec
                 .clone()
         });
-        // HLS always downmixes re-encoded audio to stereo, so only a source
-        // that is already stereo or less can be passed through unchanged.
+        let source_video_stream = resolved_media
+            .probe_data
+            .as_ref()
+            .and_then(|p| p.video_stream());
+        let source_video_codec = source_video_stream
+            .as_ref()
+            .and_then(|s| {
+                s.codec
+                    .clone()
+            });
+        // The HLS request carries no device profile, but the one the client
+        // reported at PlaybackInfo time is stored on its device.
+        let client_profile = auth
+            .device
+            .parsed_device_profile();
+        let hevc_in_ts = client_profile
+            .as_ref()
+            .is_some_and(client_wants_hevc_in_ts);
+        let segment_container = SegmentContainer::for_codecs(
+            video_codec.is_copy(),
+            source_video_codec.as_deref(),
+            hevc_in_ts,
+        );
+        let hls_profile = client_profile
+            .as_ref()
+            .and_then(|p| hls_transcoding_profile(p, segment_container));
+        // Channels the client takes for audio re-encoded to `codec`. Live
+        // channels always go out as stereo (see the LATM note below).
+        let requested_cap = [q.transcoding_max_audio_channels, q.max_audio_channels]
+            .into_iter()
+            .flatten()
+            .filter(|&c| c > 0)
+            .min();
+        let channel_cap = |codec: &str| {
+            if is_live {
+                return None;
+            }
+            let profile_cap = client_profile
+                .as_ref()
+                .and_then(|p| hls_client_max_channels(p, hls_profile, codec));
+            min_cap(profile_cap, requested_cap)
+        };
+        // Re-encoded audio keeps the source layout up to the client's cap, so
+        // only a source within that cap can be passed through unchanged.
         let audio_passthrough = audio_is_passthrough(
             &audio_codec_raw,
             source_audio_codec.as_deref(),
             source_audio.and_then(|s| s.channels),
             source_audio.and_then(|s| s.bit_rate),
-            Some(2),
+            Some(hls_channel_cap(channel_cap(&audio_codec_raw))),
             q.audio_bit_rate
                 .map(i64::from),
         );
@@ -350,19 +456,6 @@ async fn create_hls_session(
                 "HLS playback requires remuxing",
             ));
         }
-        let source_video_stream = resolved_media
-            .probe_data
-            .as_ref()
-            .and_then(|p| p.video_stream());
-        let source_video_codec = source_video_stream
-            .as_ref()
-            .and_then(|s| {
-                s.codec
-                    .clone()
-            });
-        let segment_container =
-            SegmentContainer::for_codecs(&video_codec, source_video_codec.as_deref());
-
         // --- Why we force audio transcoding for live channels ---
         //
         // IPTV/broadcast streams frequently carry AAC encoded in LATM format
@@ -392,8 +485,17 @@ async fn create_hls_session(
         //
         // Workaround: always re-encode audio to standard ADTS AAC stereo for
         // live channels, regardless of what the client negotiated. The
-        // existing audio_channels logic (None for copy, Some(2) for transcode)
-        // then kicks in automatically and produces the correct stereo downmix.
+        // existing audio_channels logic (None for copy) then produces the
+        // stereo downmix, because `channel_cap` declares no cap for live.
+
+        // A codec profile can cap the channels of a codec the client plays, which
+        // rules out copying a source with more than that.
+        let copy_exceeds_channel_limit = client_profile
+            .as_ref()
+            .zip(source_audio_codec.as_deref())
+            .and_then(|(p, codec)| hls_codec_channel_limit(p, codec))
+            .zip(source_audio.and_then(|s| s.channels))
+            .is_some_and(|(limit, channels)| channels > limit);
         let resolved_audio_codec = resolve_hls_audio_codec(
             is_live,
             resolved_media
@@ -407,6 +509,11 @@ async fn create_hls_session(
             source_audio_codec.as_deref(),
             segment_container,
             &audio_codec,
+            hls_profile.and_then(|p| {
+                p.audio_codec
+                    .as_deref()
+            }),
+            copy_exceeds_channel_limit,
         );
         if resolved_audio_codec != audio_codec && !permissions.audio_transcoding {
             return Ok(HlsSessionResult::Forbidden(
@@ -414,13 +521,20 @@ async fn create_hls_session(
             ));
         }
         let audio_codec = resolved_audio_codec;
+        let audio_channels = hls_audio_channels(
+            &audio_codec,
+            source_audio.and_then(|s| s.channels),
+            channel_cap(&audio_codec.to_string()),
+        );
 
         // Live streams have no fixed duration — skip all runtime lookups.
         let runtime_ticks = if is_live {
             0
         } else {
-            // Take the maximum of stored runtime and probe data so a stale/short
-            // metadata value can't truncate the playlist for a longer file.
+            // Size the playlist from the file's probed duration: a longer metadata
+            // runtime lists segments ffmpeg never writes. A probe far off the
+            // metadata runtime may be RemuxDB's record of another file, so then
+            // the larger of the two stands, as metadata does for an unprobed file.
             let stored_ticks = resolved_media
                 .runtime
                 .or(media.runtime)
@@ -431,9 +545,15 @@ async fn create_hls_session(
                 .as_ref()
                 .and_then(|p| p.run_time_ticks)
                 .filter(|&t| t > 0);
-            let rt = match (stored_ticks, probe_ticks) {
-                (Some(a), Some(b)) => Some(a.max(b)),
-                (a, b) => a.or(b),
+            let rt = if crate::services::stream_service::implausible_runtime(
+                resolved_media
+                    .runtime
+                    .or(media.runtime),
+                probe_ticks,
+            ) {
+                stored_ticks.max(probe_ticks)
+            } else {
+                probe_ticks.or(stored_ticks)
             };
             match rt {
                 Some(t) if t > 0 => t,
@@ -484,7 +604,7 @@ async fn create_hls_session(
             source_frame_rate,
             "source video codec for HLS session"
         );
-        let session_video_bitrate = if video_codec == "copy" {
+        let session_video_bitrate = if video_codec.is_copy() {
             None
         } else {
             resolved_media
@@ -500,7 +620,7 @@ async fn create_hls_session(
                         .map_or(target, |c| target.min(c as u32))
                 })
         };
-        let session_hw_accel = if video_codec == "copy" {
+        let session_hw_accel = if video_codec.is_copy() {
             None
         } else {
             match encoding_opts_hls
@@ -513,6 +633,8 @@ async fn create_hls_session(
         };
         let session = TranscodeSession::new(
             play_session_id.clone(),
+            auth.user
+                .id,
             id,
             media_source_id,
             input_url.clone(),
@@ -547,13 +669,32 @@ async fn create_hls_session(
             session_hw_accel,
         );
 
-        state
+        {
+            let mut session = session
+                .write()
+                .await;
+            session.audio_channels = audio_channels;
+            session.source_audio_index = source_audio.map(|s| s.index as i32);
+            session.hevc_in_ts = hevc_in_ts;
+        }
+        if !state
             .ctx
             .sessions
-            .attach_transcode(&play_session_id, session.clone());
+            .attach_transcode(
+                &play_session_id,
+                &auth
+                    .device
+                    .id,
+                session.clone(),
+            )
+            .await
+        {
+            return Err(anyhow::anyhow!("shutting down")
+                .context_internal("server is shutting down"));
+        }
 
         // Start transcoding in background
-        let session_clone = session.clone();
+        let _session_clone = session.clone();
         let encoding_opts = encoding_opts_hls.clone();
         let params = crate::playback::engine::TranscodeParams {
             input_url,
@@ -565,7 +706,7 @@ async fn create_hls_session(
             video_codec: video_codec.clone(),
             audio_codec: audio_codec.clone(),
             segment_length,
-            start_time_ticks: q.start_time_ticks,
+            start_time_ticks: if is_live { None } else { q.start_time_ticks },
             max_width: q
                 .max_width
                 .map(|v| v as u32),
@@ -587,10 +728,7 @@ async fn create_hls_session(
             audio_bitrate: q
                 .audio_bit_rate
                 .map(|v| v as u32),
-            // Force stereo downmix when transcoding audio — multi-channel AAC
-            // (e.g. 6.1 from DTS-HD) causes MEDIA_ERR_SRC_NOT_SUPPORTED on most
-            // browsers and iOS Safari.
-            audio_channels: if audio_codec == "copy" { None } else { Some(2) },
+            audio_channels,
             audio_stream_index: q
                 .audio_stream_index
                 .map(|v| v as i32)
@@ -617,6 +755,8 @@ async fn create_hls_session(
                 .await
                 .hevc_copy_tag
                 .clone(),
+            hevc_in_ts,
+            source_frame_rate,
             accelerator: hw_accel::from_encoding_opts(&encoding_opts),
             source_video_range_type,
             enable_tonemapping: encoding_opts
@@ -643,9 +783,6 @@ async fn create_hls_session(
             h264_crf: encoding_opts
                 .h264_crf
                 .unwrap_or(23),
-            h265_crf: encoding_opts
-                .h265_crf
-                .unwrap_or(28),
             is_live,
             normalize_audio_loudness: encoding_opts
                 .normalize_audio_loudness
@@ -741,10 +878,10 @@ pub async fn master_hls_video(
     State(state): State<AppState>,
     auth: auth::AuthSession,
     Path(id): Path<Uuid>,
-    Query(q): Query<api::HlsVideoQuery>,
+    Query(mut q): Query<api::HlsVideoQuery>,
 ) -> Result<impl IntoResponse> {
     debug!("master_hls_video: item_id={}, q={:?}", id, q);
-    let session = match create_hls_session(&state, &auth, id, &q).await {
+    let session = match create_hls_session(&state, &auth, id, &mut q).await {
         Ok(HlsSessionResult::Transcode(session, _)) => session,
         Ok(HlsSessionResult::Forbidden(detail)) => {
             return Err(anyhow::anyhow!("Forbidden").context_forbidden(detail));
@@ -778,7 +915,7 @@ pub async fn live_hls_video(
     Query(mut q): Query<api::HlsVideoQuery>,
 ) -> Result<impl IntoResponse> {
     debug!("live_hls_video: item_id={}, q={:?}", id, q);
-    let play_session_id = match create_hls_session(&state, &auth, id, &q).await? {
+    let play_session_id = match create_hls_session(&state, &auth, id, &mut q).await? {
         HlsSessionResult::Transcode(_, play_session_id) => play_session_id,
         HlsSessionResult::Forbidden(detail) => {
             return Err(anyhow::anyhow!("Forbidden").context_forbidden(detail));
@@ -792,7 +929,7 @@ pub async fn live_hls_video(
 #[get("/videos/{id}/main.m3u8")]
 pub async fn variant_hls_video_alt(
     State(state): State<AppState>,
-    Path(id): Path<Uuid>,
+    Path(_id): Path<Uuid>,
     Query(q): Query<api::HlsVideoQuery>,
 ) -> Result<impl IntoResponse> {
     variant_hls_video_inner(state, q).await
@@ -802,7 +939,7 @@ pub async fn variant_hls_video_alt(
 #[get("/videos/{id}/main/stream.m3u8")]
 pub async fn variant_hls_video(
     State(state): State<AppState>,
-    Path(id): Path<Uuid>,
+    Path(_id): Path<Uuid>,
     Query(q): Query<api::HlsVideoQuery>,
 ) -> Result<impl IntoResponse> {
     variant_hls_video_inner(state, q).await
@@ -815,9 +952,17 @@ pub async fn hls_main_session_segment(
     State(state): State<AppState>,
     Path((_id, play_session_id, segment_file)): Path<(Uuid, String, String)>,
     Query(q): Query<api::HlsVideoQuery>,
+    headers: axum::http::HeaderMap,
 ) -> Result<impl IntoResponse> {
     let segment_id = strip_segment_extension(&segment_file);
-    hls_segment_inner(state, segment_id, Some(play_session_id), q).await
+    hls_segment_inner(
+        state,
+        segment_id,
+        Some(play_session_id),
+        q,
+        if_none_match(&headers),
+    )
+    .await
 }
 
 /// Returns the audio codec to use for browser-facing HLS transcoding.
@@ -834,18 +979,297 @@ fn resolve_hls_audio_codec(
     input_container: Option<&remux_sdks::remux::VideoContainer>,
     source_audio_codec: Option<&str>,
     segment_container: SegmentContainer,
-    requested: &str,
-) -> String {
+    requested: &CodecTarget,
+    client_audio_codecs: Option<&[AudioCodec]>,
+    copy_exceeds_channel_limit: bool,
+) -> CodecTarget {
     let input_is_hls = input_container.is_some_and(|c| c.is_hls_input());
-    if requested == "copy"
+    if requested.is_copy()
         && (is_live
             || input_is_hls
-            || !segment_container.can_copy_audio(source_audio_codec))
+            || !segment_container.can_copy_audio(source_audio_codec)
+            || !client_accepts_audio(source_audio_codec, client_audio_codecs)
+            || copy_exceeds_channel_limit)
     {
-        "aac".to_string()
+        CodecTarget::Transcode("aac".into())
     } else {
-        requested.to_string()
+        requested.clone()
     }
+}
+
+/// Whether the client takes HEVC in MPEG-TS HLS segments: it lists `hevc` in a
+/// TS HLS video profile and in no fMP4 one. jellyfin-web declares that for
+/// webOS and Tizen unless the user ticks "Prefer fMP4-HLS" (their native
+/// players stall on fMP4 HEVC). Every other client, and one with no stored
+/// profile, keeps fMP4, which iOS and the HLS spec require for HEVC.
+fn client_wants_hevc_in_ts(profile: &remux_sdks::remux::DeviceProfile) -> bool {
+    use remux_sdks::remux::{DlnaProfileType, TranscodingProtocol, VideoContainer};
+    let lists_hevc = |is_container: fn(&VideoContainer) -> bool| {
+        profile
+            .transcoding_profiles
+            .iter()
+            .filter(|p| {
+                matches!(p.type_, Some(DlnaProfileType::Video))
+                    && matches!(p.protocol, Some(TranscodingProtocol::Hls))
+                    && p.container
+                        .as_ref()
+                        .is_some_and(is_container)
+            })
+            .any(|p| {
+                p.video_codec
+                    .as_deref()
+                    .unwrap_or_default()
+                    .iter()
+                    .any(|c| c.is_hevc())
+            })
+    };
+    lists_hevc(|c| matches!(c, VideoContainer::Ts))
+        && !lists_hevc(|c| matches!(c, VideoContainer::Mp4 | VideoContainer::M4v))
+}
+
+/// The transcoding profile the client declared for HLS in the segment
+/// container the session produces (`ts` or `mp4`), falling back to any HLS
+/// profile. A non-HLS profile (e.g. progressive mkv) says nothing about what
+/// the segments may carry, so none is used then.
+fn hls_transcoding_profile(
+    profile: &remux_sdks::remux::DeviceProfile,
+    segment_container: SegmentContainer,
+) -> Option<&remux_sdks::remux::TranscodingProfile> {
+    use remux_sdks::remux::VideoContainer;
+    let hls = || {
+        profile
+            .transcoding_profiles
+            .iter()
+            .filter(|p| {
+                matches!(p.type_, Some(remux_sdks::remux::DlnaProfileType::Video))
+                    && matches!(
+                        p.protocol,
+                        Some(remux_sdks::remux::TranscodingProtocol::Hls)
+                    )
+            })
+    };
+    hls()
+        .find(|p| match (&p.container, segment_container) {
+            (Some(VideoContainer::Ts), SegmentContainer::Ts) => true,
+            (
+                Some(VideoContainer::Mp4 | VideoContainer::M4v),
+                SegmentContainer::Fmp4,
+            ) => true,
+            _ => false,
+        })
+        .or_else(|| hls().next())
+}
+
+/// Whether the client's transcoding profile lists the source audio codec, so it
+/// can be copied into the segments. No list (or an empty one) means the client
+/// declared no restriction, and a source without a codec is left alone. A codec
+/// that cannot be recognised is not accepted when the client listed codecs.
+fn client_accepts_audio(
+    source_audio_codec: Option<&str>,
+    client_audio_codecs: Option<&[AudioCodec]>,
+) -> bool {
+    let (Some(codec), Some(accepted)) = (
+        source_audio_codec,
+        client_audio_codecs.filter(|list| !list.is_empty()),
+    ) else {
+        return true;
+    };
+    // Against an explicit allowlist a codec we cannot name is not known to be
+    // playable, so it is re-encoded rather than copied.
+    codec
+        .parse::<AudioCodec>()
+        .is_ok_and(|codec| accepted.contains(&codec))
+}
+
+/// The `AudioChannels` limit a codec profile puts on `audio_codec`, if any.
+fn hls_codec_channel_limit(
+    profile: &remux_sdks::remux::DeviceProfile,
+    audio_codec: &str,
+) -> Option<i64> {
+    use remux_sdks::remux::{
+        CodecProfileType, ProfileConditionProperty, ProfileConditionType,
+    };
+    profile
+        .codec_profiles
+        .iter()
+        .filter(|cp| {
+            matches!(
+                cp.type_,
+                Some(CodecProfileType::VideoAudio | CodecProfileType::Audio)
+            ) && cp
+                .codec
+                .as_ref()
+                .is_none_or(|codecs| {
+                    codecs.is_empty()
+                        || codecs
+                            .iter()
+                            .any(|c| c.eq_ignore_ascii_case(audio_codec))
+                })
+        })
+        .flat_map(|cp| {
+            cp.conditions
+                .iter()
+        })
+        .filter(|c| {
+            matches!(c.property, Some(ProfileConditionProperty::AudioChannels))
+                && matches!(
+                    c.condition,
+                    Some(
+                        ProfileConditionType::LessThanEqual
+                            | ProfileConditionType::Equals
+                    )
+                )
+        })
+        .filter_map(|c| {
+            c.value
+                .as_deref()
+                .and_then(|v| {
+                    v.trim()
+                        .parse::<i64>()
+                        .ok()
+                })
+        })
+        .filter(|&v| v > 0)
+        .min()
+}
+
+/// The most channels the client takes for audio the server re-encodes to
+/// `audio_codec`: the transcoding profile's `MaxAudioChannels`, narrowed by any
+/// `AudioChannels` limit in a codec profile that applies to that output codec.
+/// `None` when the client declared no cap.
+fn hls_client_max_channels(
+    profile: &remux_sdks::remux::DeviceProfile,
+    transcoding: Option<&remux_sdks::remux::TranscodingProfile>,
+    audio_codec: &str,
+) -> Option<i64> {
+    let declared = transcoding.and_then(|p| p.max_audio_channels)?;
+    Some(
+        hls_codec_channel_limit(profile, audio_codec)
+            .map_or(declared, |l| l.min(declared)),
+    )
+}
+
+/// The lower of two optional caps; either alone when only one is declared.
+fn min_cap(a: Option<i64>, b: Option<i64>) -> Option<i64> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (a, b) => a.or(b),
+    }
+}
+
+/// The channel count re-encoded audio is capped at: the client's declared cap,
+/// never more than 6 (multichannel AAC beyond 5.1, e.g. 6.1 from DTS-HD, fails
+/// in browsers), and stereo when the client declared none.
+fn hls_channel_cap(client_max_channels: Option<i64>) -> i64 {
+    client_max_channels
+        .filter(|&c| c > 0)
+        .map_or(2, |c| c.min(6))
+}
+
+/// Channel count for audio the server re-encodes (`None` when it is copied).
+/// Keeps the source layout up to the cap and never upmixes. When the source
+/// layout is unknown it is stereo, or the cap if that is lower.
+fn hls_audio_channels(
+    audio_codec: &CodecTarget,
+    source_channels: Option<i64>,
+    client_max_channels: Option<i64>,
+) -> Option<u32> {
+    if audio_codec.is_copy() {
+        return None;
+    }
+    let cap = hls_channel_cap(client_max_channels);
+    let channels = source_channels
+        .filter(|&c| c > 0)
+        .map_or(2, |c| c.min(cap))
+        .min(cap);
+    Some(channels as u32)
+}
+
+/// Stops the session's transcode when `requested` names a different audio track
+/// than the one it maps. Returns whether it was stopped.
+async fn restart_on_audio_switch(
+    sessions: &crate::playback_session::PlaybackSessionManager,
+    play_session_id: &str,
+    requested: Option<i32>,
+) -> bool {
+    let Some(existing) = sessions.get_transcode(play_session_id) else {
+        return false;
+    };
+    let (session_audio, mapped_audio) = {
+        let session = existing
+            .read()
+            .await;
+        (session.audio_stream_index, session.source_audio_index)
+    };
+    if !audio_track_changed(session_audio, mapped_audio, requested) {
+        return false;
+    }
+    debug!(
+        play_session_id = %play_session_id,
+        ?session_audio,
+        ?requested,
+        "audio track changed — stopping old transcode session and restarting"
+    );
+    sessions
+        .stop_transcode(play_session_id)
+        .await;
+    true
+}
+
+/// Stops the session's transcode when the burned-in subtitle differs from the
+/// one it was started with. Returns whether it was stopped.
+async fn restart_on_subtitle_change(
+    sessions: &crate::playback_session::PlaybackSessionManager,
+    play_session_id: &str,
+    burn_subtitle: bool,
+    requested: Option<i32>,
+) -> bool {
+    let Some(existing) = sessions.get_transcode(play_session_id) else {
+        return false;
+    };
+    let (session_burn, session_index) = {
+        let session = existing
+            .read()
+            .await;
+        (session.burn_subtitle, session.subtitle_stream_index)
+    };
+    if !burned_subtitle_changed(session_burn, session_index, burn_subtitle, requested) {
+        return false;
+    }
+    debug!(
+        play_session_id = %play_session_id,
+        ?session_index,
+        ?requested,
+        "burned-in subtitle changed — stopping old transcode session and restarting"
+    );
+    sessions
+        .stop_transcode(play_session_id)
+        .await;
+    true
+}
+
+/// What a transcode burns in: the track when subtitles are burned, otherwise
+/// nothing, whatever index the client happens to name.
+fn burned_subtitle_changed(
+    session_burn: bool,
+    session_index: Option<i32>,
+    requested_burn: bool,
+    requested_index: Option<i32>,
+) -> bool {
+    let burned = |burn: bool, index: Option<i32>| burn.then_some(index);
+    burned(session_burn, session_index) != burned(requested_burn, requested_index)
+}
+
+/// A request for an existing play session names a different audio track than
+/// the one the session was started with (the client switched tracks).
+/// A session started without a named track maps the source's default one, so
+/// naming that track later is not a switch.
+fn audio_track_changed(
+    session_index: Option<i32>,
+    mapped_index: Option<i32>,
+    requested: Option<i32>,
+) -> bool {
+    requested.is_some_and(|r| r >= 0) && session_index.or(mapped_index) != requested
 }
 
 fn should_serve_ffmpeg_variant_playlist(
@@ -981,11 +1405,12 @@ async fn variant_hls_video_inner(
 #[get("/videos/{id}/main/{segment_file}")]
 pub async fn hls_segment(
     State(state): State<AppState>,
-    Path((id, segment_file)): Path<(Uuid, String)>,
+    Path((_id, segment_file)): Path<(Uuid, String)>,
     Query(q): Query<api::HlsVideoQuery>,
+    headers: axum::http::HeaderMap,
 ) -> Result<impl IntoResponse> {
     let segment_id = strip_segment_extension(&segment_file);
-    hls_segment_inner(state, segment_id, None, q).await
+    hls_segment_inner(state, segment_id, None, q, if_none_match(&headers)).await
 }
 
 /// Segment route at the same level as main.m3u8 — browsers resolve bare
@@ -993,11 +1418,12 @@ pub async fn hls_segment(
 #[get("/videos/{id}/{segment_file}")]
 pub async fn hls_segment_flat(
     State(state): State<AppState>,
-    Path((id, segment_file)): Path<(Uuid, String)>,
+    Path((_id, segment_file)): Path<(Uuid, String)>,
     Query(q): Query<api::HlsVideoQuery>,
+    headers: axum::http::HeaderMap,
 ) -> Result<impl IntoResponse> {
     let segment_id = strip_segment_extension(&segment_file);
-    hls_segment_inner(state, segment_id, None, q).await
+    hls_segment_inner(state, segment_id, None, q, if_none_match(&headers)).await
 }
 
 /// Jellyfin-style HLS segment route with the playback session in the path.
@@ -1006,20 +1432,29 @@ pub async fn hls_session_segment(
     State(state): State<AppState>,
     Path((_id, play_session_id, segment_file)): Path<(Uuid, String, String)>,
     Query(q): Query<api::HlsVideoQuery>,
+    headers: axum::http::HeaderMap,
 ) -> Result<impl IntoResponse> {
     let segment_id = strip_segment_extension(&segment_file);
-    hls_segment_inner(state, segment_id, Some(play_session_id), q).await
+    hls_segment_inner(
+        state,
+        segment_id,
+        Some(play_session_id),
+        q,
+        if_none_match(&headers),
+    )
+    .await
 }
 
 /// Jellyfin-compatible HLS segment route: /Videos/{id}/hls1/{playlistId}/{segmentFile}
 #[get("/videos/{id}/hls1/{playlist_id}/{segment_file}")]
 pub async fn hls1_segment(
     State(state): State<AppState>,
-    Path((id, _playlist_id, segment_file)): Path<(Uuid, String, String)>,
+    Path((_id, _playlist_id, segment_file)): Path<(Uuid, String, String)>,
     Query(q): Query<api::HlsVideoQuery>,
+    headers: axum::http::HeaderMap,
 ) -> Result<impl IntoResponse> {
     let segment_id = strip_segment_extension(&segment_file);
-    hls_segment_inner(state, segment_id, None, q).await
+    hls_segment_inner(state, segment_id, None, q, if_none_match(&headers)).await
 }
 
 fn strip_segment_extension(filename: &str) -> String {
@@ -1030,10 +1465,15 @@ fn strip_segment_extension(filename: &str) -> String {
 }
 
 /// Find the highest segment index currently on disk in `dir`.
-fn get_current_transcoding_index(dir: &std::path::Path) -> Option<u32> {
-    let entries = std::fs::read_dir(dir).ok()?;
+async fn get_current_transcoding_index(dir: &std::path::Path) -> Option<u32> {
+    let mut entries = tokio::fs::read_dir(dir)
+        .await
+        .ok()?;
     let mut max_idx: Option<u32> = None;
-    for entry in entries.flatten() {
+    while let Ok(Some(entry)) = entries
+        .next_entry()
+        .await
+    {
         let name = entry.file_name();
         let name = name.to_string_lossy();
         // Accept both MPEG-TS (.ts) and fMP4 (.m4s) segment files.
@@ -1058,23 +1498,71 @@ fn get_current_transcoding_index(dir: &std::path::Path) -> Option<u32> {
 /// HLS init/fragments are always fetched whole by players, so byte-range
 /// handling isn't needed — but the length header lets the browser size the
 /// response up front instead of reading a chunked stream.
+///
+/// A restarted transcode (seek, audio-track switch) rewrites files under the
+/// same URLs, so the response must not be cached blindly: it carries an `ETag`
+/// derived from the file and the client revalidates (`no-cache`) instead of
+/// reusing a fragment or init segment of the previous run.
 async fn serve_file_with_length(
     path: &std::path::Path,
     content_type: &str,
+    if_none_match: Option<&str>,
 ) -> Result<Response<Body>> {
     let file = tokio::fs::File::open(path).await?;
-    let file_size = file
+    let meta = file
         .metadata()
-        .await?
-        .len();
+        .await?;
+    let file_size = meta.len();
+    let etag = file_etag(&meta);
+    if etag_matches(if_none_match, &etag) {
+        return Ok(Response::builder()
+            .status(StatusCode::NOT_MODIFIED)
+            .header("ETag", etag)
+            .header("Cache-Control", "no-cache")
+            .body(Body::empty())
+            .unwrap());
+    }
     let body = Body::from_stream(ReaderStream::new(file));
     Ok(Response::builder()
         .status(StatusCode::OK)
         .header("Content-Type", content_type)
         .header("Content-Length", file_size)
-        .header("Cache-Control", "public, max-age=86400")
+        .header("ETag", etag)
+        .header("Cache-Control", "no-cache")
         .body(body)
         .unwrap())
+}
+
+/// Validator that changes whenever ffmpeg rewrites the file.
+fn file_etag(meta: &std::fs::Metadata) -> String {
+    let modified = meta
+        .modified()
+        .ok()
+        .and_then(|m| {
+            m.duration_since(std::time::UNIX_EPOCH)
+                .ok()
+        })
+        .map_or(0, |d| d.as_nanos());
+    format!("\"{:x}-{:x}\"", modified, meta.len())
+}
+
+/// Whether an `If-None-Match` header names this ETag (or `*`).
+fn etag_matches(if_none_match: Option<&str>, etag: &str) -> bool {
+    if_none_match.is_some_and(|v| {
+        v.split(',')
+            .map(str::trim)
+            .any(|c| c == "*" || c.trim_start_matches("W/") == etag)
+    })
+}
+
+fn if_none_match(headers: &axum::http::HeaderMap) -> Option<String> {
+    headers
+        .get(axum::http::header::IF_NONE_MATCH)
+        .and_then(|v| {
+            v.to_str()
+                .ok()
+        })
+        .map(str::to_owned)
 }
 
 /// Poll until `path` exists with a non-zero size and stays unchanged across
@@ -1121,6 +1609,7 @@ async fn hls_segment_inner(
     segment_id: String,
     path_session_id: Option<String>,
     q: api::HlsVideoQuery,
+    if_none_match: Option<String>,
 ) -> Result<impl IntoResponse> {
     let play_session_id = path_session_id
         .or_else(|| {
@@ -1152,6 +1641,7 @@ async fn hls_segment_inner(
                 .ctx
                 .sessions
                 .segment_path(&play_session_id, "init.mp4")
+                .await
                 .with_extension("mp4"),
         };
         // Wait for ffmpeg to write the init segment. Merely checking existence
@@ -1172,7 +1662,12 @@ async fn hls_segment_inner(
             .ctx
             .sessions
             .ping(&play_session_id);
-        return serve_file_with_length(&init_path, "video/mp4").await;
+        return serve_file_with_length(
+            &init_path,
+            "video/mp4",
+            if_none_match.as_deref(),
+        )
+        .await;
     }
 
     // Derive the segment path — either from the live session or from the base
@@ -1182,10 +1677,13 @@ async fn hls_segment_inner(
             .read()
             .await
             .segment_path(&segment_id),
-        None => state
-            .ctx
-            .sessions
-            .segment_path(&play_session_id, &segment_id),
+        None => {
+            state
+                .ctx
+                .sessions
+                .segment_path(&play_session_id, &segment_id)
+                .await
+        }
     };
 
     // Parse the requested segment index from the filename.
@@ -1225,8 +1723,17 @@ async fn hls_segment_inner(
                 .output_dir
                 .clone();
             let segment_length = s.segment_length;
-            let current_idx = get_current_transcoding_index(&output_dir);
+            let current_idx = get_current_transcoding_index(&output_dir).await;
             let segment_gap_threshold = 24 / segment_length;
+
+            // A live segment older than the newest has left the sliding
+            // window: restarting ffmpeg cannot bring it back (a live source
+            // has no past) and would wipe what is still kept.
+            if s.is_live && current_idx.is_some_and(|cur| requested_idx < cur) {
+                drop(s);
+                return Err(anyhow::anyhow!("segment expired")
+                    .context_not_found("segment is no longer available"));
+            }
 
             let needs_restart = match current_idx {
                 None => {
@@ -1238,9 +1745,11 @@ async fn hls_segment_inner(
                         TranscodeState::Error(_) | TranscodeState::Complete
                     )
                 }
-                Some(cur) if requested_idx < cur => true, // seeking backward
+                Some(cur) if !s.is_live && requested_idx < cur => true, // seeking backward
                 Some(cur)
-                    if requested_idx.saturating_sub(cur) > segment_gap_threshold =>
+                    if !s.is_live
+                        && requested_idx.saturating_sub(cur)
+                            > segment_gap_threshold =>
                 {
                     true
                 } // too far ahead
@@ -1276,6 +1785,7 @@ async fn hls_segment_inner(
                         .audio_codec
                         .clone();
                     let audio_stream_index = s.audio_stream_index;
+                    let audio_channels = s.audio_channels;
                     let subtitle_stream_index = s.subtitle_stream_index;
                     let burn_subtitle = s.burn_subtitle;
                     drop(s);
@@ -1300,8 +1810,8 @@ async fn hls_segment_inner(
                             notification.await;
                         }
                     }
-                    let _ = std::fs::remove_dir_all(&output_dir);
-                    let _ = std::fs::create_dir_all(&output_dir);
+                    let _ = tokio::fs::remove_dir_all(&output_dir).await;
+                    let _ = tokio::fs::create_dir_all(&output_dir).await;
 
                     // Calculate the seek position from the runtimeTicks query param
                     // (cumulative ticks to start of this segment) provided by our
@@ -1325,7 +1835,7 @@ async fn hls_segment_inner(
                         input_url,
                         output_dir: output_dir.clone(),
                         video_codec,
-                        audio_codec: audio_codec.clone(),
+                        audio_codec,
                         segment_length,
                         start_time_ticks: Some(start_time_ticks),
                         max_width: q
@@ -1340,11 +1850,7 @@ async fn hls_segment_inner(
                         audio_bitrate: q
                             .audio_bit_rate
                             .map(|v| v as u32),
-                        audio_channels: if audio_codec == "copy" {
-                            None
-                        } else {
-                            Some(2)
-                        },
+                        audio_channels,
                         audio_stream_index,
                         subtitle_stream_index,
                         burn_subtitle,
@@ -1366,6 +1872,14 @@ async fn hls_segment_inner(
                             .await
                             .hevc_copy_tag
                             .clone(),
+                        hevc_in_ts: session
+                            .read()
+                            .await
+                            .hevc_in_ts,
+                        source_frame_rate: session
+                            .read()
+                            .await
+                            .source_frame_rate,
                         accelerator: hw_accel::from_encoding_opts(&encoding_opts),
                         source_video_range_type: session
                             .read()
@@ -1395,9 +1909,6 @@ async fn hls_segment_inner(
                         h264_crf: encoding_opts
                             .h264_crf
                             .unwrap_or(23),
-                        h265_crf: encoding_opts
-                            .h265_crf
-                            .unwrap_or(28),
                         is_live: false,
                         normalize_audio_loudness: encoding_opts
                             .normalize_audio_loudness
@@ -1476,20 +1987,62 @@ async fn hls_segment_inner(
         "video/mp2t"
     };
 
-    serve_file_with_length(&segment_path, content_type).await
+    serve_file_with_length(&segment_path, content_type, if_none_match.as_deref()).await
 }
 
 #[cfg(test)]
 mod tests {
     use super::SegmentContainer::{Fmp4, Ts};
+    use crate::playback::codec::CodecTarget;
     use remux_sdks::remux::VideoContainer;
+
+    #[test]
+    fn only_a_different_burned_in_subtitle_restarts_the_transcode() {
+        // The same playlist URL again.
+        assert!(!super::burned_subtitle_changed(
+            true,
+            Some(3),
+            true,
+            Some(3)
+        ));
+        assert!(!super::burned_subtitle_changed(false, None, false, None));
+        // An index that is not burned in changes nothing.
+        assert!(!super::burned_subtitle_changed(
+            false,
+            Some(2),
+            false,
+            Some(5)
+        ));
+        // Another track, or burning one in or out.
+        assert!(super::burned_subtitle_changed(true, Some(3), true, Some(4)));
+        assert!(super::burned_subtitle_changed(false, None, true, Some(3)));
+        assert!(super::burned_subtitle_changed(true, Some(3), false, None));
+    }
+
+    #[test]
+    fn only_a_changed_start_on_a_recorded_stream_is_a_seek() {
+        // Safari refreshes live.m3u8 with the query it started with.
+        assert!(!super::is_seek(3, true, 0));
+        assert!(!super::is_seek(835, true, 835));
+        // The same URL again on a stream with a runtime is no seek either.
+        assert!(!super::is_seek(600, false, 600));
+        assert!(super::is_seek(900, false, 600));
+    }
 
     #[test]
     fn vod_hls_source_reencodes_copied_audio_to_aac() {
         let hls = VideoContainer::Other("hls".to_string());
         assert_eq!(
-            super::resolve_hls_audio_codec(false, Some(&hls), Some("aac"), Ts, "copy"),
-            "aac"
+            super::resolve_hls_audio_codec(
+                false,
+                Some(&hls),
+                Some("aac"),
+                Ts,
+                &"copy".into(),
+                None,
+                false
+            ),
+            CodecTarget::from("aac")
         );
         let hls_upper = VideoContainer::Other("HLS".to_string());
         assert_eq!(
@@ -1498,9 +2051,11 @@ mod tests {
                 Some(&hls_upper),
                 Some("aac"),
                 Ts,
-                "copy"
+                &"copy".into(),
+                None,
+                false
             ),
-            "aac"
+            CodecTarget::from("aac")
         );
     }
 
@@ -1512,18 +2067,36 @@ mod tests {
                 Some(&VideoContainer::Mp4),
                 Some("aac"),
                 Ts,
-                "copy"
+                &"copy".into(),
+                None,
+                false
             ),
-            "copy"
+            CodecTarget::from("copy")
         );
         assert_eq!(
-            super::resolve_hls_audio_codec(false, None, Some("ac3"), Ts, "copy"),
-            "copy"
+            super::resolve_hls_audio_codec(
+                false,
+                None,
+                Some("ac3"),
+                Ts,
+                &"copy".into(),
+                None,
+                false
+            ),
+            CodecTarget::from("copy")
         );
         let hls = VideoContainer::Other("hls".to_string());
         assert_eq!(
-            super::resolve_hls_audio_codec(false, Some(&hls), Some("aac"), Ts, "ac3"),
-            "ac3"
+            super::resolve_hls_audio_codec(
+                false,
+                Some(&hls),
+                Some("aac"),
+                Ts,
+                &"ac3".into(),
+                None,
+                false
+            ),
+            CodecTarget::from("ac3")
         );
     }
 
@@ -1531,8 +2104,16 @@ mod tests {
     fn ts_incompatible_audio_copy_resolves_to_aac() {
         for codec in ["truehd", "flac", "pcm_s16le"] {
             assert_eq!(
-                super::resolve_hls_audio_codec(false, None, Some(codec), Ts, "copy"),
-                "aac"
+                super::resolve_hls_audio_codec(
+                    false,
+                    None,
+                    Some(codec),
+                    Ts,
+                    &"copy".into(),
+                    None,
+                    false
+                ),
+                CodecTarget::from("aac")
             );
         }
     }
@@ -1540,13 +2121,29 @@ mod tests {
     #[test]
     fn fmp4_segments_copy_flac_but_not_truehd_or_pcm() {
         assert_eq!(
-            super::resolve_hls_audio_codec(false, None, Some("flac"), Fmp4, "copy"),
-            "copy"
+            super::resolve_hls_audio_codec(
+                false,
+                None,
+                Some("flac"),
+                Fmp4,
+                &"copy".into(),
+                None,
+                false
+            ),
+            CodecTarget::from("copy")
         );
         for codec in ["truehd", "pcm_s16le"] {
             assert_eq!(
-                super::resolve_hls_audio_codec(false, None, Some(codec), Fmp4, "copy"),
-                "aac"
+                super::resolve_hls_audio_codec(
+                    false,
+                    None,
+                    Some(codec),
+                    Fmp4,
+                    &"copy".into(),
+                    None,
+                    false
+                ),
+                CodecTarget::from("aac")
             );
         }
     }
@@ -1554,16 +2151,40 @@ mod tests {
     #[test]
     fn live_channel_forces_aac_over_copy() {
         assert_eq!(
-            super::resolve_hls_audio_codec(true, None, Some("aac"), Ts, "copy"),
-            "aac"
+            super::resolve_hls_audio_codec(
+                true,
+                None,
+                Some("aac"),
+                Ts,
+                &"copy".into(),
+                None,
+                false
+            ),
+            CodecTarget::from("aac")
         );
         assert_eq!(
-            super::resolve_hls_audio_codec(true, None, Some("aac"), Ts, "aac"),
-            "aac"
+            super::resolve_hls_audio_codec(
+                true,
+                None,
+                Some("aac"),
+                Ts,
+                &"aac".into(),
+                None,
+                false
+            ),
+            CodecTarget::from("aac")
         );
         assert_eq!(
-            super::resolve_hls_audio_codec(true, None, Some("aac"), Ts, "ac3"),
-            "ac3"
+            super::resolve_hls_audio_codec(
+                true,
+                None,
+                Some("aac"),
+                Ts,
+                &"ac3".into(),
+                None,
+                false
+            ),
+            CodecTarget::from("ac3")
         );
     }
 
@@ -1635,5 +2256,563 @@ mod tests {
         ctx.sessions
             .stop_transcode("hls-selection")
             .await;
+    }
+
+    /// An episode whose metadata runtime ran past its file listed segments
+    /// ffmpeg never wrote, and playback stalled short of the end. A probe far
+    /// off the runtime (RemuxDB's record of another file) must not cut it short.
+    #[tokio::test]
+    async fn the_playlist_covers_exactly_the_probed_file() {
+        use http::header::HeaderValue;
+
+        use crate::integration_test::{
+            auth_header_with_token, authenticated_server, insert_test_source,
+        };
+
+        let (server, guard, token) = authenticated_server().await;
+        let ctx = &guard.0;
+        let auth = HeaderValue::from_str(&auth_header_with_token(&token)).unwrap();
+        // The test source probes at 10 s.
+        for (psid, runtime, expected_secs) in
+            [("longer", 12, 10), ("another-file", 40, 40)]
+        {
+            let mut source = insert_test_source(ctx).await;
+            source.runtime = Some(runtime);
+            source
+                .save(&ctx.db)
+                .await
+                .unwrap();
+            server
+                .get(&format!(
+                    "/videos/{}/master.m3u8?PlaySessionId={}",
+                    source.id, psid
+                ))
+                .add_header(http::header::AUTHORIZATION, auth.clone())
+                .await
+                .assert_status_ok();
+            let session = ctx
+                .sessions
+                .get_transcode(psid)
+                .expect("HLS session");
+            assert_eq!(
+                session
+                    .read()
+                    .await
+                    .runtime_ticks,
+                expected_secs * 10_000_000,
+                "{psid}"
+            );
+        }
+        ctx.sessions
+            .stop_all()
+            .await;
+    }
+
+    use remux_sdks::remux::AudioCodec;
+
+    #[test]
+    fn copied_audio_the_client_does_not_list_is_reencoded() {
+        let accepted = [AudioCodec::Aac, AudioCodec::Mp3, AudioCodec::Ac3];
+        // DTS is not in the client's HLS profile: re-encode it.
+        assert_eq!(
+            super::resolve_hls_audio_codec(
+                false,
+                None,
+                Some("dts"),
+                Ts,
+                &"copy".into(),
+                Some(&accepted),
+                false
+            ),
+            CodecTarget::from("aac")
+        );
+        // AC3 is listed: still copied.
+        assert_eq!(
+            super::resolve_hls_audio_codec(
+                false,
+                None,
+                Some("ac3"),
+                Ts,
+                &"copy".into(),
+                Some(&accepted),
+                false
+            ),
+            CodecTarget::from("copy")
+        );
+        // No declared restriction (no profile, or an empty list), or no known
+        // source codec: unchanged.
+        for accepted in [None, Some(&[][..])] {
+            assert_eq!(
+                super::resolve_hls_audio_codec(
+                    false,
+                    None,
+                    Some("dts"),
+                    Ts,
+                    &"copy".into(),
+                    accepted,
+                    false
+                ),
+                CodecTarget::from("copy")
+            );
+        }
+        assert_eq!(
+            super::resolve_hls_audio_codec(
+                false,
+                None,
+                None,
+                Ts,
+                &"copy".into(),
+                Some(&accepted),
+                false
+            ),
+            CodecTarget::from("copy")
+        );
+        // A codec the client doesn't list is re-encoded, even an unusual one.
+        assert_eq!(
+            super::resolve_hls_audio_codec(
+                false,
+                None,
+                Some("wmapro"),
+                Ts,
+                &"copy".into(),
+                Some(&accepted),
+                false
+            ),
+            CodecTarget::from("aac")
+        );
+        // An explicit transcode request is never turned back into a copy.
+        assert_eq!(
+            super::resolve_hls_audio_codec(
+                false,
+                None,
+                Some("dts"),
+                Ts,
+                &"aac".into(),
+                Some(&accepted),
+                false
+            ),
+            CodecTarget::from("aac")
+        );
+    }
+
+    #[test]
+    fn webos_style_profiles_get_hevc_in_ts_and_fmp4_profiles_do_not() {
+        let profile =
+            |containers: &[(&str, &str)]| -> remux_sdks::remux::DeviceProfile {
+                serde_json::from_value(serde_json::json!({
+                "TranscodingProfiles": containers.iter().map(|(c, v)| serde_json::json!({
+                    "Type": "Video", "Protocol": "hls", "Container": c, "VideoCodec": v,
+                })).collect::<Vec<_>>()
+            }))
+            .unwrap()
+            };
+        // webOS/Tizen default: TS lists hevc, no fMP4 profile.
+        assert!(super::client_wants_hevc_in_ts(&profile(&[(
+            "ts",
+            "h264,hevc"
+        )])));
+        // The user ticked "Prefer fMP4-HLS": both are declared.
+        assert!(!super::client_wants_hevc_in_ts(&profile(&[
+            ("mp4", "av1,hevc,h264"),
+            ("ts", "h264,hevc"),
+        ])));
+        // Safari/Chrome: fMP4 with hevc, TS without it.
+        assert!(!super::client_wants_hevc_in_ts(&profile(&[
+            ("mp4", "av1,hevc,h264"),
+            ("ts", "h264"),
+        ])));
+        // TS without hevc, or no HLS profile at all, keeps the fMP4 default.
+        assert!(!super::client_wants_hevc_in_ts(&profile(&[("ts", "h264")])));
+        assert!(!super::client_wants_hevc_in_ts(&Default::default()));
+    }
+
+    #[test]
+    fn a_non_hls_profile_does_not_move_hevc_to_ts() {
+        let profile: remux_sdks::remux::DeviceProfile =
+            serde_json::from_value(serde_json::json!({
+                "TranscodingProfiles": [{
+                    "Type": "Video", "Protocol": "http", "Container": "ts",
+                    "VideoCodec": "hevc",
+                }]
+            }))
+            .unwrap();
+        assert!(!super::client_wants_hevc_in_ts(&profile));
+    }
+
+    #[test]
+    fn hls_profile_prefers_the_hls_transcoding_profile() {
+        use remux_sdks::remux::{
+            DeviceProfile, DlnaProfileType, TranscodingProfile, TranscodingProtocol,
+        };
+        let profile = |protocol, codecs: Vec<AudioCodec>| TranscodingProfile {
+            type_: Some(DlnaProfileType::Video),
+            protocol: Some(protocol),
+            audio_codec: Some(codecs),
+            ..Default::default()
+        };
+        let device = DeviceProfile {
+            transcoding_profiles: vec![
+                profile(TranscodingProtocol::Http, vec![AudioCodec::Dts]),
+                profile(TranscodingProtocol::Hls, vec![AudioCodec::Aac]),
+            ],
+            ..Default::default()
+        };
+        assert_eq!(
+            super::hls_transcoding_profile(&device, super::SegmentContainer::Ts)
+                .and_then(|p| p
+                    .audio_codec
+                    .clone()),
+            Some(vec![AudioCodec::Aac])
+        );
+    }
+
+    #[test]
+    fn transcoding_profile_reads_the_string_channel_cap() {
+        let profile: remux_sdks::remux::DeviceProfile =
+            serde_json::from_value(serde_json::json!({
+                "TranscodingProfiles": [{
+                    "Type": "Video",
+                    "Protocol": "hls",
+                    "Container": "ts",
+                    "AudioCodec": "aac,ac3",
+                    "MaxAudioChannels": "6"
+                }]
+            }))
+            .unwrap();
+        let hls = super::hls_transcoding_profile(&profile, super::SegmentContainer::Ts)
+            .unwrap();
+        assert_eq!(hls.max_audio_channels, Some(6));
+        assert_eq!(
+            hls.audio_codec,
+            Some(vec![AudioCodec::Aac, AudioCodec::Ac3])
+        );
+    }
+
+    fn profile_with_codec_limit() -> remux_sdks::remux::DeviceProfile {
+        serde_json::from_value(serde_json::json!({
+            "TranscodingProfiles": [
+                {"Type": "Video", "Protocol": "hls", "Container": "mp4",
+                 "AudioCodec": "aac", "MaxAudioChannels": "6"},
+                {"Type": "Video", "Protocol": "hls", "Container": "ts",
+                 "AudioCodec": "aac,mp3", "MaxAudioChannels": "6"}
+            ],
+            "CodecProfiles": [{
+                "Type": "VideoAudio",
+                "Codec": "aac",
+                "Conditions": [{
+                    "Condition": "LessThanEqual",
+                    "Property": "AudioChannels",
+                    "Value": "2",
+                    "IsRequired": false
+                }]
+            }]
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn hls_profile_matches_the_segment_container() {
+        let profile = profile_with_codec_limit();
+        let ts = super::hls_transcoding_profile(&profile, super::SegmentContainer::Ts)
+            .unwrap();
+        assert_eq!(ts.audio_codec, Some(vec![AudioCodec::Aac, AudioCodec::Mp3]));
+        let mp4 =
+            super::hls_transcoding_profile(&profile, super::SegmentContainer::Fmp4)
+                .unwrap();
+        assert_eq!(mp4.audio_codec, Some(vec![AudioCodec::Aac]));
+    }
+
+    #[test]
+    fn output_codec_channel_limits_narrow_the_profile_cap() {
+        let profile = profile_with_codec_limit();
+        let tp = super::hls_transcoding_profile(&profile, super::SegmentContainer::Ts);
+        assert_eq!(super::hls_client_max_channels(&profile, tp, "aac"), Some(2));
+        // The limit is for AAC only.
+        assert_eq!(super::hls_client_max_channels(&profile, tp, "ac3"), Some(6));
+        let none = super::hls_client_max_channels(&profile, None, "aac");
+        assert_eq!(none, None);
+    }
+
+    #[test]
+    fn an_unrecognised_source_codec_is_not_copied_to_a_client_with_an_allowlist() {
+        let accepted = [AudioCodec::Aac];
+        assert!(!super::client_accepts_audio(
+            Some("mystery"),
+            Some(&accepted)
+        ));
+        assert!(super::client_accepts_audio(Some("mystery"), None));
+        assert!(super::client_accepts_audio(None, Some(&accepted)));
+    }
+
+    fn transcode_for_test(
+        dir: &std::path::Path,
+        audio_index: Option<i32>,
+    ) -> std::sync::Arc<tokio::sync::RwLock<crate::playback::session::TranscodeSession>>
+    {
+        crate::playback::session::TranscodeSession::new(
+            "ps".into(),
+            uuid::Uuid::nil(),
+            uuid::Uuid::nil(),
+            uuid::Uuid::nil(),
+            "http://example.invalid/video".into(),
+            dir.to_path_buf(),
+            "copy".into(),
+            "aac".into(),
+            audio_index,
+            None,
+            false,
+            6,
+            Default::default(),
+            0,
+            false,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+    }
+
+    #[tokio::test]
+    async fn concurrent_audio_switches_restart_the_session_once() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let dir = std::env::temp_dir()
+            .join(format!("remux-hls-switch-{}", std::process::id()));
+        let sessions = std::sync::Arc::new(
+            crate::playback_session::PlaybackSessionManager::new(&dir),
+        );
+        let locks = std::sync::Arc::new(crate::keyed_lock::KeyedLock::<String>::new());
+        sessions
+            .attach_transcode(
+                "ps",
+                "device",
+                transcode_for_test(&dir.join("old"), Some(1)),
+            )
+            .await;
+        let created = std::sync::Arc::new(AtomicUsize::new(0));
+
+        // Every request takes the create lock, restarts on a switch and builds
+        // a session only when none is left, as `create_hls_session` does.
+        let request = |new_dir: std::path::PathBuf| {
+            let (sessions, locks, created) =
+                (sessions.clone(), locks.clone(), created.clone());
+            tokio::spawn(async move {
+                let _guard = locks
+                    .lock("ps".to_string())
+                    .await;
+                super::restart_on_audio_switch(&sessions, "ps", Some(2)).await;
+                if sessions
+                    .get_transcode("ps")
+                    .is_none()
+                {
+                    created.fetch_add(1, Ordering::SeqCst);
+                    tokio::task::yield_now().await;
+                    sessions
+                        .attach_transcode(
+                            "ps",
+                            "device",
+                            transcode_for_test(&new_dir, Some(2)),
+                        )
+                        .await;
+                }
+            })
+        };
+        let all = (0..8).map(|i| request(dir.join(format!("new{i}"))));
+        for task in all.collect::<Vec<_>>() {
+            task.await
+                .unwrap();
+        }
+
+        assert_eq!(created.load(Ordering::SeqCst), 1);
+        let current = sessions
+            .get_transcode("ps")
+            .unwrap();
+        assert_eq!(
+            current
+                .read()
+                .await
+                .audio_stream_index,
+            Some(2)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn requested_and_profile_caps_combine_to_the_lower() {
+        assert_eq!(super::min_cap(Some(6), Some(2)), Some(2));
+        assert_eq!(super::min_cap(None, Some(2)), Some(2));
+        assert_eq!(super::min_cap(Some(6), None), Some(6));
+        assert_eq!(super::min_cap(None, None), None);
+    }
+
+    #[test]
+    fn a_client_without_an_hls_profile_declares_no_audio_allowlist() {
+        let profile: remux_sdks::remux::DeviceProfile =
+            serde_json::from_value(serde_json::json!({
+                "TranscodingProfiles": [{
+                    "Type": "Video",
+                    "Protocol": "http",
+                    "Container": "mkv",
+                    "AudioCodec": "dts,aac"
+                }]
+            }))
+            .unwrap();
+        assert!(
+            super::hls_transcoding_profile(&profile, super::SegmentContainer::Ts)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn copy_is_refused_when_the_source_exceeds_a_codec_channel_limit() {
+        let profile = profile_with_codec_limit();
+        assert_eq!(super::hls_codec_channel_limit(&profile, "aac"), Some(2));
+        assert_eq!(super::hls_codec_channel_limit(&profile, "ac3"), None);
+        // A 5.1 AAC source can't be copied for a client limited to stereo AAC.
+        assert_eq!(
+            super::resolve_hls_audio_codec(
+                false,
+                None,
+                Some("aac"),
+                Ts,
+                &"copy".into(),
+                None,
+                true
+            ),
+            CodecTarget::from("aac")
+        );
+    }
+
+    #[test]
+    fn a_cap_of_six_lets_5_1_pass_through_but_nothing_larger() {
+        use crate::playback::decision::audio_is_passthrough;
+        let cap = super::hls_channel_cap(Some(6));
+        assert!(audio_is_passthrough(
+            "aac",
+            Some("aac"),
+            Some(6),
+            None,
+            Some(cap),
+            None
+        ));
+        assert!(!audio_is_passthrough(
+            "aac",
+            Some("aac"),
+            Some(8),
+            None,
+            Some(cap),
+            None
+        ));
+        // No declared cap is stereo, as before.
+        let stereo = super::hls_channel_cap(None);
+        assert!(!audio_is_passthrough(
+            "aac",
+            Some("aac"),
+            Some(6),
+            None,
+            Some(stereo),
+            None
+        ));
+    }
+
+    #[tokio::test]
+    async fn unchanged_segments_answer_a_matching_etag_with_304() {
+        let path = std::env::temp_dir()
+            .join(format!("remux-hls-etag-{}.m4s", std::process::id()));
+        std::fs::write(&path, b"segment").unwrap();
+        let first = super::serve_file_with_length(&path, "video/mp4", None)
+            .await
+            .unwrap();
+        assert_eq!(first.status(), axum::http::StatusCode::OK);
+        assert_eq!(first.headers()["Cache-Control"], "no-cache");
+        let etag = first.headers()["ETag"]
+            .to_str()
+            .unwrap()
+            .to_owned();
+        let again = super::serve_file_with_length(&path, "video/mp4", Some(&etag))
+            .await
+            .unwrap();
+        assert_eq!(again.status(), axum::http::StatusCode::NOT_MODIFIED);
+        // A rewritten file (restarted transcode) no longer matches.
+        std::fs::write(&path, b"a different segment").unwrap();
+        let rewritten = super::serve_file_with_length(&path, "video/mp4", Some(&etag))
+            .await
+            .unwrap();
+        assert_eq!(rewritten.status(), axum::http::StatusCode::OK);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn etag_matching_handles_lists_weak_tags_and_wildcards() {
+        assert!(super::etag_matches(Some("\"a\", \"b\""), "\"b\""));
+        assert!(super::etag_matches(Some("W/\"a\""), "\"a\""));
+        assert!(super::etag_matches(Some("*"), "\"a\""));
+        assert!(!super::etag_matches(Some("\"a\""), "\"b\""));
+        assert!(!super::etag_matches(None, "\"a\""));
+    }
+
+    #[test]
+    fn transcoded_audio_keeps_the_source_layout_up_to_the_client_cap() {
+        // Copy has no channel count.
+        assert_eq!(
+            super::hls_audio_channels(&"copy".into(), Some(6), Some(6)),
+            None
+        );
+        // No declared cap or unknown source: stereo, as before.
+        assert_eq!(
+            super::hls_audio_channels(&"aac".into(), Some(6), None),
+            Some(2)
+        );
+        assert_eq!(
+            super::hls_audio_channels(&"aac".into(), None, Some(6)),
+            Some(2)
+        );
+        // An unknown source layout still respects a mono-only client.
+        assert_eq!(
+            super::hls_audio_channels(&"aac".into(), None, Some(1)),
+            Some(1)
+        );
+        // 5.1 DTS for a client that takes 6 channels stays 5.1.
+        assert_eq!(
+            super::hls_audio_channels(&"aac".into(), Some(6), Some(6)),
+            Some(6)
+        );
+        // Never upmixes, never exceeds the cap or 6.
+        assert_eq!(
+            super::hls_audio_channels(&"aac".into(), Some(2), Some(6)),
+            Some(2)
+        );
+        assert_eq!(
+            super::hls_audio_channels(&"aac".into(), Some(8), Some(6)),
+            Some(6)
+        );
+        assert_eq!(
+            super::hls_audio_channels(&"aac".into(), Some(8), Some(8)),
+            Some(6)
+        );
+        assert_eq!(
+            super::hls_audio_channels(&"aac".into(), Some(6), Some(2)),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn switching_audio_track_is_detected_only_for_a_named_different_track() {
+        assert!(super::audio_track_changed(Some(1), None, Some(3)));
+        assert!(super::audio_track_changed(None, None, Some(3)));
+        assert!(!super::audio_track_changed(Some(3), None, Some(3)));
+        // The request doesn't name a track (or uses the -1 "unset" sentinel).
+        assert!(!super::audio_track_changed(Some(1), None, None));
+        // Naming the default track of a session that started without one is
+        // not a switch; naming another still is.
+        assert!(!super::audio_track_changed(None, Some(1), Some(1)));
+        assert!(super::audio_track_changed(None, Some(1), Some(2)));
+        assert!(!super::audio_track_changed(Some(1), None, Some(-1)));
     }
 }

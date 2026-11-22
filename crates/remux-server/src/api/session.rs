@@ -1,3 +1,4 @@
+use crate::ids::UserId;
 use axum::{
     Json,
     extract::{Path, State},
@@ -8,22 +9,20 @@ use axum_extra::extract::Query;
 use chrono::Utc;
 use http::StatusCode;
 use remux_macros::{delete, get, post, query};
-use serde::Deserialize;
-use serde_json::json;
 use serde_with::{DurationSeconds, serde_as};
 use std::time::Duration;
 use tracing::info;
 use uuid::Uuid;
 
 use crate::{
-    AppState, IntoApiError, OptionExt, ResultExt, api, common,
+    AppState, IntoApiError, OptionExt, ResultExt, api,
     common::{TickUnit, ToRunTimeTicks},
     db,
     db::auth,
-    playback::session::TranscodeSession,
+    playback::codec::CodecTarget,
     playback_session,
-    playback_session::ServedPlayback,
-    services::{self, MediaResolveService},
+    playback_session::{ServedPlayback, TRANSCODE_CREATE_LOCKS},
+    services::MediaResolveService,
     signals::{
         Event, PlaybackContext, PlaybackPosition, RemoteCommandInfo, RemotePlayInfo,
         RemotePlaystateInfo,
@@ -163,8 +162,24 @@ pub async fn sessions_capabilities_by_id(
 pub async fn report_playback_start(
     State(state): State<AppState>,
     session: auth::AuthSession,
-    Json(data): Json<api::PlaybackInfo>,
+    Json(mut data): Json<api::PlaybackInfo>,
 ) -> Result<impl IntoResponse> {
+    report_source_id(&state, &mut data).await;
+    if !data
+        .item_id
+        .is_nil()
+    {
+        data.item_id = MediaResolveService::playable_item_id(
+            &state.ctx,
+            UserId(
+                session
+                    .user
+                    .id,
+            ),
+            data.item_id,
+        )
+        .await;
+    }
     state
         .ctx
         .sessions
@@ -214,12 +229,123 @@ pub async fn report_playback_start(
     Ok(StatusCode::NO_CONTENT.into_response())
 }
 
+/// A report naming a picked group's version id as its source names the plain
+/// group, the way the session and stream selection know it (see `VersionId`).
+async fn report_source_id(state: &AppState, data: &mut api::PlaybackInfo) {
+    let Some(source) = data
+        .media_source_id
+        .as_deref()
+        .and_then(|sid| Uuid::parse_str(sid).ok())
+    else {
+        return;
+    };
+    if db::Media::get_by_id(
+        &state
+            .ctx
+            .db,
+        &source,
+    )
+    .await
+    .ok()
+    .flatten()
+    .is_none()
+    {
+        if let Some(version) = crate::services::VersionId::decode(
+            &state
+                .ctx
+                .db,
+            source,
+        )
+        .await
+        {
+            data.media_source_id = Some(
+                version
+                    .group
+                    .simple()
+                    .to_string(),
+            );
+        }
+    }
+}
+
+/// The item a progress/stop report is about. A version id maps back to its
+/// owner. A stream's owner is its parent, but a stream group's owner is only the
+/// last item it was browsed under (`StreamService::get_group_item`), which
+/// another title sharing the group can overwrite mid-playback. For a group, the
+/// live session playing that group knows what it started, so it wins. Only a
+/// session playing that same group counts: Android TV's external player sends
+/// a bare stop without a PlaySessionId, and the device's latest session may be
+/// another title.
+async fn report_item_id(
+    state: &AppState,
+    session: &auth::AuthSession,
+    data: &api::PlaybackInfo,
+) -> Uuid {
+    let is_group = db::Media::get_by_id(
+        &state
+            .ctx
+            .db,
+        &data.item_id,
+    )
+    .await
+    .ok()
+    .flatten()
+    .is_some_and(|m| m.kind == db::MediaKind::StreamGroup);
+    if is_group {
+        let live = data
+            .play_session_id
+            .as_deref()
+            .and_then(|psid| {
+                state
+                    .ctx
+                    .sessions
+                    .get(psid)
+            })
+            .or_else(|| {
+                state
+                    .ctx
+                    .sessions
+                    .get_by_device(
+                        &session
+                            .device
+                            .id,
+                    )
+            })
+            .filter(|s| {
+                s.media_source_id
+                    .as_deref()
+                    .and_then(|sid| Uuid::parse_str(sid).ok())
+                    == Some(data.item_id)
+            });
+        if let Some(live) = live {
+            return live.item_id;
+        }
+    }
+    MediaResolveService::playable_item_id(
+        &state.ctx,
+        UserId(
+            session
+                .user
+                .id,
+        ),
+        data.item_id,
+    )
+    .await
+}
+
 #[post("/sessions/playing/progress")]
 pub async fn report_playback_progress(
     State(state): State<AppState>,
     session: auth::AuthSession,
-    Json(data): Json<api::PlaybackInfo>,
+    Json(mut data): Json<api::PlaybackInfo>,
 ) -> Result<impl IntoResponse> {
+    report_source_id(&state, &mut data).await;
+    if !data
+        .item_id
+        .is_nil()
+    {
+        data.item_id = report_item_id(&state, &session, &data).await;
+    }
     // Jellyfin clients keep reporting while paused, so the transition is what
     // marks a real pause; the position is read before the session is updated.
     let was_paused = state
@@ -246,6 +372,32 @@ pub async fn report_playback_progress(
                 .map(|s| s.play_session_id)
         });
     if let Some(ref psid) = effective_psid {
+        let before = state
+            .ctx
+            .sessions
+            .get(psid);
+        let item_id = Some(data.item_id)
+            .filter(|id| !id.is_nil())
+            .or_else(|| {
+                before
+                    .as_ref()
+                    .map(|b| b.item_id)
+            });
+        let release = item_id.and_then(|item_id| {
+            crate::services::StreamService::played_release(
+                &state.ctx,
+                psid,
+                item_id,
+                data.media_source_id
+                    .as_deref()
+                    .or(before
+                        .as_ref()
+                        .and_then(|b| {
+                            b.media_source_id
+                                .as_deref()
+                        })),
+            )
+        });
         state
             .ctx
             .sessions
@@ -256,9 +408,19 @@ pub async fn report_playback_progress(
                 &session.user,
                 psid,
                 &data,
+                release,
             )
             .await
             .context_internal("failed to update progress")?;
+        if let Some(before) = before.as_ref() {
+            crate::services::StreamService::remember_track_choice(
+                &state.ctx,
+                &session.user,
+                before,
+                &data,
+            )
+            .await;
+        }
         state
             .ctx
             .signals
@@ -271,7 +433,7 @@ pub async fn report_playback_progress(
             && session
                 .device
                 .is_4k_capable
-                != Some(true)
+                .is_none()
         {
             state
                 .ctx
@@ -326,8 +488,15 @@ pub async fn report_playback_progress(
 pub async fn report_playback_stopped(
     State(state): State<AppState>,
     session: auth::AuthSession,
-    Json(data): Json<api::PlaybackInfo>,
+    Json(mut data): Json<api::PlaybackInfo>,
 ) -> Result<impl IntoResponse> {
+    report_source_id(&state, &mut data).await;
+    if !data
+        .item_id
+        .is_nil()
+    {
+        data.item_id = report_item_id(&state, &session, &data).await;
+    }
     let effective_psid = data
         .play_session_id
         .clone()
@@ -405,6 +574,24 @@ pub async fn report_playback_stopped(
             .signals
             .emit(Event::SessionsChanged);
         if let Some(item_id) = changed_item_id {
+            if data
+                .play_session_id
+                .is_none()
+            {
+                state
+                    .ctx
+                    .sessions
+                    .stop_unreported(
+                        &session
+                            .device
+                            .id,
+                        session
+                            .user
+                            .id,
+                        item_id,
+                    )
+                    .await;
+            }
             state
                 .ctx
                 .signals
@@ -422,6 +609,19 @@ pub async fn report_playback_stopped(
         .item_id
         .is_nil()
     {
+        state
+            .ctx
+            .sessions
+            .stop_unreported(
+                &session
+                    .device
+                    .id,
+                session
+                    .user
+                    .id,
+                data.item_id,
+            )
+            .await;
         // No play session to attach this stop to: the client never reported a
         // start and sent no `PlaySessionId`. The stop
         // still names the item and the position, and Jellyfin persists it
@@ -523,7 +723,7 @@ pub async fn sessions_capabilities_full_by_id(
 #[serde_as]
 #[query]
 #[derive(Default)]
-struct SessionsQuery {
+pub struct SessionsQuery {
     #[serde(rename = "activeWithinSeconds", alias = "ActiveWithinSeconds")]
     #[serde_as(as = "Option<DurationSeconds<u64>>")]
     active_within: Option<Duration>,
@@ -556,11 +756,11 @@ pub(crate) async fn build_session_list(
     for device in devices {
         // Prefer a session that has an active transcode attached; fall back to
         // any session for this device. This handles quality-switch windows where
-        // a new stub (with inherited device_id) coexists with the old session
-        // that had its transcode cleared.
+        // a new stub coexists with the old session that had its transcode
+        // cleared. Like Jellyfin, a stub shows nothing before a report.
         let ps = playback_sessions
             .iter()
-            .filter(|s| s.device_id == device.id)
+            .filter(|s| s.device_id == device.id && s.is_reported())
             .max_by_key(|s| {
                 (
                     s.transcode
@@ -731,7 +931,7 @@ pub(crate) async fn build_session_list(
                 let video_stream = probe_data.and_then(|p| {
                     p.media_streams
                         .iter()
-                        .find(|s| s.type_ == Some(api::MediaStreamType::Video))
+                        .find(|s| s.type_ == api::MediaStreamType::Video)
                 });
                 let width = video_stream.and_then(|v| {
                     v.width
@@ -744,7 +944,7 @@ pub(crate) async fn build_session_list(
                 let audio_channels = probe_data.and_then(|p| {
                     p.media_streams
                         .iter()
-                        .find(|s| s.type_ == Some(api::MediaStreamType::Audio))
+                        .find(|s| s.type_ == api::MediaStreamType::Audio)
                         .and_then(|a| {
                             a.channels
                                 .map(|x| x as i32)
@@ -775,30 +975,24 @@ pub(crate) async fn build_session_list(
                 // Use the actual source codec name when ffmpeg is copying the
                 // stream (remux). Clients use VideoCodec/AudioCodec to display
                 // the stream format, so "copy" is meaningless to them.
-                let video_codec_name = if ts.video_codec == "copy" {
-                    ts.source_video_codec
+                let video_codec_name = match &ts.video_codec {
+                    CodecTarget::Copy => ts
+                        .source_video_codec
                         .clone()
-                        .unwrap_or_else(|| {
-                            ts.video_codec
-                                .clone()
-                        })
-                } else {
-                    ts.video_codec
-                        .clone()
+                        .unwrap_or_else(|| "copy".to_string()),
+                    CodecTarget::Transcode(codec) => codec.clone(),
                 };
-                let audio_codec_name = if ts.audio_codec == "copy" {
-                    ts.source_audio_codec
+                let audio_codec_name = match &ts.audio_codec {
+                    CodecTarget::Copy => ts
+                        .source_audio_codec
                         .clone()
-                        .unwrap_or_else(|| {
-                            ts.audio_codec
-                                .clone()
-                        })
-                } else {
-                    ts.audio_codec
-                        .clone()
+                        .unwrap_or_else(|| "copy".to_string()),
+                    CodecTarget::Transcode(codec) => codec.clone(),
                 };
 
-                let is_video_direct = ts.video_codec == "copy";
+                let is_video_direct = ts
+                    .video_codec
+                    .is_copy();
                 let container = if ts.use_fmp4() { "fmp4" } else { "ts" };
                 let bitrate = if is_video_direct {
                     probe_data.and_then(|p| p.bitrate)
@@ -811,7 +1005,9 @@ pub(crate) async fn build_session_list(
                     video_codec: Some(video_codec_name),
                     container: Some(container.to_string()),
                     is_video_direct,
-                    is_audio_direct: ts.audio_codec == "copy",
+                    is_audio_direct: ts
+                        .audio_codec
+                        .is_copy(),
                     bitrate,
                     framerate: ts.source_frame_rate,
                     width,
@@ -1041,7 +1237,7 @@ pub async fn get_sessions(
 #[post("/userplayeditems/{id}")]
 pub async fn user_mark_played(
     State(state): State<AppState>,
-    session: auth::AuthSession,
+    _session: auth::AuthSession,
     auth::TargetUser(user): auth::TargetUser,
     Path(id): Path<Uuid>,
 ) -> Result<impl IntoResponse> {
@@ -1051,7 +1247,7 @@ pub async fn user_mark_played(
 #[delete("/userplayeditems/{id}")]
 pub async fn user_unmark_played(
     State(state): State<AppState>,
-    session: auth::AuthSession,
+    _session: auth::AuthSession,
     auth::TargetUser(user): auth::TargetUser,
     Path(id): Path<Uuid>,
 ) -> Result<impl IntoResponse> {
@@ -1063,7 +1259,7 @@ pub async fn user_unmark_played(
 
 #[query]
 #[derive(Default)]
-struct RemotePlayQuery {
+pub struct RemotePlayQuery {
     item_ids: remux_sdks::CommaSeparatedList<Uuid>,
     play_command: Option<String>,
     start_position_ticks: Option<i64>,
@@ -1075,7 +1271,7 @@ struct RemotePlayQuery {
 
 #[query]
 #[derive(Default)]
-struct RemotePlaystateQuery {
+pub struct RemotePlaystateQuery {
     seek_position_ticks: Option<i64>,
     controlling_user_id: Option<String>,
 }
@@ -1098,7 +1294,7 @@ enum PlaystateCommand {
 
 #[query]
 #[derive(Default)]
-struct RemoteViewingQuery {
+pub struct RemoteViewingQuery {
     item_type: Option<String>,
     item_id: Option<String>,
     item_name: Option<String>,
@@ -1106,7 +1302,7 @@ struct RemoteViewingQuery {
 
 #[query]
 #[derive(Debug, Clone, Default, serde::Deserialize)]
-struct RemoteFullCommand {
+pub struct RemoteFullCommand {
     name: Option<String>,
     controlling_user_id: Option<String>,
     arguments: Option<std::collections::HashMap<String, String>>,
@@ -1114,7 +1310,7 @@ struct RemoteFullCommand {
 
 #[query]
 #[derive(Debug, Clone, Default, serde::Deserialize)]
-struct RemoteMessageBody {
+pub struct RemoteMessageBody {
     header: Option<String>,
     text: Option<String>,
     timeout_ms: Option<i64>,
@@ -1461,6 +1657,11 @@ pub async fn delete_transcoding(
 ) -> Result<impl IntoResponse> {
     if let Some(play_session_id) = q.play_session_id {
         info!("Stopping transcode session: {}", play_session_id);
+        // Wait out a transcode being created for this session, so the stop
+        // finds it.
+        let _create = TRANSCODE_CREATE_LOCKS
+            .lock_if_exists(&play_session_id)
+            .await;
         state
             .ctx
             .sessions
@@ -1507,11 +1708,20 @@ mod tests {
 
 #[cfg(test)]
 mod e2e_tests {
-    use crate::integration_test::{
-        AUTH_HEADER, auth_header_with_token, authenticated_server, seed_movie,
-    };
+    use axum_test::TestServer;
     use http::{StatusCode, header::HeaderValue};
     use serde_json::json;
+    use std::sync::Arc;
+    use uuid::Uuid;
+
+    use crate::{
+        AppContext,
+        integration_test::{
+            AUTH_HEADER, auth_header_with_token, authenticated_server,
+            insert_test_source, seed_movie,
+        },
+        playback::session::TranscodeSession,
+    };
 
     async fn post_capabilities_full(
         server: &axum_test::TestServer,
@@ -1975,6 +2185,367 @@ mod e2e_tests {
         assert!(
             !user_data["LastPlayedDate"].is_null(),
             "playback start must set LastPlayedDate: {user_data}"
+        );
+    }
+
+    type Transcode = Arc<tokio::sync::RwLock<TranscodeSession>>;
+
+    async fn test_user_id(ctx: &AppContext) -> Uuid {
+        crate::db::User::get_by_username(&ctx.db, "test")
+            .await
+            .unwrap()
+            .unwrap()
+            .id
+    }
+
+    /// What master.m3u8 attaches for `psid` on the test device, without
+    /// spawning ffmpeg.
+    async fn attach_transcode(
+        ctx: &AppContext,
+        dir: &std::path::Path,
+        psid: &str,
+        user: Uuid,
+        item: Uuid,
+    ) -> Transcode {
+        let ts = TranscodeSession::new(
+            psid.to_string(),
+            user,
+            item,
+            item,
+            String::new(),
+            dir.join(psid),
+            "h264".into(),
+            "aac".into(),
+            None,
+            None,
+            false,
+            6,
+            Default::default(),
+            0,
+            false,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        assert!(
+            ctx.sessions
+                .attach_transcode(psid, "test-device", ts.clone())
+                .await
+        );
+        ts
+    }
+
+    /// The player's master.m3u8 request for `item` under `psid`.
+    async fn request_hls(server: &TestServer, auth: &str, item: Uuid, psid: &str) {
+        server
+            .get(&format!("/videos/{item}/master.m3u8?PlaySessionId={psid}"))
+            .add_header(
+                http::header::AUTHORIZATION,
+                HeaderValue::from_str(auth).unwrap(),
+            )
+            .await
+            .assert_status_ok();
+    }
+
+    async fn report(
+        server: &TestServer,
+        auth: &str,
+        path: &str,
+        body: serde_json::Value,
+    ) {
+        server
+            .post(path)
+            .add_header(
+                http::header::AUTHORIZATION,
+                HeaderValue::from_str(auth).unwrap(),
+            )
+            .json(&body)
+            .await
+            .assert_status(StatusCode::NO_CONTENT);
+    }
+
+    /// The test device's entry in `/Sessions`.
+    async fn device_session(
+        server: &TestServer,
+        auth: &str,
+    ) -> crate::api::SessionInfoDto {
+        let resp = server
+            .get("/sessions")
+            .add_header(
+                http::header::AUTHORIZATION,
+                HeaderValue::from_str(auth).unwrap(),
+            )
+            .await;
+        resp.assert_status_ok();
+        let mut sessions: Vec<crate::api::SessionInfoDto> = resp.json();
+        sessions.remove(0)
+    }
+
+    async fn stopped(ts: &Transcode) -> bool {
+        ts.read()
+            .await
+            .stopped
+    }
+
+    /// A client retrying under a new PlaySessionId without DELETE
+    /// /Videos/ActiveEncodings left one ffmpeg per attempt running. The
+    /// retry's master.m3u8 stops the old transcode; another user's transcode
+    /// of the item on the same device is kept.
+    #[tokio::test]
+    async fn a_retry_stops_the_old_transcode_but_not_another_users() {
+        let (server, guard, token) = authenticated_server().await;
+        let ctx = &guard.0;
+        let auth = auth_header_with_token(&token);
+        let item = insert_test_source(ctx)
+            .await
+            .id;
+        server
+            .post("/users/new")
+            .add_header(
+                http::header::AUTHORIZATION,
+                HeaderValue::from_str(&auth).unwrap(),
+            )
+            .json(&json!({ "Name": "other", "Password": "other" }))
+            .await
+            .assert_status_ok();
+        // Signed in on the same device.
+        let other_token = server
+            .post("/users/authenticatebyname")
+            .add_header(
+                http::header::AUTHORIZATION,
+                HeaderValue::from_static(AUTH_HEADER),
+            )
+            .json(&json!({ "Username": "other", "Pw": "other" }))
+            .await
+            .json::<serde_json::Value>()["AccessToken"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        request_hls(
+            &server,
+            &auth_header_with_token(&other_token),
+            item,
+            "other",
+        )
+        .await;
+        request_hls(&server, &auth, item, "first").await;
+        let other = ctx
+            .sessions
+            .get_transcode("other")
+            .unwrap();
+        let first = ctx
+            .sessions
+            .get_transcode("first")
+            .unwrap();
+        request_hls(&server, &auth, item, "retry").await;
+
+        assert!(stopped(&first).await);
+        assert!(
+            !stopped(
+                &ctx.sessions
+                    .get_transcode("retry")
+                    .unwrap()
+            )
+            .await
+        );
+        assert!(!stopped(&other).await);
+        ctx.sessions
+            .stop_all()
+            .await;
+    }
+
+    /// A client reporting without PlaySessionId gets a start under a random
+    /// id, which leaves master.m3u8's transcode unreported. Its stop must
+    /// still end that transcode.
+    #[tokio::test]
+    async fn a_stop_without_play_session_ends_the_unreported_transcode() {
+        let (server, guard, token) = authenticated_server().await;
+        let ctx = &guard.0;
+        let auth = auth_header_with_token(&token);
+        let item = insert_test_source(ctx)
+            .await
+            .id;
+
+        request_hls(&server, &auth, item, "hls").await;
+        let ts = ctx
+            .sessions
+            .get_transcode("hls")
+            .unwrap();
+        let start = json!({ "ItemId": item, "PlayMethod": "Transcode" });
+        report(&server, &auth, "/sessions/playing", start).await;
+        let stop = json!({ "ItemId": item });
+        report(&server, &auth, "/sessions/playing/stopped", stop).await;
+
+        assert!(stopped(&ts).await);
+    }
+
+    /// master.m3u8 runs before the start report. As on Jellyfin, `/Sessions`
+    /// shows nothing playing until that report; a report without a
+    /// PlaySessionId then shows its item, and must not stop the transcode.
+    #[tokio::test]
+    async fn sessions_show_a_playback_only_once_it_is_reported() {
+        let (server, guard, token) = authenticated_server().await;
+        let ctx = &guard.0;
+        let auth = auth_header_with_token(&token);
+        let dir = tempfile::tempdir().unwrap();
+        let user = test_user_id(ctx).await;
+        let item = Uuid::new_v4();
+
+        let ts = attach_transcode(ctx, dir.path(), "hls", user, item).await;
+        assert!(
+            device_session(&server, &auth)
+                .await
+                .now_playing_item
+                .is_none()
+        );
+
+        let start = json!({ "ItemId": item, "PlayMethod": "Transcode" });
+        report(&server, &auth, "/sessions/playing", start).await;
+
+        assert_eq!(
+            device_session(&server, &auth)
+                .await
+                .now_playing_item
+                .map(|i| i.id),
+            Some(item)
+        );
+        assert!(!stopped(&ts).await);
+    }
+
+    /// jellyfin-web's audio switch during a transcode: new PlaySessionId and
+    /// transcode, DELETE of the old encoding, then progress only under the
+    /// new id. That progress makes the new id the user's playback, and
+    /// `/Sessions` follows its position and pause state.
+    #[tokio::test]
+    async fn sessions_follow_a_stream_switch_reported_by_progress_only() {
+        let (server, guard, token) = authenticated_server().await;
+        let ctx = &guard.0;
+        let auth = auth_header_with_token(&token);
+        let dir = tempfile::tempdir().unwrap();
+        let user = test_user_id(ctx).await;
+        let item = Uuid::new_v4();
+
+        attach_transcode(ctx, dir.path(), "before", user, item).await;
+        let start = json!({
+            "ItemId": item,
+            "PlaySessionId": "before",
+            "PlayMethod": "Transcode",
+            "PositionTicks": 100_000_000,
+        });
+        report(&server, &auth, "/sessions/playing", start).await;
+        attach_transcode(ctx, dir.path(), "after", user, item).await;
+        server
+            .delete("/videos/activeencodings?PlaySessionId=before")
+            .add_header(
+                http::header::AUTHORIZATION,
+                HeaderValue::from_str(&auth).unwrap(),
+            )
+            .await
+            .assert_status(StatusCode::NO_CONTENT);
+        let progress = json!({
+            "ItemId": item,
+            "PlaySessionId": "after",
+            "PlayMethod": "Transcode",
+            "PositionTicks": 900_000_000,
+            "IsPaused": true,
+        });
+        report(&server, &auth, "/sessions/playing/progress", progress).await;
+
+        let play_state = device_session(&server, &auth)
+            .await
+            .play_state
+            .unwrap();
+        assert_eq!(play_state.position_ticks, Some(900_000_000));
+        assert!(play_state.is_paused);
+        assert_eq!(
+            ctx.sessions
+                .get("after")
+                .unwrap()
+                .user_id,
+            user
+        );
+    }
+
+    /// A stop before master.m3u8's transcode spawns ffmpeg (#613) leaves it
+    /// never started.
+    #[tokio::test]
+    async fn a_stop_before_the_first_spawn_prevents_it() {
+        let (server, guard, token) = authenticated_server().await;
+        let ctx = &guard.0;
+        let dir = tempfile::tempdir().unwrap();
+        let nil = Uuid::nil();
+        let ts = attach_transcode(ctx, dir.path(), "early", nil, nil).await;
+
+        server
+            .delete("/videos/activeencodings?PlaySessionId=early")
+            .add_header(
+                http::header::AUTHORIZATION,
+                HeaderValue::from_str(&auth_header_with_token(&token)).unwrap(),
+            )
+            .await
+            .assert_status(StatusCode::NO_CONTENT);
+        crate::playback::engine::start_transcode(
+            ts.clone(),
+            crate::playback::engine::TranscodeParams {
+                output_dir: dir
+                    .path()
+                    .join("early"),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        // Starting marks it Running before it spawns the ffmpeg loop.
+        assert_eq!(
+            ts.read()
+                .await
+                .state,
+            crate::playback::session::TranscodeState::Starting
+        );
+    }
+
+    /// Exiting runs no destructors, so shutdown first stops every transcode
+    /// and refuses new ones, until a failed restart reopens.
+    #[tokio::test]
+    async fn stop_all_stops_every_transcode_and_refuses_new_ones_until_reopened() {
+        let (_server, guard, _token) = authenticated_server().await;
+        let ctx = &guard.0;
+        let dir = tempfile::tempdir().unwrap();
+        let nil = Uuid::nil();
+        let ts = attach_transcode(ctx, dir.path(), "running", nil, nil).await;
+
+        ctx.sessions
+            .stop_all()
+            .await;
+
+        assert!(stopped(&ts).await);
+        assert!(
+            ctx.sessions
+                .get("running")
+                .is_none()
+        );
+        assert!(
+            !ctx.sessions
+                .attach_transcode("late", "test-device", ts.clone())
+                .await
+        );
+        // As /System/Restart does when the new process fails to spawn.
+        ctx.sessions
+            .reopen();
+        assert!(
+            ctx.sessions
+                .attach_transcode("after", "test-device", ts)
+                .await
         );
     }
 }

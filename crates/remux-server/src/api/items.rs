@@ -1,5 +1,10 @@
-use crate::services::{MediaResolveService, StreamService, image::ImageService};
-use anyhow::Context;
+use crate::{
+    ids::{ItemId, StreamGroupId, UserId},
+    services::{
+        MediaResolveService, StreamService, image::ImageService,
+        resolve::PlayableItemId,
+    },
+};
 use axum::{
     Json,
     extract::{Path, State},
@@ -7,24 +12,23 @@ use axum::{
 };
 use axum_extra::extract::Query;
 use http::StatusCode;
-use itertools::Itertools;
 use remux_macros::{delete, get, patch, post, query};
 use remux_utils::merge_option;
 use serde::Deserialize;
-use tracing::{debug, error, info, trace, warn};
+use tracing::{debug, info, warn};
 use uuid::{Uuid, uuid};
 
 use crate::{
-    AppState, IntoApiError, OptionExt, ResultExt, api,
-    common::{IntoVec, TickUnit, ToRunTimeTicks},
+    AppState, OptionExt, ResultExt, api,
+    common::{TickUnit, ToRunTimeTicks},
     db,
     db::auth,
-    device_profile::{DeviceProfileExt, SourceRankingContext},
+    device_profile::SourceRankingContext,
     errors::LogErr,
     sdks,
 };
 use axum_anyhow::ApiResult as Result;
-use chrono::{Datelike, Utc};
+use chrono::Utc;
 use sqlx::SqlitePool;
 
 use super::{mock_items, stub_json};
@@ -353,7 +357,7 @@ pub async fn get_items(
             .db,
     )
     .await;
-    let show_ungrouped = server_config
+    let _show_ungrouped = server_config
         .stream_groups_show_ungrouped
         .unwrap_or(true);
 
@@ -723,30 +727,12 @@ pub async fn get_items(
             // Smart collections: items float freely (no parent_id constraint).
             q.parent_id = None;
 
+            // (A smart collection of kind `Collection` is handled above.)
             let media_kind_filter = if let Some(kind) = parent
                 .collection_media_kind
-                .clone()
+                .as_ref()
             {
-                match kind {
-                    db::CollectionMediaKind::Movie => vec![db::MediaKind::Movie],
-                    db::CollectionMediaKind::Series => vec![db::MediaKind::Series],
-                    db::CollectionMediaKind::Mixed => {
-                        vec![db::MediaKind::Movie, db::MediaKind::Series]
-                    }
-                    db::CollectionMediaKind::Music => vec![
-                        db::MediaKind::Track,
-                        db::MediaKind::Album,
-                        db::MediaKind::Artist,
-                    ],
-                    db::CollectionMediaKind::Collection => {
-                        // Handled above — this branch is now unreachable for
-                        // smart collections with collection_media_kind='collection'.
-                        vec![db::MediaKind::Collection]
-                    }
-                    db::CollectionMediaKind::Playlist => {
-                        vec![db::MediaKind::Playlist]
-                    }
-                }
+                kind.media_kinds()
             } else {
                 vec![db::MediaKind::Movie, db::MediaKind::Series]
             };
@@ -784,7 +770,16 @@ pub async fn get_items(
                         .cloned()
                         .collect();
                     if intersection.is_empty() {
-                        vec![]
+                        // A library of episodes is listed whatever item types
+                        // the client asks for: a client browsing it as a TV
+                        // library asks for series, which would leave it empty.
+                        if parent.collection_media_kind
+                            == Some(db::CollectionMediaKind::Episode)
+                        {
+                            collection_types
+                        } else {
+                            vec![]
+                        }
                     } else {
                         intersection
                     }
@@ -814,7 +809,20 @@ pub async fn get_items(
                     None
                 };
 
-            let result = db::Media::get_by_jellyfin_filter(
+            let lists_upcoming = smart_filter.is_some_and(|f| f.requires_upcoming());
+            // Soonest first, unless the collection or the client chose an order.
+            if lists_upcoming
+                && parent
+                    .collection_default_sort
+                    .as_ref()
+                    .is_none_or(|s| s.is_empty())
+                && client.is_default_sort(&q)
+            {
+                q.sort_by = Some(vec![api::ItemSortBy::DigitalReleaseDate]);
+                q.sort_order = Some(vec![api::SortOrder::Ascending]);
+            }
+
+            let mut result = db::Media::get_by_jellyfin_filter(
                 &state
                     .ctx
                     .db,
@@ -827,6 +835,23 @@ pub async fn get_items(
                 Some(&parent),
             )
             .await?;
+
+            if lists_upcoming {
+                let now = chrono::Utc::now().naive_utc();
+                for media in &mut result.records {
+                    if let Some(date) = media
+                        .digital_released_at
+                        .or(media.released_at)
+                    {
+                        media.title = format!(
+                            "{} · {}",
+                            media.title,
+                            // Calendar days: a time-of-day must not turn tomorrow into today.
+                            countdown_label((date.date() - now.date()).num_days())
+                        );
+                    }
+                }
+            }
 
             return Ok(ItemsQueryResultBuilder::with_items(
                 session,
@@ -952,6 +977,17 @@ pub async fn get_items(
         q.fields
             .clone(),
     ))
+}
+
+/// How long until something comes out, for the name of an upcoming item.
+fn countdown_label(days: i64) -> String {
+    match days {
+        ..=0 => "today".to_string(),
+        1 => "tomorrow".to_string(),
+        2..=13 => format!("in {days} days"),
+        14..=59 => format!("in {} weeks", days / 7),
+        _ => format!("in {} months", days / 30),
+    }
 }
 
 #[get("/items/latest")]
@@ -1092,7 +1128,7 @@ pub async fn items_root(
 pub async fn items_ancestors(
     State(state): State<AppState>,
     _session: auth::AuthSession,
-    Path(id): Path<Uuid>,
+    PlayableItemId { id, .. }: PlayableItemId,
 ) -> Result<impl IntoResponse> {
     let ancestors = db::Media::get_ancestors(
         &state
@@ -1134,7 +1170,7 @@ pub async fn delete_item(
 pub async fn refresh_item(
     State(state): State<AppState>,
     _session: auth::AdminSession,
-    Path(id): Path<Uuid>,
+    PlayableItemId { id, .. }: PlayableItemId,
     Query(q): Query<api::RefreshItemQuery>,
 ) -> Result<StatusCode> {
     let mut media = db::Media::get_by_id(
@@ -1444,16 +1480,47 @@ pub async fn library_refresh(
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// Stubs — Jellyfin clients call these; we return empty lists so they don't 404
-
+/// The item's direct-URL trailers, each a playable `Trailer` item. Its
+/// YouTube trailers are `RemoteTrailers` on the item itself.
 #[get("/items/{id}/localtrailers")]
 pub async fn items_local_trailers(
-    _state: State<AppState>,
-    _session: auth::AuthSession,
-    _path: Path<Uuid>,
+    State(state): State<AppState>,
+    session: auth::AuthSession,
+    PlayableItemId { id, .. }: PlayableItemId,
 ) -> Result<impl IntoResponse> {
-    Ok(Json(Vec::<api::BaseItemDto>::new()))
+    local_trailers_inner(state, session, id).await
 }
+
+pub(crate) async fn local_trailers_inner(
+    state: AppState,
+    session: auth::AuthSession,
+    id: Uuid,
+) -> Result<Json<Vec<api::BaseItemDto>>> {
+    let db = &state
+        .ctx
+        .db;
+    let owner = db::Media::get_by_id(db, &id).await?;
+    let visible = match &owner {
+        Some(owner) => {
+            !owner
+                .is_hidden_by_policy(db, &session.user)
+                .await?
+        }
+        None => false,
+    };
+    let owner = owner
+        .filter(|_| visible)
+        .context_not_found("not found")?;
+    let trailers = db::Media::trailer_rows(db, &owner.id).await?;
+    Ok(Json(
+        trailers
+            .into_iter()
+            .map(|trailer| api::db_media_to_item(trailer, false))
+            .collect::<Vec<_>>(),
+    ))
+}
+
+/// Stubs — Jellyfin clients call these; we return empty lists so they don't 404
 
 #[get("/items/{id}/specialfeatures")]
 pub async fn items_special_features(
@@ -1501,7 +1568,7 @@ pub async fn items_theme_songs(
 pub async fn items_intros(
     State(state): State<AppState>,
     session: auth::AuthSession,
-    Path(id): Path<Uuid>,
+    PlayableItemId { id, .. }: PlayableItemId,
 ) -> Result<impl IntoResponse> {
     crate::api::intro::get_intros_inner(state, session, id).await
 }
@@ -1525,7 +1592,7 @@ pub struct RemoteImagesQuery {
 pub async fn items_remote_images(
     State(state): State<AppState>,
     _session: auth::AuthSession,
-    Path(id): Path<Uuid>,
+    PlayableItemId { id, .. }: PlayableItemId,
     Query(q): Query<RemoteImagesQuery>,
 ) -> Result<impl IntoResponse> {
     let media = match db::Media::get_by_id(
@@ -1644,7 +1711,7 @@ pub async fn items_remote_images_providers(
 #[get("/items/counts")]
 pub async fn items_counts(
     State(state): State<AppState>,
-    session: auth::AuthSession,
+    _session: auth::AuthSession,
 ) -> Result<impl IntoResponse> {
     let (
         movie_count,
@@ -1742,8 +1809,10 @@ async fn rank_item_sources(
     original_language: Option<&str>,
     remembered_audio: Option<i64>,
     remembered_subtitle: Option<i64>,
+    remembered_languages: &remux_sdks::remux::RememberedLanguages,
+    include_groups: bool,
 ) {
-    crate::services::StreamService::rank_media_sources(
+    crate::services::StreamService::rank_media_sources_with_groups(
         db,
         sources,
         ranking,
@@ -1755,7 +1824,9 @@ async fn rank_item_sources(
             requested_subtitle: None,
             remembered_audio,
             remembered_subtitle,
+            remembered_languages,
         },
+        include_groups,
     )
     .await;
 }
@@ -1796,26 +1867,69 @@ async fn item_for_user(
     // and then play MediaSources[0], so the requested group must end up first and
     // keep its own UUID instead of the item id stamped by `db_media_to_item`.
     let mut requested_group: Option<Uuid> = None;
-    let resolved_id = match MediaResolveService::resolve_item(id, &state.ctx).await? {
-        Some(m) if m.kind == db::MediaKind::StreamGroup => {
-            requested_group = Some(m.id);
-            // Stream groups have no parent_id on the row (they're global). Look up the
-            // group→item mapping written by the items pipeline and PlaybackInfo.
-            StreamService::get_group_item(
+    // Same for a plain stream picked as a version (no group covers it): the
+    // parent's metadata, with that stream first. The response keeps the
+    // stream's id as the item id, see the comment above `base_item.id = version`.
+    let mut requested_stream: Option<Uuid> = None;
+    // A group picked as a version of one title (see `VersionId`).
+    let picked_version = match db::Media::get_by_id(
+        &state
+            .ctx
+            .db,
+        &id,
+    )
+    .await?
+    {
+        Some(_) => None,
+        None => {
+            crate::services::VersionId::decode(
                 &state
                     .ctx
-                    .store,
-                target_user_id.unwrap_or(
-                    session
-                        .user
-                        .id,
-                ),
-                m.id,
+                    .db,
+                id,
             )
-            .context_not_found("stream group not yet associated with an item")?
+            .await
         }
-        Some(m) => m.id,
-        None => return Ok(None),
+    };
+    let resolved_id = if let Some(version) = picked_version {
+        requested_group = Some(version.group);
+        version.owner
+    } else {
+        match MediaResolveService::resolve_item(id, &state.ctx).await? {
+            Some(m) if m.kind == db::MediaKind::StreamGroup => {
+                requested_group = Some(m.id);
+                // Stream groups have no parent_id on the row (they're global). Look up the
+                // group→item mapping written by the items pipeline and PlaybackInfo.
+                StreamService::get_group_item(
+                    &state
+                        .ctx
+                        .store,
+                    UserId(
+                        target_user_id.unwrap_or(
+                            session
+                                .user
+                                .id,
+                        ),
+                    ),
+                    StreamGroupId(m.id),
+                )
+                .context_not_found("stream group not yet associated with an item")?
+            }
+            Some(m)
+                if m.kind == db::MediaKind::Stream
+                    && m.parent_id
+                        .is_some() =>
+            {
+                requested_stream = Some(m.id);
+                ItemId(
+                    m.parent_id
+                        .unwrap_or(m.id),
+                )
+            }
+            Some(m) => ItemId(m.id),
+            None => return Ok(None),
+        }
+        .uuid()
     };
     let mut media = db::Media::get_by_filter(
         &state
@@ -1825,6 +1939,8 @@ async fn item_for_user(
             id: Some(vec![resolved_id]),
             include_user_state: true,
             include_child_count: true,
+            include_recursive_item_count: fields
+                .is_some_and(|f| f.contains(&api::ItemFields::RecursiveItemCount)),
             user_id: Some(
                 target_user_id.unwrap_or(
                     session
@@ -1863,11 +1979,22 @@ async fn item_for_user(
 
     // Same remembered track selections PlaybackInfo resolves with, so both
     // endpoints rank and default sources identically.
-    let (remembered_audio, remembered_subtitle) = media
+    let (remembered_audio, remembered_subtitle, indexes_source) = media
         .user_state
         .as_ref()
-        .map(|s| (s.audio_idx, s.subtitle_idx))
+        .map(db::UserMediaState::remembered_indexes)
         .unwrap_or_default();
+    let mut remembered_languages = db::UserMediaState::remembered_languages(
+        &state
+            .ctx
+            .db,
+        &session
+            .user
+            .id,
+        &media.id,
+    )
+    .await;
+    remembered_languages.indexes_source = indexes_source;
 
     let needs_streams = want_streams
         && matches!(
@@ -1893,16 +2020,47 @@ async fn item_for_user(
                 .device
                 .parsed_device_profile(),
         );
+    let ranking_ctx = SourceRankingContext {
+        mode: server_config
+            .sort_media_sources
+            .unwrap_or_default(),
+        device_profile: persisted_device_profile.as_ref(),
+        is_4k_capable: session
+            .device
+            .is_4k_capable
+            == Some(true),
+        subtitle_mode,
+        explicit_subtitle_index: None,
+        // MaxStaticBitrate is the most this device takes of a file as it is,
+        // which is what picking a version asks; the streaming cap is the
+        // transcode's.
+        max_bitrate: persisted_device_profile
+            .as_ref()
+            .and_then(|p| {
+                [
+                    p.max_streaming_bitrate,
+                    p.max_static_bitrate
+                        .filter(|b| *b > 0),
+                ]
+                .into_iter()
+                .flatten()
+                .min()
+            }),
+    };
+    let sort_groups = server_config
+        .stream_groups_auto_sort
+        .unwrap_or(false);
 
-    // Items detail itself never shows subtitles (embedded or addon external —
-    // see the media_streams-stripping block below), but it still warms the
+    // Items detail itself never shows embedded or add-on subtitles (see the
+    // media_streams-stripping block below), but it still warms the
     // segment cache in the background so the PlaybackInfo call that follows a
     // few seconds later doesn't pay the cold-fetch cost.
     if needs_streams {
         if matches!(media.kind, db::MediaKind::Movie | db::MediaKind::Episode) {
             warm_providers_cache(&state.ctx, &media);
         }
-        state
+        // Already logged; the item is served with whatever sources it has.
+        let _ = state
             .ctx
             .addons
             .refresh_streams(
@@ -1946,7 +2104,10 @@ async fn item_for_user(
     } else {
         None
     };
-    if want_streams && media.kind == db::MediaKind::Stream {
+    // A stream or trailer plays its own URL, so it is its own source.
+    if want_streams
+        && matches!(media.kind, db::MediaKind::Stream | db::MediaKind::Trailer)
+    {
         media.sources = Some(vec![media.clone()]);
     } else if want_streams
         && matches!(media.kind, db::MediaKind::Movie | db::MediaKind::Episode)
@@ -1958,6 +2119,26 @@ async fn item_for_user(
                     .db,
             )
             .await?;
+        // Best first before grouping, so a group's representative (its first
+        // match) is its best stream for this device.
+        let mut raw = raw;
+        rank_item_sources(
+            &state
+                .ctx
+                .db,
+            &mut raw,
+            ranking_ctx,
+            &user_cfg,
+            server_config
+                .preferred_metadata_language
+                .as_deref(),
+            original_language.as_deref(),
+            remembered_audio,
+            remembered_subtitle,
+            &remembered_languages,
+            false,
+        )
+        .await;
         let grouped = db::StreamGroup::filter_sources(
             &state
                 .ctx
@@ -1977,11 +2158,13 @@ async fn item_for_user(
                     &state
                         .ctx
                         .store,
-                    session
-                        .user
-                        .id,
-                    gid,
-                    media.id,
+                    UserId(
+                        session
+                            .user
+                            .id,
+                    ),
+                    StreamGroupId(gid),
+                    ItemId(media.id),
                 );
             }
         }
@@ -2002,9 +2185,27 @@ async fn item_for_user(
                 }
             }
         }
+        if let Some(sid) = requested_stream {
+            match filtered
+                .iter()
+                .position(|s| {
+                    s.group_id
+                        .is_none()
+                        && s.id == sid
+                }) {
+                Some(pos) => {
+                    let source = filtered.remove(pos);
+                    filtered.insert(0, source);
+                }
+                None => {
+                    warn!(%sid, item = %media.id, "requested stream is not among the item's sources");
+                    requested_stream = None;
+                }
+            }
+        }
         media.sources = Some(filtered);
 
-        if requested_group.is_none() {
+        if requested_group.is_none() && requested_stream.is_none() {
             if let Some(sources) = media
                 .sources
                 .as_mut()
@@ -2014,21 +2215,7 @@ async fn item_for_user(
                         .ctx
                         .db,
                     sources,
-                    SourceRankingContext {
-                        mode: server_config
-                            .sort_media_sources
-                            .unwrap_or_default(),
-                        device_profile: persisted_device_profile.as_ref(),
-                        is_4k_capable: session
-                            .device
-                            .is_4k_capable
-                            == Some(true),
-                        subtitle_mode,
-                        explicit_subtitle_index: None,
-                        max_bitrate: persisted_device_profile
-                            .as_ref()
-                            .and_then(|p| p.max_streaming_bitrate),
-                    },
+                    ranking_ctx,
                     &user_cfg,
                     server_config
                         .preferred_metadata_language
@@ -2036,6 +2223,8 @@ async fn item_for_user(
                     original_language.as_deref(),
                     remembered_audio,
                     remembered_subtitle,
+                    &remembered_languages,
+                    sort_groups,
                 )
                 .await;
             }
@@ -2057,6 +2246,26 @@ async fn item_for_user(
                     .db,
             )
             .await?;
+        // Best first before grouping, so a group's representative (its first
+        // match) is its best stream for this device.
+        let mut raw = raw;
+        rank_item_sources(
+            &state
+                .ctx
+                .db,
+            &mut raw,
+            ranking_ctx,
+            &user_cfg,
+            server_config
+                .preferred_metadata_language
+                .as_deref(),
+            original_language.as_deref(),
+            remembered_audio,
+            remembered_subtitle,
+            &remembered_languages,
+            false,
+        )
+        .await;
         let grouped = db::StreamGroup::filter_sources(
             &state
                 .ctx
@@ -2076,11 +2285,13 @@ async fn item_for_user(
                     &state
                         .ctx
                         .store,
-                    session
-                        .user
-                        .id,
-                    gid,
-                    media.id,
+                    UserId(
+                        session
+                            .user
+                            .id,
+                    ),
+                    StreamGroupId(gid),
+                    ItemId(media.id),
                 );
             }
         }
@@ -2096,21 +2307,7 @@ async fn item_for_user(
                         .ctx
                         .db,
                     sources,
-                    SourceRankingContext {
-                        mode: server_config
-                            .sort_media_sources
-                            .unwrap_or_default(),
-                        device_profile: persisted_device_profile.as_ref(),
-                        is_4k_capable: session
-                            .device
-                            .is_4k_capable
-                            == Some(true),
-                        subtitle_mode,
-                        explicit_subtitle_index: None,
-                        max_bitrate: persisted_device_profile
-                            .as_ref()
-                            .and_then(|p| p.max_streaming_bitrate),
-                    },
+                    ranking_ctx,
                     &user_cfg,
                     server_config
                         .preferred_metadata_language
@@ -2118,6 +2315,8 @@ async fn item_for_user(
                     original_language.as_deref(),
                     remembered_audio,
                     remembered_subtitle,
+                    &remembered_languages,
+                    sort_groups,
                 )
                 .await;
             }
@@ -2187,24 +2386,75 @@ async fn item_for_user(
         }]);
     }
 
-    // Items detail never advertises subtitle tracks — neither embedded (from
-    // probe data) nor addon-external. Addon subtitle fetches are the slow
-    // part of building this response (multi-second network round trips per
-    // addon), most clients never surface subtitles on a details page anyway,
-    // and every real client calls PlaybackInfo before it actually starts
-    // playback — that's the one place subtitles (embedded + external) get
-    // advertised, with indexes that stay consistent with the download
-    // endpoint. Strip rather than just not-append, so a stale/cached embedded
-    // subtitle entry from probe data doesn't leak through either.
+    // Items detail never advertises embedded or add-on subtitle tracks.
+    // Addon subtitle fetches are the slow part of building this response
+    // (multi-second network round trips per addon), and which embedded ones
+    // PlaybackInfo keeps depends on the device; both get advertised there,
+    // with indexes that stay consistent with the download endpoint. Strip
+    // rather than just not-append, so a stale/cached embedded subtitle entry
+    // from probe data doesn't leak through either.
+    //
+    // The subtitle files next to the video are the exception, as in
+    // Jellyfin: a local lookup, at the indexes PlaybackInfo gives them (see
+    // `local_sidecars`). Android TV hands an item to an external player
+    // from this response alone.
     if want_streams
         && matches!(media.kind, db::MediaKind::Movie | db::MediaKind::Episode)
     {
+        let rows = media
+            .sources
+            .clone()
+            .unwrap_or_default();
+        let local_subtitles = if rows.is_empty() {
+            Vec::new()
+        } else {
+            let mut item = media.clone();
+            state
+                .ctx
+                .addons
+                .fetch_local_subtitles(
+                    &mut item,
+                    &state.ctx,
+                    Some(
+                        session
+                            .user
+                            .id,
+                    ),
+                )
+                .await
+        };
         if let Some(ref mut sources) = base_item.media_sources {
-            for source in sources.iter_mut() {
+            for (i, source) in sources
+                .iter_mut()
+                .enumerate()
+            {
+                let sidecar_start = crate::api::subtitles::sidecar_block_start(source);
                 source
                     .media_streams
-                    .retain(|s| s.type_ != Some(api::MediaStreamType::Subtitle));
+                    .retain(|s| s.type_ != api::MediaStreamType::Subtitle);
                 source.default_subtitle_stream_index = None;
+                let (Some(start), Some(row)) = (sidecar_start, rows.get(i)) else {
+                    continue;
+                };
+                let sidecars = crate::api::subtitles::local_sidecars(
+                    &local_subtitles,
+                    row.stream_info
+                        .as_ref()
+                        .and_then(|info| {
+                            info.filename
+                                .as_deref()
+                        }),
+                );
+                crate::api::subtitles::push_local_sidecars(
+                    source,
+                    start,
+                    &sidecars,
+                    media.id,
+                    session
+                        .device
+                        .access_token
+                        .expose(),
+                );
             }
         }
     }
@@ -2216,7 +2466,7 @@ async fn item_for_user(
             // run before the label block below, which needs to know the real
             // resolved subtitle to judge a possible burn-in.
             for source in sources.iter_mut() {
-                source.resolve_default_streams(
+                source.resolve_default_streams_remembering(
                     &user_cfg,
                     server_config
                         .preferred_metadata_language
@@ -2226,6 +2476,7 @@ async fn item_for_user(
                     None,
                     remembered_audio,
                     remembered_subtitle,
+                    &remembered_languages,
                 );
             }
         }
@@ -2268,7 +2519,7 @@ async fn item_for_user(
                     if let Some(video) = source
                         .media_streams
                         .iter_mut()
-                        .find(|s| matches!(s.type_, Some(api::MediaStreamType::Video)))
+                        .find(|s| matches!(s.type_, api::MediaStreamType::Video))
                     {
                         crate::device_profile::annotate_video_display_title(
                             video,
@@ -2303,15 +2554,78 @@ async fn item_for_user(
             .and_then(|s| s.group_id)
             == Some(*gid)
     });
-    if let Some(gid) = hoisted_group {
+    // The source carries the group's version id for this title rather than the
+    // shared group id, see `VersionId`.
+    let hoisted_group =
+        hoisted_group.map(|gid| crate::services::VersionId::new(media.id, gid).id());
+    if let Some(version) = hoisted_group {
         if let Some(source) = base_item
             .media_sources
             .as_mut()
             .and_then(|s| s.first_mut())
         {
-            source.id = gid;
-            source.e_tag = gid;
+            source.id = version;
+            source.e_tag = version;
         }
+    }
+
+    // Same for a plain stream request: keep its own id on the hoisted source.
+    if let Some(sid) = requested_stream {
+        if media
+            .sources
+            .as_ref()
+            .and_then(|s| s.first())
+            .map(|s| s.id)
+            == Some(sid)
+        {
+            if let Some(source) = base_item
+                .media_sources
+                .as_mut()
+                .and_then(|s| s.first_mut())
+            {
+                source.id = sid;
+                source.e_tag = sid;
+            }
+        }
+    }
+
+    // A version fetched by its id (picked in a client's version list) must come
+    // back as a FULL item whose Id is that version's id and whose first source
+    // carries the same id. This is how Jellyfin does it: every version is an item
+    // of its own. Two clients depend on both halves, and each regressed when we
+    // answered differently:
+    //  - Android TV's external player only plays a source whose id equals the
+    //    item id, else it toasts "No playable items" (#661, #696). Returning the
+    //    parent item here (the #673 change) broke exactly this.
+    //  - jellyfin-web 12.x reloads the page from the picked version's item
+    //    (`refreshSelectedVersion`). A bare stream row loses the poster, Play
+    //    button and version list (#673), so it needs the parent's metadata.
+    // Hence: parent's metadata, version's id. A picked stream group gets a
+    // version id of its own per title (`VersionId`), never the shared group id:
+    // the group is the same row for every title, so its id can't say which
+    // title is meant once another title with that group is opened (#697).
+    // Everything keyed by an item id
+    // (playback, reporting, watch state) maps it back to the owner: see
+    // `StreamService::version_target` and `MediaResolveService::playable_item_id`.
+    // Do not special-case a client here, and do not return the parent's id.
+    // Without MediaSources in `Fields` there is no source list to check, but the
+    // item is still that version.
+    let version = if needs_streams {
+        hoisted_group.or(requested_stream.filter(|sid| {
+            media
+                .sources
+                .as_ref()
+                .and_then(|s| s.first())
+                .map(|s| s.id)
+                == Some(*sid)
+        }))
+    } else {
+        requested_group
+            .map(|gid| crate::services::VersionId::new(media.id, gid).id())
+            .or(requested_stream)
+    };
+    if let Some(version) = version {
+        base_item.id = version;
     }
 
     // For tracks, wrap the Source row(s) as HLS-transcoded MediaSources.
@@ -2330,7 +2644,7 @@ async fn item_for_user(
             .sources
             .as_deref()
             .unwrap_or(&[]);
-        let mut media_streams: Vec<api::MediaStream> = sources
+        let media_streams: Vec<api::MediaStream> = sources
             .first()
             .and_then(|s| {
                 s.probe_data
@@ -2341,7 +2655,7 @@ async fn item_for_user(
                     .media_streams
                     .clone();
                 for s in &mut streams {
-                    if matches!(s.type_, Some(api::MediaStreamType::Subtitle)) {
+                    if matches!(s.type_, api::MediaStreamType::Subtitle) {
                         s.is_text_subtitle_stream = s.is_text_subtitle_stream();
                     }
                 }
@@ -2350,10 +2664,10 @@ async fn item_for_user(
             .unwrap_or_else(|| {
                 vec![api::MediaStream {
                     index: 0,
-                    type_: Some(api::MediaStreamType::Audio),
+                    type_: api::MediaStreamType::Audio,
                     codec: Some("aac".to_string()),
                     channels: Some(2),
-                    is_default: Some(true),
+                    is_default: true,
                     display_title: Some("Audio".to_string()),
                     ..Default::default()
                 }]
@@ -2487,7 +2801,7 @@ pub async fn items_get(
 
 #[get("/items/suggestions")]
 pub async fn items_suggestions(
-    State(state): State<AppState>,
+    State(_state): State<AppState>,
     _session: auth::AuthSession,
 ) -> Result<impl IntoResponse> {
     //let b = state.tmdb.movie_popular_list().send().await.unwrap()
@@ -2569,7 +2883,7 @@ pub async fn items_filters(
 #[get("/library/mediafolders")]
 pub async fn library_mediafolders(
     State(state): State<AppState>,
-    session: auth::AuthSession,
+    _session: auth::AuthSession,
 ) -> Result<impl IntoResponse> {
     let items = db::Media::get_by_filter(
         &state
@@ -2643,7 +2957,7 @@ fn media_to_virtual_folder(m: db::Media) -> api::VirtualFolderInfo {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "PascalCase")]
-struct VirtualFolderRequest {
+pub struct VirtualFolderRequest {
     name: String,
     collection_type: Option<String>,
     collection_kind: Option<String>,
@@ -2654,7 +2968,7 @@ struct VirtualFolderRequest {
 #[post("/library/virtualfolders")]
 pub async fn create_virtual_folder(
     State(state): State<AppState>,
-    session: auth::AdminSession,
+    _session: auth::AdminSession,
     Json(payload): Json<VirtualFolderRequest>,
 ) -> Result<Json<api::VirtualFolderInfo>> {
     let collection_media_kind = payload
@@ -2697,7 +3011,7 @@ pub async fn create_virtual_folder(
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "PascalCase")]
-struct UpdateVirtualFolderRequest {
+pub struct UpdateVirtualFolderRequest {
     id: uuid::Uuid,
     name: String,
     collection_type: Option<String>,
@@ -2707,10 +3021,10 @@ struct UpdateVirtualFolderRequest {
     sort_order: Option<i64>,
 }
 
-#[post("/library/virtualfolders/LibraryOptions")]
+#[post("/library/virtualfolders/libraryoptions")]
 pub async fn update_virtual_folder(
     State(state): State<AppState>,
-    session: auth::AdminSession,
+    _session: auth::AdminSession,
     Json(payload): Json<UpdateVirtualFolderRequest>,
 ) -> Result<StatusCode> {
     let media = db::Media::get_by_id(
@@ -2763,14 +3077,14 @@ pub async fn update_virtual_folder(
 
 #[query]
 #[derive(Debug)]
-struct DeleteVirtualFolderQuery {
+pub struct DeleteVirtualFolderQuery {
     name: String,
 }
 
 #[delete("/library/virtualfolders")]
 pub async fn delete_virtual_folder(
     State(state): State<AppState>,
-    session: auth::AdminSession,
+    _session: auth::AdminSession,
     Query(q): Query<DeleteVirtualFolderQuery>,
 ) -> Result<StatusCode> {
     let result = db::Media::get_by_filter(
@@ -2824,6 +3138,7 @@ fn parse_collection_type(s: &str) -> Option<db::CollectionMediaKind> {
     match s {
         "movies" => Some(db::CollectionMediaKind::Movie),
         "tvshows" => Some(db::CollectionMediaKind::Series),
+        "episodes" => Some(db::CollectionMediaKind::Episode),
         "mixed" => Some(db::CollectionMediaKind::Mixed),
         "music" => Some(db::CollectionMediaKind::Music),
         "collections" => Some(db::CollectionMediaKind::Collection),
@@ -3178,7 +3493,7 @@ fn external_id_infos_for_kind(kind: db::MediaKind) -> Vec<api::ExternalIdInfo> {
 pub async fn items_metadata_editor(
     State(state): State<AppState>,
     _session: auth::AdminSession,
-    Path(id): Path<Uuid>,
+    PlayableItemId { id, .. }: PlayableItemId,
 ) -> Result<impl IntoResponse> {
     let item = db::Media::get_by_id(
         &state
@@ -3269,7 +3584,7 @@ pub async fn items_metadata_editor(
 
 #[query]
 #[derive(Debug, Default)]
-struct GetSimilarItemsQuery {
+pub struct GetSimilarItemsQuery {
     pub user_id: Option<Uuid>,
     pub limit: Option<u32>,
     pub start_index: Option<u32>,
@@ -3280,7 +3595,7 @@ struct GetSimilarItemsQuery {
 pub async fn items_similar(
     State(state): State<AppState>,
     session: auth::AuthSession,
-    Path(id): Path<Uuid>,
+    PlayableItemId { id, .. }: PlayableItemId,
     Query(q): Query<GetSimilarItemsQuery>,
 ) -> Result<impl IntoResponse> {
     let limit = q
@@ -3422,7 +3737,7 @@ struct UpdateItemPerson {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "PascalCase")]
-struct UpdateItemRequest {
+pub struct UpdateItemRequest {
     name: Option<String>,
     overview: Option<String>,
     premiere_date: Option<chrono::DateTime<chrono::Utc>>,
@@ -3453,7 +3768,7 @@ struct UpdateItemRequest {
 pub async fn update_item(
     State(state): State<AppState>,
     _session: auth::AdminSession,
-    Path(id): Path<Uuid>,
+    PlayableItemId { id, .. }: PlayableItemId,
     Json(payload): Json<UpdateItemRequest>,
 ) -> Result<StatusCode> {
     let mut media = db::Media::get_by_id(
@@ -3468,7 +3783,14 @@ pub async fn update_item(
     if let Some(name) = payload.name {
         media.title = name;
     }
-    merge_option(&mut media.description, &payload.overview, true);
+    // An empty overview is the editor clearing it.
+    let clear_description = payload
+        .overview
+        .as_deref()
+        .is_some_and(str::is_empty);
+    if let Some(overview) = payload.overview {
+        media.description = db::NonEmptyString::try_new(overview).ok();
+    }
     if let Some(premiere_date) = payload.premiere_date {
         media.released_at = Some(premiere_date.naive_utc());
     } else if let Some(year) = payload.production_year {
@@ -3495,6 +3817,15 @@ pub async fn update_item(
         )
         .await
         .context_bad_request("Failed to save item")?;
+    if clear_description {
+        db::Media::clear_description(
+            &state
+                .ctx
+                .db,
+            &media.id,
+        )
+        .await?;
+    }
 
     if let Some(tags) = &payload.tags {
         set_tags(
@@ -3720,7 +4051,7 @@ pub async fn update_item(
 
 #[query]
 #[derive(Debug, Default)]
-struct ContentTypeQuery {
+pub struct ContentTypeQuery {
     content_type: Option<String>,
 }
 
@@ -3756,7 +4087,7 @@ pub async fn update_item_content_type(
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "PascalCase")]
-struct PatchItemRequest {
+pub struct PatchItemRequest {
     name: Option<String>,
     collection_type: Option<String>,
     collection_kind: Option<String>,
@@ -3775,7 +4106,7 @@ struct PatchItemRequest {
 #[patch("/items/{id}")]
 pub async fn patch_item(
     State(state): State<AppState>,
-    session: auth::AdminSession,
+    _session: auth::AdminSession,
     Path(id): Path<Uuid>,
     Json(payload): Json<PatchItemRequest>,
 ) -> Result<StatusCode> {
@@ -3979,7 +4310,7 @@ fn segments_to_dtos(
 #[get("/mediasegments/{id}")]
 pub async fn media_segments(
     _session: auth::AuthSession,
-    Path(id): Path<Uuid>,
+    PlayableItemId { id, requested }: PlayableItemId,
     Query(q): Query<SegmentQuery>,
     State(state): State<crate::AppState>,
 ) -> Result<impl IntoResponse> {
@@ -4017,7 +4348,7 @@ pub async fn media_segments(
         .addons
         .fetch_segments(&media, &state.ctx, false)
         .await;
-    let dtos = segments_to_dtos(id, id, &segs, filter_ref);
+    let dtos = segments_to_dtos(requested, requested, &segs, filter_ref);
 
     let count = dtos.len();
     Ok(Json(serde_json::json!({
@@ -4029,6 +4360,20 @@ pub async fn media_segments(
 
 #[cfg(test)]
 mod tests {
+    use crate::ids::{ItemId, StreamGroupId, UserId};
+    #[test]
+    fn countdown_label_reads_naturally() {
+        use super::countdown_label;
+        assert_eq!(countdown_label(-3), "today");
+        assert_eq!(countdown_label(0), "today");
+        assert_eq!(countdown_label(1), "tomorrow");
+        assert_eq!(countdown_label(4), "in 4 days");
+        assert_eq!(countdown_label(13), "in 13 days");
+        assert_eq!(countdown_label(14), "in 2 weeks");
+        assert_eq!(countdown_label(59), "in 8 weeks");
+        assert_eq!(countdown_label(60), "in 2 months");
+    }
+
     use super::{
         RemoteImagesQuery, exclude_episodes_from_search, external_id_infos_for_kind,
         is_remote_enabled,
@@ -4924,6 +5269,118 @@ mod tests {
         c
     }
 
+    async fn movie_with_trailers(db: &sqlx::SqlitePool) -> db::Media {
+        let mut movie =
+            insert_media(db, "Inception", db::MediaKind::Movie, "tt1375666").await;
+        movie.trailers = Some(vec![
+            db::Trailer {
+                source: db::TrailerSource::Youtube("cdx31ak4KbQ".into()),
+                name: Some("Official Trailer".into()),
+            },
+            db::Trailer {
+                source: db::TrailerSource::Url(
+                    "https://cdn.example/inception.mp4".into(),
+                ),
+                name: Some("Rotten Tomatoes 1080p".into()),
+            },
+        ]);
+        movie
+            .save(db)
+            .await
+            .unwrap();
+        movie
+    }
+
+    #[tokio::test]
+    async fn direct_trailers_are_local_trailers_and_youtube_ones_remote() {
+        let (server, guard, token) = authenticated_server().await;
+        let auth = auth_header_with_token(&token);
+        let movie = movie_with_trailers(
+            &guard
+                .0
+                .db,
+        )
+        .await;
+        let get = |path: String| {
+            server
+                .get(&path)
+                .add_header(
+                    http::header::AUTHORIZATION,
+                    HeaderValue::from_str(&auth).unwrap(),
+                )
+        };
+
+        let item: serde_json::Value = get(format!(
+            "/items/{}?fields=RemoteTrailers,LocalTrailerCount",
+            movie.id
+        ))
+        .await
+        .json();
+        assert_eq!(item["LocalTrailerCount"], 1);
+        assert_eq!(
+            item["RemoteTrailers"],
+            serde_json::json!([{"Name": "Official Trailer", "Url": "https://www.youtube.com/watch?v=cdx31ak4KbQ"}])
+        );
+
+        for path in [
+            format!("/items/{}/localtrailers", movie.id),
+            format!("/users/{}/items/{}/localtrailers", Uuid::new_v4(), movie.id),
+        ] {
+            let trailers: serde_json::Value = get(path)
+                .await
+                .json();
+            let trailers = trailers
+                .as_array()
+                .unwrap();
+            assert_eq!(trailers.len(), 1);
+            assert_eq!(trailers[0]["Name"], "Rotten Tomatoes 1080p");
+            assert_eq!(trailers[0]["Type"], "Trailer");
+            assert_eq!(trailers[0]["ExtraType"], "Trailer");
+            assert_eq!(trailers[0]["MediaType"], "Video");
+            assert_eq!(
+                trailers[0]["ParentId"],
+                movie
+                    .id
+                    .simple()
+                    .to_string()
+            );
+        }
+
+        // A trailer is not one of the movie's children or a library item.
+        for path in [
+            format!("/items?ParentId={}", movie.id),
+            format!("/items?ParentId={}&Recursive=true", movie.id),
+            "/items?Recursive=true".to_string(),
+            "/items?Recursive=true&IncludeItemTypes=Trailer".to_string(),
+        ] {
+            let items: serde_json::Value = get(path.clone())
+                .await
+                .json();
+            assert!(
+                items["Items"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .all(|item| item["Type"] != "Trailer"),
+                "{path}: {items}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn local_trailers_of_an_unknown_item_are_not_found() {
+        let (server, _guard, token) = authenticated_server().await;
+        server
+            .get(&format!("/items/{}/localtrailers", Uuid::new_v4()))
+            .add_header(
+                http::header::AUTHORIZATION,
+                HeaderValue::from_str(&auth_header_with_token(&token)).unwrap(),
+            )
+            .expect_failure()
+            .await
+            .assert_status(http::StatusCode::NOT_FOUND);
+    }
+
     // Requests movies from a series-only smart collection; must return nothing.
     #[tokio::test]
     async fn test_include_item_types_mismatched_returns_empty() {
@@ -5127,6 +5584,151 @@ mod tests {
             .unwrap();
     }
 
+    /// Series and seasons report their episode progress like Jellyfin 12's
+    /// folders: `UnplayedItemCount` and `PlayedPercentage` (0 included)
+    /// always, the episode count with `Fields=RecursiveItemCount`, in lists as
+    /// well as for a single item.
+    #[tokio::test]
+    async fn series_and_seasons_report_played_percentage() {
+        let (server, guard, token) = authenticated_server().await;
+        let auth = auth_header_with_token(&token);
+        let db = &guard
+            .0
+            .db;
+        let user_id = get_user_id(&server, &auth).await;
+
+        let series =
+            insert_media(db, "Succession", db::MediaKind::Series, "tt7660850").await;
+        let now = Utc::now().naive_utc();
+        let mut seasons = Vec::new();
+        for n in 1..=2 {
+            let mut season = db::Media {
+                title: format!("Season {n}"),
+                kind: db::MediaKind::Season,
+                parent_id: Some(series.id),
+                grandparent_id: Some(series.id),
+                idx: Some(n),
+                created_at: now,
+                updated_at: now,
+                ..Default::default()
+            };
+            season
+                .save(db)
+                .await
+                .unwrap();
+            seasons.push(season);
+        }
+        // Two episodes per season; one of season 1 is played.
+        let mut episodes = Vec::new();
+        for (n, season) in [&seasons[0], &seasons[0], &seasons[1], &seasons[1]]
+            .into_iter()
+            .enumerate()
+        {
+            let mut ep = db::Media {
+                title: format!("Episode {n}"),
+                kind: db::MediaKind::Episode,
+                parent_id: Some(season.id),
+                grandparent_id: Some(series.id),
+                idx: Some(n as i64 + 1),
+                // Unreleased episodes are left out of the counts.
+                released_at: Some(now - chrono::Duration::days(30)),
+                created_at: now,
+                updated_at: now,
+                ..Default::default()
+            };
+            ep.save(db)
+                .await
+                .unwrap();
+            episodes.push(ep);
+        }
+        mark_played(db, &episodes[0]).await;
+
+        let get = |path: String, query: Vec<(&'static str, String)>| {
+            let server = &server;
+            let auth = &auth;
+            let uid = user_id.clone();
+            async move {
+                let mut req = server
+                    .get(&path)
+                    .add_header(
+                        http::header::AUTHORIZATION,
+                        HeaderValue::from_str(auth).unwrap(),
+                    )
+                    .add_query_param("userId", uid.as_str());
+                for (k, v) in query {
+                    req = req.add_query_param(k, v);
+                }
+                let resp = req.await;
+                resp.assert_status_ok();
+                resp.json::<serde_json::Value>()
+            }
+        };
+        let find = |body: &serde_json::Value, name: &str| {
+            body["Items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|i| i["Name"] == name)
+                .unwrap_or_else(|| panic!("{name} missing: {body}"))
+                .clone()
+        };
+
+        // Series list without the field: progress, but no episode count.
+        let list = get(
+            "/items".into(),
+            vec![
+                ("Recursive", "true".into()),
+                ("IncludeItemTypes", "Series".into()),
+            ],
+        )
+        .await;
+        let item = find(&list, "Succession");
+        assert_eq!(item["UserData"]["UnplayedItemCount"], 3);
+        assert_eq!(item["UserData"]["PlayedPercentage"], 25.0);
+        assert!(item["RecursiveItemCount"].is_null());
+
+        // Series list with the field, as KefinTweaks asks for it.
+        let list = get(
+            "/items".into(),
+            vec![
+                ("Recursive", "true".into()),
+                ("IncludeItemTypes", "Series".into()),
+                ("Fields", "UserData,RecursiveItemCount".into()),
+            ],
+        )
+        .await;
+        let item = find(&list, "Succession");
+        assert_eq!(item["RecursiveItemCount"], 4);
+        assert_eq!(item["UserData"]["UnplayedItemCount"], 3);
+        assert_eq!(item["UserData"]["PlayedPercentage"], 25.0);
+
+        // Single item.
+        let item = get(format!("/items/{}", series.id), vec![]).await;
+        assert_eq!(item["UserData"]["PlayedPercentage"], 25.0);
+
+        // Seasons count their own episodes (by parent, not grandparent).
+        let list = get(
+            "/items".into(),
+            vec![
+                (
+                    "ParentId",
+                    series
+                        .id
+                        .to_string(),
+                ),
+                ("Fields", "RecursiveItemCount".into()),
+            ],
+        )
+        .await;
+        let s1 = find(&list, "Season 1");
+        assert_eq!(s1["RecursiveItemCount"], 2);
+        assert_eq!(s1["UserData"]["UnplayedItemCount"], 1);
+        assert_eq!(s1["UserData"]["PlayedPercentage"], 50.0);
+        let s2 = find(&list, "Season 2");
+        assert_eq!(s2["UserData"]["UnplayedItemCount"], 2);
+        assert_eq!(s2["UserData"]["PlayedPercentage"], 0.0);
+    }
+
     // Recursive=true + IncludeItemTypes=Episode + Filters=IsPlayed must return
     // only played episodes under a smart series collection, not zero.
     #[tokio::test]
@@ -5319,6 +5921,144 @@ mod tests {
         );
     }
 
+    // An upcoming library lists the next unaired episode of series the user
+    // started, soonest first, named with a countdown, and shows up in
+    // /UserViews although the server hides unreleased items elsewhere.
+    #[tokio::test]
+    async fn upcoming_episode_library_lists_next_unaired_episodes() {
+        let (server, guard, token) = authenticated_server().await;
+        let auth = auth_header_with_token(&token);
+        let db = &guard
+            .0
+            .db;
+        let user_id = get_user_id(&server, &auth).await;
+        let now = Utc::now().naive_utc();
+
+        let mut episodes = Vec::new();
+        for (name, days_to_next) in [("Slow Show", 20_i64), ("Quick Show", 3)] {
+            let mut series = db::Media {
+                title: name.to_string(),
+                kind: db::MediaKind::Series,
+                external_ids: db::ExternalIds {
+                    imdb: Some(
+                        db::NonEmptyString::try_new(format!("tt99{}", days_to_next))
+                            .unwrap(),
+                    ),
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            series
+                .save(db)
+                .await
+                .unwrap();
+            for (n, offset) in
+                [(1_i64, -14_i64), (2, days_to_next), (3, days_to_next + 7)]
+            {
+                let mut ep = db::Media {
+                    title: format!("{name} E{n}"),
+                    kind: db::MediaKind::Episode,
+                    external_ids: db::ExternalIds {
+                        imdb: Some(
+                            db::NonEmptyString::try_new(format!(
+                                "tt99{days_to_next}{n}"
+                            ))
+                            .unwrap(),
+                        ),
+                        ..Default::default()
+                    },
+                    grandparent_id: Some(series.id),
+                    parent_idx: Some(1),
+                    idx: Some(n),
+                    released_at: Some(now + chrono::Duration::days(offset)),
+                    ..Default::default()
+                };
+                ep.save(db)
+                    .await
+                    .unwrap();
+                episodes.push((n, ep.id));
+            }
+        }
+        // Watching the first episode of each series is what starts it.
+        for (n, id) in &episodes {
+            if *n == 1 {
+                sqlx::query(
+                    "INSERT INTO user_media_state \
+                     (user_id, media_id, favorite, play_count, played_at, playback_position) \
+                     VALUES (?1, ?2, 0, 1, ?3, 0)",
+                )
+                .bind(uuid::Uuid::parse_str(&user_id).unwrap())
+                .bind(id)
+                .bind(now)
+                .execute(db)
+                .await
+                .unwrap();
+            }
+        }
+
+        let mut c = db::Media {
+            title: "Upcoming".to_string(),
+            kind: db::MediaKind::Collection,
+            collection_kind: Some(db::CollectionKind::Smart),
+            collection_media_kind: Some(db::CollectionMediaKind::Episode),
+            collection_smart_filter: Some(remux_sdks::remux::CollectionFilter {
+                match_mode: remux_sdks::remux::FilterMatchMode::All,
+                groups: vec![remux_sdks::remux::FilterGroup {
+                    match_mode: remux_sdks::remux::FilterMatchMode::All,
+                    rules: vec![remux_sdks::remux::FilterRule::Upcoming {
+                        value: true,
+                    }],
+                }],
+            }),
+            promoted: true,
+            created_at: now,
+            updated_at: now,
+            ..Default::default()
+        };
+        c.save(db)
+            .await
+            .unwrap();
+
+        let body: serde_json::Value = server
+            .get(&format!(
+                "/items?parentId={}&userId={user_id}",
+                c.id.simple()
+            ))
+            .add_header(
+                http::header::AUTHORIZATION,
+                HeaderValue::from_str(&auth).unwrap(),
+            )
+            .await
+            .json();
+        let names: Vec<&str> = body["Items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|i| i["Name"].as_str())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["Quick Show E2 · in 3 days", "Slow Show E2 · in 2 weeks"],
+            "soonest first, one per series, with a countdown"
+        );
+
+        let views: serde_json::Value = server
+            .get(&format!("/userviews?userId={user_id}"))
+            .add_header(
+                http::header::AUTHORIZATION,
+                HeaderValue::from_str(&auth).unwrap(),
+            )
+            .await
+            .json();
+        let view_names: Vec<&str> = views["Items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|i| i["Name"].as_str())
+            .collect();
+        assert!(view_names.contains(&"Upcoming"), "{view_names:?}");
+    }
+
     // /UserViews must not return a promoted smart collection with no matching content.
     #[tokio::test]
     async fn userviews_hides_empty_smart_collection() {
@@ -5501,7 +6241,7 @@ mod tests {
             id,
             title: "Fields test movie".to_string(),
             kind: db::MediaKind::Movie,
-            description: Some("A test overview".to_string()),
+            description: db::NonEmptyString::try_new("A test overview").ok(),
             released_at: Some(Utc::now().naive_utc()),
             external_ids,
             ..Default::default()
@@ -6059,8 +6799,6 @@ mod tests {
     // before the fix.
     #[tokio::test]
     async fn items_latest_alias_applies_collection_filters() {
-        use crate::db::auth;
-
         let (server, guard, token) = authenticated_server().await;
         let auth_hdr = auth_header_with_token(&token);
         let db = &guard
@@ -6277,7 +7015,7 @@ mod tests {
             media_streams: vec![
                 crate::api::MediaStream {
                     codec: Some("h264".to_string()),
-                    type_: Some(crate::api::MediaStreamType::Video),
+                    type_: crate::api::MediaStreamType::Video,
                     index: 0,
                     width: Some(1920),
                     height: Some(1080),
@@ -6285,13 +7023,13 @@ mod tests {
                 },
                 crate::api::MediaStream {
                     codec: Some("aac".to_string()),
-                    type_: Some(crate::api::MediaStreamType::Audio),
+                    type_: crate::api::MediaStreamType::Audio,
                     index: 1,
                     ..Default::default()
                 },
                 crate::api::MediaStream {
                     codec: Some("subrip".to_string()),
-                    type_: Some(crate::api::MediaStreamType::Subtitle),
+                    type_: crate::api::MediaStreamType::Subtitle,
                     index: 2,
                     language: Some("fra".to_string()),
                     is_text_subtitle_stream: true,
@@ -6299,7 +7037,7 @@ mod tests {
                 },
                 crate::api::MediaStream {
                     codec: Some("subrip".to_string()),
-                    type_: Some(crate::api::MediaStreamType::Subtitle),
+                    type_: crate::api::MediaStreamType::Subtitle,
                     index: 3,
                     language: Some("eng".to_string()),
                     is_text_subtitle_stream: true,
@@ -6385,6 +7123,185 @@ mod tests {
             body["MediaSources"][0]["DefaultSubtitleStreamIndex"],
             serde_json::Value::Null,
             "Items detail must never set a default subtitle stream index"
+        );
+    }
+
+    /// A subtitle file next to the video is listed on the item at the index
+    /// PlaybackInfo gives it, and served at that index without a session:
+    /// Android TV hands the item's subtitles to an external player, which
+    /// fetches them with no credentials.
+    #[tokio::test]
+    async fn a_sidecar_subtitle_is_listed_on_the_item_like_in_playbackinfo() {
+        let (server, guard, token) = authenticated_server().await;
+        let auth = auth_header_with_token(&token);
+        let ctx = &guard.0;
+        let dir = tempfile::tempdir().unwrap();
+        let now = Utc::now().naive_utc();
+
+        let addon = crate::addons::addon::Addon {
+            id: Uuid::new_v4(),
+            name: "local".to_string(),
+            preset: remux_sdks::remux::AddonPresetRef {
+                kind: "opendal-local".to_string(),
+                config: serde_json::json!({
+                    "media_kind": "movie",
+                    "paths": [dir.path().to_str().unwrap()],
+                })
+                .into(),
+            },
+            resources: vec![
+                remux_sdks::stremio::ResourceType::Stream,
+                remux_sdks::stremio::ResourceType::Subtitles,
+            ],
+            types: vec![],
+            enabled: true,
+            priority: 0,
+            system: false,
+            is_default: true,
+            http_redirect_stream: false,
+            subtitle_extraction: false,
+            probe_on_scan: false,
+            service_filter: vec![],
+            created_at: now,
+            updated_at: now,
+        };
+        addon
+            .insert(&ctx.db)
+            .await
+            .unwrap();
+        ctx.addons
+            .reload(&ctx.db, &ctx.config)
+            .await
+            .unwrap();
+        let sub_name = "Sidecar.Movie.2020.hu.srt";
+        let sub_path = dir
+            .path()
+            .join(sub_name);
+        std::fs::write(&sub_path, "1\n00:00:01,000 --> 00:00:02,000\nSzia\n").unwrap();
+        sqlx::query(
+            "INSERT INTO opendal_files (id, addon_id, media_kind, path, name, imdb_id, scanned_at) \
+             VALUES (?, ?, 'subtitle', ?, ?, 'tt7000001', ?)",
+        )
+        .bind(Uuid::new_v4())
+        .bind(addon.id)
+        .bind(sub_path.to_str().unwrap())
+        .bind(sub_name)
+        .bind(now)
+        .execute(&ctx.db)
+        .await
+        .unwrap();
+
+        let movie =
+            insert_media(&ctx.db, "Sidecar Movie", db::MediaKind::Movie, "tt7000001")
+                .await;
+        let id = movie.id;
+        sqlx::query("UPDATE media SET streams_refreshed_at = ? WHERE id = ?")
+            .bind(now)
+            .bind(id)
+            .execute(&ctx.db)
+            .await
+            .unwrap();
+        let mut stream = db::Media {
+            title: "Sidecar.Movie.2020.mkv".to_string(),
+            kind: db::MediaKind::Stream,
+            parent_id: Some(id),
+            stream_info: Some(crate::stream::StreamInfo {
+                descriptor: crate::stream::StreamDescriptor::Local(
+                    "Sidecar.Movie.2020.mkv".into(),
+                ),
+                filename: Some("Sidecar.Movie.2020.mkv".to_string()),
+                ..Default::default()
+            }),
+            probe_data: Some(crate::api::MediaSourceInfo {
+                container: Some(VideoContainer::Mkv),
+                bitrate: Some(8_000_000),
+                run_time_ticks: Some(100_000_000),
+                media_streams: vec![
+                    crate::api::MediaStream {
+                        codec: Some("h264".to_string()),
+                        type_: crate::api::MediaStreamType::Video,
+                        index: 0,
+                        width: Some(1920),
+                        height: Some(1080),
+                        ..Default::default()
+                    },
+                    crate::api::MediaStream {
+                        codec: Some("aac".to_string()),
+                        type_: crate::api::MediaStreamType::Audio,
+                        index: 1,
+                        ..Default::default()
+                    },
+                ],
+                remux: Some(remux_sdks::remux::MediaSourceRemuxInfo {
+                    source: Some(crate::api::ProbeOrigin::Ffprobe),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            created_at: now,
+            updated_at: now,
+            ..Default::default()
+        };
+        stream
+            .save(&ctx.db)
+            .await
+            .unwrap();
+
+        let sidecar = |body: &serde_json::Value| {
+            body["MediaSources"][0]["MediaStreams"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|s| s["Type"] == "Subtitle" && s["Language"] == "hu")
+                .map(|s| {
+                    (
+                        s["Index"]
+                            .as_i64()
+                            .unwrap(),
+                        s["IsExternal"].clone(),
+                        s["Path"].clone(),
+                    )
+                })
+        };
+        let item: serde_json::Value = server
+            .get(&format!("/items/{id}"))
+            .add_header(
+                http::header::AUTHORIZATION,
+                HeaderValue::from_str(&auth).unwrap(),
+            )
+            .add_query_params(&[("Fields", "MediaSources")])
+            .await
+            .json();
+        let on_item = sidecar(&item).expect("the item lists the sidecar");
+        assert_eq!(
+            on_item,
+            (2, serde_json::json!(true), serde_json::json!(sub_name))
+        );
+
+        let playback: serde_json::Value = server
+            .post(&format!("/items/{id}/playbackinfo"))
+            .add_header(
+                http::header::AUTHORIZATION,
+                HeaderValue::from_str(&auth).unwrap(),
+            )
+            .json(&serde_json::json!({ "MaxStreamingBitrate": 100_000_000 }))
+            .await
+            .json();
+        assert_eq!(sidecar(&playback).map(|(index, ..)| index), Some(on_item.0));
+
+        let resp = server
+            .get(&format!(
+                "/videos/{id}/{}/subtitles/{}/stream.srt",
+                item["MediaSources"][0]["Id"]
+                    .as_str()
+                    .unwrap(),
+                on_item.0
+            ))
+            .await;
+        resp.assert_status_ok();
+        assert!(
+            resp.text()
+                .contains("Szia")
         );
     }
 
@@ -6709,7 +7626,7 @@ mod tests {
         let ctx = &guard.0;
         let now = Utc::now().naive_utc();
 
-        let web_group = db::StreamGroup::create(
+        let _web_group = db::StreamGroup::create(
             &ctx.db,
             "1080p · WEB",
             StreamFilter {
@@ -6758,7 +7675,7 @@ mod tests {
             media_streams: vec![
                 api::MediaStream {
                     codec: Some("h264".to_string()),
-                    type_: Some(api::MediaStreamType::Video),
+                    type_: api::MediaStreamType::Video,
                     index: 0,
                     width: Some(1920),
                     height: Some(1080),
@@ -6766,7 +7683,7 @@ mod tests {
                 },
                 api::MediaStream {
                     codec: Some("aac".to_string()),
-                    type_: Some(api::MediaStreamType::Audio),
+                    type_: api::MediaStreamType::Audio,
                     index: 1,
                     ..Default::default()
                 },
@@ -6875,26 +7792,381 @@ mod tests {
             "1080p · Blu-ray",
             "the requested group must be MediaSources[0] — Android TV plays get(0)"
         );
+        // A picked group comes back under its version id for this movie, not the
+        // shared group id: the group is the same row for every title.
+        let version = crate::services::VersionId::new(movie.id, bluray_group.id).id();
+        let simple = |id: uuid::Uuid| {
+            id.simple()
+                .to_string()
+        };
         assert_eq!(
             sources2[0]["Id"]
                 .as_str()
                 .unwrap(),
-            bluray_group
-                .id
-                .simple()
-                .to_string(),
-            "the hoisted source must keep its group UUID, not the item id, so the \
-             client sends the group back on PlaybackInfo"
+            simple(version),
+            "the hoisted source carries the version id, so the client sends it back"
         );
         assert_eq!(
             body2["Id"]
                 .as_str()
                 .unwrap(),
-            movie
-                .id
-                .simple()
-                .to_string(),
-            "the item itself is still the parent movie"
+            simple(version),
+            "a picked version is an item of its own, as in Jellyfin"
+        );
+
+        // Opening another title with the same group repoints the shared group id.
+        // The version id the client holds must still mean this movie.
+        let other =
+            insert_media(&ctx.db, "Other Movie", db::MediaKind::Movie, "tt7777779")
+                .await;
+        let user_id: uuid::Uuid = sqlx::query_scalar("SELECT id FROM users LIMIT 1")
+            .fetch_one(&ctx.db)
+            .await
+            .unwrap();
+        crate::services::StreamService::save_group_item(
+            &ctx.store,
+            UserId(user_id),
+            StreamGroupId(bluray_group.id),
+            ItemId(other.id),
+        );
+        let request = |method: http::Method, path: String| {
+            server
+                .method(method, &path)
+                .add_header(
+                    http::header::AUTHORIZATION,
+                    HeaderValue::from_str(&auth).unwrap(),
+                )
+        };
+        let again: serde_json::Value =
+            request(http::Method::GET, format!("/items/{version}"))
+                .await
+                .json();
+        assert_eq!(again["Name"], "Test Movie");
+        assert_eq!(again["Id"], simple(version));
+
+        let resp3 = request(
+            http::Method::POST,
+            format!(
+                "/items/{version}/playbackinfo?mediaSourceId={}",
+                simple(version)
+            ),
+        )
+        .json(&serde_json::json!({}))
+        .await;
+        resp3.assert_status_ok();
+        let info: serde_json::Value = resp3.json();
+        assert_eq!(
+            info["MediaSources"][0]["Name"]
+                .as_str()
+                .unwrap(),
+            "1080p · Blu-ray",
+            "PlaybackInfo for the picked version must offer that group"
+        );
+
+        request(http::Method::POST, "/sessions/playing".to_string())
+            .json(&serde_json::json!({
+                "ItemId": simple(version),
+                "MediaSourceId": simple(version),
+                "PlaySessionId": "picked-group-session",
+                "PositionTicks": 0,
+            }))
+            .await
+            .assert_status(http::StatusCode::NO_CONTENT);
+        let live = ctx
+            .sessions
+            .get("picked-group-session")
+            .unwrap();
+        assert_eq!(
+            live.item_id, movie.id,
+            "playback is recorded against the movie"
+        );
+        assert_eq!(
+            live.media_source_id
+                .as_deref(),
+            Some(simple(bluray_group.id).as_str()),
+            "the session knows the plain group as its source"
+        );
+
+        // Android TV's external player only sends a stop, without a session.
+        request(http::Method::POST, "/sessions/playing/stopped".to_string())
+            .json(&serde_json::json!({
+                "ItemId": simple(version),
+                "MediaSourceId": simple(version),
+                "PositionTicks": 600_000_000i64,
+            }))
+            .await
+            .assert_status(http::StatusCode::NO_CONTENT);
+        let position = |id: uuid::Uuid| {
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COALESCE(MAX(playback_position), 0) FROM user_media_state WHERE media_id = ?",
+            )
+            .bind(id)
+            .fetch_one(&ctx.db)
+        };
+        assert!(
+            position(movie.id)
+                .await
+                .unwrap()
+                > 0
+        );
+        assert_eq!(
+            position(other.id)
+                .await
+                .unwrap(),
+            0
+        );
+
+        // The version shows the movie's poster.
+        let dir = tempfile::tempdir().unwrap();
+        let poster = dir
+            .path()
+            .join("poster.png");
+        image::RgbImage::new(1, 1)
+            .save(&poster)
+            .unwrap();
+        db::MediaImage::save(
+            &ctx.db,
+            movie.id,
+            db::ImageKind::Primary,
+            poster
+                .to_str()
+                .unwrap(),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        server
+            .get(&format!("/items/{version}/images/primary"))
+            .await
+            .assert_status_ok();
+    }
+
+    /// As in Jellyfin, fetching a version by its id returns that version as the
+    /// item, with its own source first. Android TV refetches it when a version
+    /// is picked and only plays a source whose id equals the item id, otherwise
+    /// it toasts "No playable items". Watch state still belongs to the movie.
+    #[tokio::test]
+    async fn a_picked_version_comes_back_as_an_item_of_its_own() {
+        let (server, guard, token) = authenticated_server().await;
+        let auth = auth_header_with_token(&token);
+        let ctx = &guard.0;
+        let now = Utc::now().naive_utc();
+
+        let movie =
+            insert_media(&ctx.db, "Test Movie", db::MediaKind::Movie, "tt7777777")
+                .await;
+        sqlx::query("UPDATE media SET streams_refreshed_at = ? WHERE id = ?")
+            .bind(now)
+            .bind(movie.id)
+            .execute(&ctx.db)
+            .await
+            .unwrap();
+        let mut streams = vec![];
+        for (idx, filename) in [
+            (0, "TestMovie.2026.1080p.WEB-DL.H264.mkv"),
+            (1, "TestMovie.2026.1080p.BluRay.x264.mkv"),
+        ] {
+            let mut stream = db::Media {
+                title: filename.to_string(),
+                kind: db::MediaKind::Stream,
+                parent_id: Some(movie.id),
+                idx: Some(idx),
+                stream_info: Some(crate::stream::StreamInfo {
+                    descriptor: crate::stream::StreamDescriptor::Local(filename.into()),
+                    filename: Some(filename.to_string()),
+                    ..Default::default()
+                }),
+                created_at: now,
+                updated_at: now,
+                ..Default::default()
+            };
+            stream
+                .save(&ctx.db)
+                .await
+                .unwrap();
+            streams.push(stream);
+        }
+        let item = |id: uuid::Uuid, auth: String| {
+            let server = &server;
+            async move {
+                let resp = server
+                    .get(&format!("/items/{id}"))
+                    .add_header(
+                        http::header::AUTHORIZATION,
+                        HeaderValue::from_str(&auth).unwrap(),
+                    )
+                    .await;
+                resp.assert_status_ok();
+                resp.json::<serde_json::Value>()
+            }
+        };
+        let simple = |id: uuid::Uuid| {
+            id.simple()
+                .to_string()
+        };
+        let sources_of = |body: &serde_json::Value| -> Vec<String> {
+            body["MediaSources"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|s| {
+                    s["Id"]
+                        .as_str()
+                        .unwrap()
+                        .to_string()
+                })
+                .collect()
+        };
+        // Loading the item first, as the client does, is what lists the versions.
+        item(movie.id, auth.clone()).await;
+        let picked = streams[1].id;
+
+        let body = item(picked, auth.clone()).await;
+        assert_eq!(body["Id"], simple(picked));
+        assert!(
+            sources_of(&body).contains(&simple(picked)),
+            "a source must carry the item id, or the external player bails"
+        );
+        assert_eq!(sources_of(&body)[0], simple(picked), "the pick plays first");
+
+        // Marking the picked version watched marks the movie.
+        server
+            .post(&format!("/userplayeditems/{picked}"))
+            .add_header(
+                http::header::AUTHORIZATION,
+                HeaderValue::from_str(&auth).unwrap(),
+            )
+            .await
+            .assert_status_ok();
+        let played = |id: uuid::Uuid| {
+            sqlx::query_scalar::<_, bool>(
+                "SELECT COALESCE(MAX(play_count), 0) > 0 FROM user_media_state WHERE media_id = ?",
+            )
+            .bind(id)
+            .fetch_one(&ctx.db)
+        };
+        assert!(
+            played(movie.id)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !played(picked)
+                .await
+                .unwrap()
+        );
+
+        // The version carries the movie's image tags; its poster must load.
+        let dir = tempfile::tempdir().unwrap();
+        let poster = dir
+            .path()
+            .join("poster.png");
+        image::RgbImage::new(1, 1)
+            .save(&poster)
+            .unwrap();
+        db::MediaImage::save(
+            &ctx.db,
+            movie.id,
+            db::ImageKind::Primary,
+            poster
+                .to_str()
+                .unwrap(),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let tag = item(picked, auth.clone()).await["ImageTags"]["Primary"]
+            .as_str()
+            .expect("the version shows the movie's poster")
+            .to_string();
+        server
+            .get(&format!("/items/{picked}/images/primary?tag={tag}"))
+            .await
+            .assert_status_ok();
+
+        // Item routes act on the movie: its ancestors don't include itself, a
+        // stream's do.
+        let resp = server
+            .get(&format!("/items/{picked}/ancestors"))
+            .add_header(
+                http::header::AUTHORIZATION,
+                HeaderValue::from_str(&auth).unwrap(),
+            )
+            .await;
+        resp.assert_status_ok();
+        let ancestors: Vec<String> = resp
+            .json::<serde_json::Value>()
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|a| {
+                a["Id"]
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect();
+        assert!(!ancestors.contains(&simple(movie.id)));
+
+        // Android TV's external player only sends a stop, without a
+        // PlaySessionId. A session of another title on the device must not
+        // take the position.
+        let other =
+            insert_media(&ctx.db, "Other Movie", db::MediaKind::Movie, "tt7777778")
+                .await;
+        let report = |path: &'static str, body: serde_json::Value| {
+            let server = &server;
+            let auth = auth.clone();
+            async move {
+                server
+                    .post(path)
+                    .add_header(
+                        http::header::AUTHORIZATION,
+                        HeaderValue::from_str(&auth).unwrap(),
+                    )
+                    .json(&body)
+                    .await
+                    .assert_status(http::StatusCode::NO_CONTENT);
+            }
+        };
+        report(
+            "/sessions/playing",
+            serde_json::json!({
+                "ItemId": simple(other.id),
+                "PlaySessionId": "other-title",
+                "PositionTicks": 0,
+            }),
+        )
+        .await;
+        report(
+            "/sessions/playing/stopped",
+            serde_json::json!({
+                "ItemId": simple(picked),
+                "MediaSourceId": simple(picked),
+                "PositionTicks": 600_000_000i64,
+            }),
+        )
+        .await;
+        let position = |id: uuid::Uuid| {
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COALESCE(MAX(playback_position), 0) FROM user_media_state WHERE media_id = ?",
+            )
+            .bind(id)
+            .fetch_one(&ctx.db)
+        };
+        assert_eq!(
+            position(other.id)
+                .await
+                .unwrap(),
+            0
+        );
+        assert!(
+            position(movie.id)
+                .await
+                .unwrap()
+                > 0
         );
     }
 
@@ -6917,6 +8189,36 @@ mod tests {
 
         resp.assert_status_ok();
         assert_api_keys_are_real(&resp.json::<serde_json::Value>(), &token);
+    }
+
+    /// A trailer opened by id is playable: it lists itself as its source, so
+    /// clients (Swiftfin) don't take it for a missing, virtual item.
+    #[tokio::test]
+    async fn a_trailer_opens_as_its_own_source() {
+        let (server, guard, token) = authenticated_server().await;
+        let auth = auth_header_with_token(&token);
+        let trailer =
+            insert_test_source_of_kind(&guard.0, db::MediaKind::Trailer).await;
+
+        let resp = server
+            .get(&format!("/items/{}", trailer.id))
+            .add_header(
+                http::header::AUTHORIZATION,
+                HeaderValue::from_str(&auth).unwrap(),
+            )
+            .await;
+
+        resp.assert_status_ok();
+        let body = resp.json::<serde_json::Value>();
+        assert_eq!(body["Type"], "Trailer");
+        assert_ne!(body["LocationType"], "Virtual");
+        assert_eq!(
+            body["MediaSources"][0]["Id"],
+            trailer
+                .id
+                .simple()
+                .to_string()
+        );
     }
 
     /// Android TV calls `/items?parentId=<season>&startIndex=1` with no SortBy and
@@ -7578,7 +8880,7 @@ mod tests {
         )
         .await;
 
-        let user_id = get_user_id(&server, &auth).await;
+        let _user_id = get_user_id(&server, &auth).await;
         let resp = server
             .get("/items")
             .add_header(
@@ -7936,6 +9238,58 @@ mod tests {
             .unwrap();
             assert_eq!(people, vec![person.id], "the old People must survive");
         }
+    }
+
+    /// The editor clears an overview by sending it empty; leaving it out keeps it.
+    #[tokio::test]
+    async fn update_item_clears_an_overview_sent_empty() {
+        let (server, guard, token) = authenticated_server().await;
+        let db = &guard
+            .0
+            .db;
+        let auth = auth_header_with_token(&token);
+        let movie =
+            insert_media(db, "Overview Movie", db::MediaKind::Movie, "tt1000906").await;
+        let update = |body: serde_json::Value| {
+            server
+                .post(&format!("/items/{}", movie.id))
+                .add_header(
+                    http::header::AUTHORIZATION,
+                    HeaderValue::from_str(&auth).unwrap(),
+                )
+                .json(&body)
+        };
+        let description = || async {
+            db::Media::get_by_id(db, &movie.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .description
+                .map(String::from)
+        };
+
+        update(serde_json::json!({ "Overview": "Plot." }))
+            .await
+            .assert_status(http::StatusCode::NO_CONTENT);
+        assert_eq!(
+            description()
+                .await
+                .as_deref(),
+            Some("Plot.")
+        );
+        update(serde_json::json!({ "Name": "Overview Movie" }))
+            .await
+            .assert_status(http::StatusCode::NO_CONTENT);
+        assert_eq!(
+            description()
+                .await
+                .as_deref(),
+            Some("Plot.")
+        );
+        update(serde_json::json!({ "Overview": "" }))
+            .await
+            .assert_status(http::StatusCode::NO_CONTENT);
+        assert_eq!(description().await, None);
     }
 
     async fn set_policy_filter(db: &sqlx::SqlitePool, filter: CollectionFilter) {

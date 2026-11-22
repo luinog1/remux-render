@@ -6,14 +6,13 @@ use axum::{
 };
 use http::{HeaderMap, StatusCode};
 use remux_macros::{get, post, query, route};
-use serde::Deserialize;
 use serde_json::json;
 use std::time::Duration;
 use tracing::info;
 use uuid::Uuid;
 
 use crate::{
-    AppState, IntoApiError, OptionExt, ResultExt, api,
+    AppState, OptionExt, ResultExt, api,
     common::{self, get_uuid, server_id},
     db::{self, auth},
     intro,
@@ -108,12 +107,15 @@ pub async fn system_info_public(
                 .started_at
                 .to_rfc3339(),
         ),
+        remux_force_default_view_order: config
+            .force_default_view_order
+            .unwrap_or(false),
         ..Default::default()
     }))
 }
 
 #[get("/system/ping")]
-pub async fn system_ping(State(state): State<AppState>) -> Result<impl IntoResponse> {
+pub async fn system_ping(State(_state): State<AppState>) -> Result<impl IntoResponse> {
     Ok(Json(json!("Remux Server")))
 }
 
@@ -146,7 +148,7 @@ pub async fn web_manifest() -> impl IntoResponse {
 /// Get storage information
 #[get("/system/info/storage")]
 pub async fn system_info_storage(
-    State(state): State<AppState>,
+    State(_state): State<AppState>,
     _session: auth::AdminSession,
 ) -> Result<impl IntoResponse> {
     // Create storage information following the Jellyfin SystemStorageInfo structure
@@ -306,10 +308,16 @@ pub async fn update_system_configuration(
 }
 
 /// Get encoding configuration
+///
+/// Readable by any signed-in user, like Jellyfin's `GET
+/// /System/Configuration/{key}`: jellyfin-web reads it before rendering an
+/// ASS/SSA subtitle (to check `EnableFallbackFont`) and gives up on the
+/// subtitle if the request fails, so a non-admin would never see one.
+/// Changing it stays admin-only.
 #[get("/system/configuration/encoding")]
 pub async fn get_encoding_configuration(
     State(state): State<AppState>,
-    _session: auth::AdminSession,
+    _session: auth::AuthSession,
 ) -> Result<impl IntoResponse> {
     let opts = crate::db::Settings::get_encoding_config(
         &state
@@ -379,7 +387,7 @@ pub async fn update_intro_configuration(
 
 #[get("/system/endpoint")]
 pub async fn system_endpoint(
-    State(state): State<AppState>,
+    State(_state): State<AppState>,
 ) -> Result<impl IntoResponse> {
     Ok(Json(json!({
         "IsLocal": false,
@@ -475,12 +483,16 @@ pub async fn quickconnect_initiate(
     state
         .ctx
         .store
-        .save(format!("qc:{secret}"), entry, Duration::from_secs(600));
+        .save(
+            crate::store_keys::quick_connect(&secret),
+            entry,
+            Duration::from_secs(600),
+        );
     state
         .ctx
         .store
         .save(
-            format!("qc:code:{code}"),
+            crate::store_keys::quick_connect_code(&code),
             secret.clone(),
             Duration::from_secs(600),
         );
@@ -516,7 +528,7 @@ pub async fn quickconnect_connect(
     let entry = state
         .ctx
         .store
-        .get::<QuickConnectEntry>(format!("qc:{}", q.secret))
+        .get::<QuickConnectEntry>(crate::store_keys::quick_connect(&q.secret))
         .context_not_found("QuickConnect request not found or expired")?;
 
     Ok(Json(api::QuickConnectResult {
@@ -562,7 +574,7 @@ pub async fn quickconnect_connect(
 #[post("/quickconnect/authorize")]
 pub async fn quickconnect_authorize(
     State(state): State<AppState>,
-    session: auth::AuthSession,
+    _session: auth::AuthSession,
     auth::TargetUser(target): auth::TargetUser,
     Query(q): Query<QuickConnectCodeQuery>,
 ) -> Result<impl IntoResponse> {
@@ -571,20 +583,20 @@ pub async fn quickconnect_authorize(
     let secret = state
         .ctx
         .store
-        .get::<String>(format!("qc:code:{}", q.code))
+        .get::<String>(crate::store_keys::quick_connect_code(&q.code))
         .context_not_found("QuickConnect code not found or expired")?;
 
     let entry = state
         .ctx
         .store
-        .get::<QuickConnectEntry>(format!("qc:{secret}"))
+        .get::<QuickConnectEntry>(crate::store_keys::quick_connect(&secret))
         .context_not_found("QuickConnect request not found or expired")?;
 
     state
         .ctx
         .store
         .save(
-            format!("qc:{secret}"),
+            crate::store_keys::quick_connect(&secret),
             QuickConnectEntry {
                 authenticated: true,
                 user_id: Some(approved_user_id),
@@ -692,7 +704,7 @@ pub async fn get_branding_css_dotcss(
 
 #[query]
 #[derive(Default)]
-struct ActivityLogQuery {
+pub struct ActivityLogQuery {
     #[serde(rename = "startIndex", alias = "StartIndex")]
     start_index: Option<i64>,
     #[serde(alias = "Limit")]
@@ -779,7 +791,10 @@ pub async fn get_utc_time() -> impl IntoResponse {
 
 /// Restart the server (Admin only)
 #[post("/system/restart")]
-pub async fn system_restart(session: auth::AdminSession) -> Result<impl IntoResponse> {
+pub async fn system_restart(
+    State(state): State<AppState>,
+    session: auth::AdminSession,
+) -> Result<impl IntoResponse> {
     info!(
         "Server restart requested by user: {}",
         session
@@ -787,8 +802,25 @@ pub async fn system_restart(session: auth::AdminSession) -> Result<impl IntoResp
             .username
     );
 
-    // Trigger actual server restart
-    restart_server().await?;
+    // Exit runs no destructors, so stop ffmpeg first. Not after the spawn:
+    // the successor binds the port once this process exits. Not the full
+    // `AppContext::shutdown`: its torrent HTTP listener stays bound, so a
+    // failed restart could not bring P2P back.
+    state
+        .ctx
+        .sessions
+        .stop_all()
+        .await;
+
+    // Returns only if the new process could not be spawned: this one keeps
+    // serving, so it must transcode again.
+    if let Err(e) = restart_server().await {
+        state
+            .ctx
+            .sessions
+            .reopen();
+        return Err(e);
+    }
 
     Ok(Json(json!({
         "Message": "Server restart initiated",
@@ -817,7 +849,7 @@ async fn restart_server() -> Result<()> {
     }
 
     // Start the new process
-    let mut child = command.spawn()?;
+    let child = command.spawn()?;
 
     info!("New server process started with PID: {}", child.id());
 
@@ -830,7 +862,10 @@ async fn restart_server() -> Result<()> {
 
 /// Shutdown the server (Admin only)
 #[post("/system/shutdown")]
-pub async fn system_shutdown(session: auth::AdminSession) -> Result<impl IntoResponse> {
+pub async fn system_shutdown(
+    State(state): State<AppState>,
+    session: auth::AdminSession,
+) -> Result<impl IntoResponse> {
     info!(
         "Server shutdown requested by user: {}",
         session
@@ -838,7 +873,12 @@ pub async fn system_shutdown(session: auth::AdminSession) -> Result<impl IntoRes
             .username
     );
 
-    // Trigger actual server shutdown
+    // Exit runs no destructors, so stop ffmpeg first.
+    state
+        .ctx
+        .shutdown()
+        .await;
+
     shutdown_server().await?;
 
     Ok(Json(json!({
@@ -882,6 +922,9 @@ pub async fn system_info(
             .jellyfin_version
             .clone(),
         remux_version: env!("CARGO_PKG_VERSION").to_string(),
+        remux_force_default_view_order: config
+            .force_default_view_order
+            .unwrap_or(false),
         can_self_restart: Some(true),
         has_pending_restart: false,
         is_shutting_down: false,
@@ -895,7 +938,7 @@ pub async fn system_info(
 mod test {
     use super::*;
     use crate::integration_test::{
-        AUTH_HEADER, auth_header_with_token, authenticated_server, new_test_server,
+        auth_header_with_token, authenticated_server, new_test_server,
     };
     use axum_test::expect_json;
     use http::header::HeaderValue;
@@ -939,7 +982,28 @@ mod test {
             "Version": crate::default_jellyfin_version(),
             "RemuxVersion": env!("CARGO_PKG_VERSION"),
             "StartupWizardCompleted": true,
+            "RemuxForceDefaultViewOrder": false,
         }));
+
+        let mut cfg = crate::db::Settings::get_config_or_default(
+            &_ctx
+                .0
+                .db,
+        )
+        .await;
+        cfg.force_default_view_order = Some(true);
+        crate::db::Settings::set_config(
+            &_ctx
+                .0
+                .db,
+            &cfg,
+        )
+        .await
+        .unwrap();
+        server
+            .get("/system/info/public")
+            .await
+            .assert_json_contains(&json!({ "RemuxForceDefaultViewOrder": true }));
     }
 
     #[tokio::test]
@@ -1089,6 +1153,64 @@ mod test {
             .await;
         resp2.assert_status_ok();
         resp2.assert_json_contains(&json!({ "ServerName": "TestUpdated" }));
+    }
+
+    // --- GET /system/configuration/encoding ---
+
+    #[tokio::test]
+    async fn encoding_configuration_is_readable_but_not_writable_by_non_admins() {
+        let (server, _ctx, admin_token) = authenticated_server().await;
+        let admin_auth = auth_header_with_token(&admin_token);
+
+        server
+            .post("/users/new")
+            .add_header(
+                http::header::AUTHORIZATION,
+                HeaderValue::from_str(&admin_auth).unwrap(),
+            )
+            .json(&json!({ "Name": "regularuser", "Password": "pass1234" }))
+            .await
+            .assert_status_ok();
+        let resp = server
+            .post("/users/authenticatebyname")
+            .add_header(
+                http::header::AUTHORIZATION,
+                HeaderValue::from_static(crate::integration_test::AUTH_HEADER),
+            )
+            .json(&json!({ "Username": "regularuser", "Pw": "pass1234" }))
+            .await;
+        resp.assert_status_ok();
+        let regular_auth = auth_header_with_token(
+            resp.json::<serde_json::Value>()["AccessToken"]
+                .as_str()
+                .unwrap(),
+        );
+
+        let resp = server
+            .get("/system/configuration/encoding")
+            .add_header(
+                http::header::AUTHORIZATION,
+                HeaderValue::from_str(&regular_auth).unwrap(),
+            )
+            .await;
+        resp.assert_status_ok();
+        let config: serde_json::Value = resp.json();
+
+        server
+            .post("/system/configuration/encoding")
+            .add_header(
+                http::header::AUTHORIZATION,
+                HeaderValue::from_str(&regular_auth).unwrap(),
+            )
+            .json(&config)
+            .expect_failure()
+            .await;
+
+        server
+            .get("/system/configuration/encoding")
+            .expect_failure()
+            .await
+            .assert_status(StatusCode::UNAUTHORIZED);
     }
 
     // --- GET /system/endpoint ---

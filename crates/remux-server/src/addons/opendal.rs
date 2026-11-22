@@ -1,4 +1,4 @@
-use anyhow::{Result, bail};
+use anyhow::Result;
 use async_trait::async_trait;
 use chrono::Utc;
 use futures_util::TryStreamExt;
@@ -18,13 +18,45 @@ use super::{
     SubtitleInfo, SubtitleQuery, TreeAddon,
 };
 use crate::{
-    AppContext, addons::Addon, common, db, sdks, sdks::CachedEndpoint,
-    services::MediaResolveService,
+    AppContext, addons::Addon, common, db, sdks, services::MediaResolveService,
 };
 
 // ---------------------------------------------------------------------------
 // Shared option helper
 // ---------------------------------------------------------------------------
+
+/// What an Opendal library holds (its `media_kind` option), and the kind of
+/// each file in `opendal_files.media_kind` (where subtitles are listed too).
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    strum_macros::EnumString,
+    strum_macros::Display,
+    strum_macros::AsRefStr,
+)]
+#[strum(serialize_all = "snake_case")]
+pub enum OpendalKind {
+    Movie,
+    Episode,
+    Track,
+    Subtitle,
+}
+
+impl OpendalKind {
+    /// From an addon's config: `media_kind`, a movie library by default.
+    fn from_cfg(cfg: &serde_json::Value) -> Self {
+        cfg["media_kind"]
+            .as_str()
+            .and_then(|kind| {
+                kind.parse()
+                    .ok()
+            })
+            .unwrap_or(Self::Movie)
+    }
+}
 
 fn media_kind_option() -> AddonOption {
     AddonOption {
@@ -149,10 +181,7 @@ impl AddonPreset for OpendalLocalPreset {
         cfg: &serde_json::Value,
         _config: &crate::Config,
     ) -> Result<AddonCapabilities> {
-        let media_kind = cfg["media_kind"]
-            .as_str()
-            .unwrap_or("movie")
-            .to_string();
+        let media_kind = OpendalKind::from_cfg(cfg);
         let paths = cfg_paths_local(cfg)?;
         let first = paths
             .first()
@@ -279,10 +308,7 @@ impl AddonPreset for OpendalWebdavPreset {
         cfg: &serde_json::Value,
         _config: &crate::Config,
     ) -> Result<AddonCapabilities> {
-        let media_kind = cfg["media_kind"]
-            .as_str()
-            .unwrap_or("movie")
-            .to_string();
+        let media_kind = OpendalKind::from_cfg(cfg);
         let endpoint = cfg["endpoint"]
             .as_str()
             .filter(|s| !s.is_empty())
@@ -333,24 +359,55 @@ inventory::submit! {
 pub struct OpendalAddon {
     addon_id: Uuid,
     operator: Arc<opendal::Operator>,
+    #[allow(dead_code)] // kept for debugging/logging the source root
     root: String,
     backend: String,
-    media_kind: String,
+    media_kind: OpendalKind,
 }
 
 #[derive(sqlx::FromRow)]
 pub struct OpendalFile {
     pub path: String,
     pub name: String,
+    #[allow(dead_code)] // selected by `SELECT *`; not read yet
     pub title: Option<String>,
+    #[allow(dead_code)] // selected by `SELECT *`; not read yet
     pub imdb_id: Option<String>,
     pub season: Option<i64>,
     pub episode: Option<i64>,
+    #[allow(dead_code)] // selected by `SELECT *`; not read yet
     pub track_number: Option<i64>,
+    #[allow(dead_code)] // selected by `SELECT *`; not read yet
     pub year: Option<i64>,
+    #[allow(dead_code)] // selected by `SELECT *`; not read yet
     pub size: Option<i64>,
     #[sqlx(default)]
     pub probe_data: Option<sqlx::types::Json<crate::api::MediaSourceInfo>>,
+}
+
+impl OpendalAddon {
+    /// How to serve the file at `path`. A local backend indexes absolute
+    /// paths while its operator is rooted at the library folder, so going
+    /// through the operator would resolve the path under the root a second
+    /// time; local files are served straight from disk instead.
+    fn descriptor_for(&self, path: &str) -> crate::stream::StreamDescriptor {
+        // A `.strm` file is indexed under the URL it contains, not under its own
+        // path, so there is no file on the backend to open: play the URL.
+        if path.starts_with("http://") || path.starts_with("https://") {
+            crate::stream::StreamDescriptor::Http {
+                url: path.to_string(),
+                request_headers: Default::default(),
+                response_headers: Default::default(),
+            }
+        } else if self.backend == "local" {
+            crate::stream::StreamDescriptor::Local(std::path::PathBuf::from(path))
+        } else {
+            crate::stream::StreamDescriptor::Opendal {
+                addon_id: self.addon_id,
+                path: path.to_string(),
+            }
+        }
+    }
 }
 
 #[async_trait]
@@ -363,12 +420,9 @@ impl AddonKind for OpendalAddon {
         &self,
     ) -> Result<Option<(Vec<remux_sdks::stremio::ResourceRef>, Vec<StremioMediaType>)>>
     {
-        let media_type = match self
-            .media_kind
-            .as_str()
-        {
-            "episode" => StremioMediaType::Series,
-            "track" => StremioMediaType::Track,
+        let media_type = match self.media_kind {
+            OpendalKind::Episode => StremioMediaType::Series,
+            OpendalKind::Track => StremioMediaType::Track,
             _ => StremioMediaType::Movie,
         };
         let make_ref = |name| remux_sdks::stremio::ResourceRef {
@@ -376,13 +430,15 @@ impl AddonKind for OpendalAddon {
             types: vec![],
             id_prefixes: None,
         };
-        Ok(Some((
-            vec![
-                make_ref(ResourceType::Stream),
-                make_ref(ResourceType::Catalog),
-            ],
-            vec![media_type],
-        )))
+        let mut resources = vec![
+            make_ref(ResourceType::Stream),
+            make_ref(ResourceType::Catalog),
+        ];
+        // The subtitle files next to the videos (see `SubtitleAddon::supports`).
+        if matches!(self.media_kind, OpendalKind::Movie | OpendalKind::Episode) {
+            resources.push(make_ref(ResourceType::Subtitles));
+        }
+        Ok(Some((resources, vec![media_type])))
     }
 }
 
@@ -396,16 +452,14 @@ impl CatalogAddon for OpendalAddon {
             default_max_items: Some(999999999),
             collection_media_kind: Some(
                 self.media_kind
-                    .as_str()
+                    .as_ref()
                     .into(),
             ),
-            media_kind: match self
-                .media_kind
-                .as_str()
-            {
+            media_kind: match self.media_kind {
                 // episode files are grouped into Series catalog items
-                "episode" => Some(db::MediaKind::Series),
+                OpendalKind::Episode => Some(db::MediaKind::Series),
                 other => other
+                    .as_ref()
                     .parse()
                     .ok(),
             },
@@ -421,8 +475,8 @@ impl CatalogAddon for OpendalAddon {
             return Ok(None);
         }
 
-        let items: Vec<db::Media> = match self.media_kind.as_str() {
-            "episode" => {
+        let items: Vec<db::Media> = match self.media_kind {
+            OpendalKind::Episode => {
                 sqlx::query_as::<_, (String, Option<String>)>(
                     "SELECT DISTINCT imdb_id, title FROM opendal_files \
                      WHERE addon_id = ? AND media_kind = 'episode' AND imdb_id IS NOT NULL",
@@ -443,7 +497,7 @@ impl CatalogAddon for OpendalAddon {
                 })
                 .collect()
             }
-            "track" => {
+            OpendalKind::Track => {
                 #[derive(sqlx::FromRow)]
                 struct FileRow {
                     path: String,
@@ -518,18 +572,7 @@ impl CatalogAddon for OpendalAddon {
                         }
                     }
                     let track_key = format!("{}:track:{}", self.addon_id, f.path);
-                    let descriptor = if self.backend == "local" {
-                        crate::stream::StreamDescriptor::Local(
-                            std::path::PathBuf::from(&f.path),
-                        )
-                    } else {
-                        crate::stream::StreamDescriptor::Opendal {
-                            addon_id: self.addon_id,
-                            path: f
-                                .path
-                                .clone(),
-                        }
-                    };
+                    let descriptor = self.descriptor_for(&f.path);
                     out.push(db::Media {
                         id: common::get_stable_uuid(track_key.clone()),
                         title: f
@@ -630,19 +673,20 @@ impl IndexAddon for OpendalAddon {
 
 #[async_trait]
 impl SubtitleAddon for OpendalAddon {
+    fn is_local(&self) -> bool {
+        true
+    }
+
     fn supports(&self, media: &db::Media) -> bool {
-        match self
-            .media_kind
-            .as_str()
-        {
-            "movie" => {
+        match self.media_kind {
+            OpendalKind::Movie => {
                 media.kind == db::MediaKind::Movie
                     && media
                         .external_ids
                         .imdb
                         .is_some()
             }
-            "episode" => {
+            OpendalKind::Episode => {
                 media.kind == db::MediaKind::Episode
                     && media
                         .grandparent
@@ -663,7 +707,7 @@ impl SubtitleAddon for OpendalAddon {
         _query: &SubtitleQuery,
         db: &sqlx::SqlitePool,
     ) -> Result<Vec<SubtitleInfo>> {
-        let files: Vec<OpendalFile> = if self.media_kind == "episode" {
+        let files: Vec<OpendalFile> = if self.media_kind == OpendalKind::Episode {
             let Some(imdb_id) = media
                 .grandparent
                 .as_deref()
@@ -721,10 +765,7 @@ impl SubtitleAddon for OpendalAddon {
                     id: f
                         .path
                         .clone(),
-                    url: Some(crate::stream::StreamDescriptor::Opendal {
-                        addon_id: self.addon_id,
-                        path: f.path,
-                    }),
+                    url: Some(self.descriptor_for(&f.path)),
                     lang,
                     is_forced,
                     is_hi,
@@ -740,18 +781,15 @@ impl SubtitleAddon for OpendalAddon {
 #[async_trait]
 impl StreamAddon for OpendalAddon {
     fn supports(&self, media: &db::Media) -> bool {
-        match self
-            .media_kind
-            .as_str()
-        {
-            "movie" => {
+        match self.media_kind {
+            OpendalKind::Movie => {
                 media.kind == db::MediaKind::Movie
                     && media
                         .external_ids
                         .imdb
                         .is_some()
             }
-            "episode" => {
+            OpendalKind::Episode => {
                 media.kind == db::MediaKind::Episode
                     && media
                         .grandparent
@@ -762,7 +800,7 @@ impl StreamAddon for OpendalAddon {
                                 .is_some()
                         })
             }
-            "track" => media.kind == db::MediaKind::Track,
+            OpendalKind::Track => media.kind == db::MediaKind::Track,
             _ => false,
         }
     }
@@ -773,7 +811,7 @@ impl StreamAddon for OpendalAddon {
         ctx: &AppContext,
         _id_prefixes: Option<&[String]>,
     ) -> Result<Vec<crate::stream::StreamInfo>> {
-        let files: Vec<OpendalFile> = if self.media_kind == "track" {
+        let files: Vec<OpendalFile> = if self.media_kind == OpendalKind::Track {
             // Local tracks carry their own descriptor (path) on the media row;
             // fall back to a title+artist+album match for legacy rows.
             // Only reuse it when the file is one this addon indexed: every music
@@ -816,7 +854,7 @@ impl StreamAddon for OpendalAddon {
             .fetch_all(&ctx.db)
             .await?
         } else {
-            let imdb_id = if self.media_kind == "episode" {
+            let imdb_id = if self.media_kind == OpendalKind::Episode {
                 media
                     .grandparent
                     .as_deref()
@@ -841,7 +879,7 @@ impl StreamAddon for OpendalAddon {
                  WHERE addon_id = ? AND media_kind = ? AND imdb_id = ?",
             )
             .bind(self.addon_id)
-            .bind(&self.media_kind)
+            .bind(self.media_kind.as_ref())
             .bind(imdb_id)
             .fetch_all(&ctx.db)
             .await?
@@ -865,21 +903,16 @@ impl StreamAddon for OpendalAddon {
                 }
             })
             .map(|f| {
-                let descriptor = if self.backend == "local" {
-                    crate::stream::StreamDescriptor::Local(std::path::PathBuf::from(
-                        &f.path,
-                    ))
-                } else {
-                    crate::stream::StreamDescriptor::Opendal {
-                        addon_id: self.addon_id,
-                        path: f
-                            .path
-                            .clone(),
-                    }
-                };
+                let descriptor = self.descriptor_for(&f.path);
                 crate::stream::StreamInfo {
                     descriptor,
                     name: Some(
+                        f.name
+                            .clone(),
+                    ),
+                    // Lets release-aware subtitle ranking compare sidecars
+                    // against this file.
+                    filename: Some(
                         f.name
                             .clone(),
                     ),
@@ -900,7 +933,6 @@ impl StreamAddon for OpendalAddon {
         descriptor: &crate::stream::StreamDescriptor,
         headers: &axum::http::HeaderMap,
     ) -> axum_anyhow::ApiResult<axum::response::Response> {
-        use crate::ResultExt;
         use axum::body::Body;
         use futures_util::TryStreamExt;
         use std::io;
@@ -920,7 +952,7 @@ impl StreamAddon for OpendalAddon {
             .operator
             .stat(path)
             .await
-            .context_not_found("file not found in opendal backend")?;
+            .map_err(|e| backend_error(self.addon_id, path, "stat", e))?;
         let file_size = meta.content_length();
         let content_type = crate::stream::mime_from_path(std::path::Path::new(path));
 
@@ -944,11 +976,11 @@ impl StreamAddon for OpendalAddon {
                 .operator
                 .reader_with(path)
                 .await
-                .context_bad_request("failed to open opendal reader")?;
+                .map_err(|e| backend_error(self.addon_id, path, "open", e))?;
             let bytes_stream = reader
                 .into_bytes_stream(start..start + length)
                 .await
-                .context_bad_request("failed to create opendal byte stream")?
+                .map_err(|e| backend_error(self.addon_id, path, "read", e))?
                 .map_err(io::Error::other);
 
             Ok(axum::response::Response::builder()
@@ -967,11 +999,11 @@ impl StreamAddon for OpendalAddon {
                 .operator
                 .reader(path)
                 .await
-                .context_bad_request("failed to open opendal reader")?;
+                .map_err(|e| backend_error(self.addon_id, path, "open", e))?;
             let bytes_stream = reader
                 .into_bytes_stream(..)
                 .await
-                .context_bad_request("failed to create opendal byte stream")?
+                .map_err(|e| backend_error(self.addon_id, path, "read", e))?
                 .map_err(io::Error::other);
 
             Ok(axum::response::Response::builder()
@@ -988,7 +1020,7 @@ impl StreamAddon for OpendalAddon {
 #[async_trait]
 impl TreeAddon for OpendalAddon {
     fn supports(&self, root: &db::Media) -> bool {
-        self.media_kind == "episode"
+        self.media_kind == OpendalKind::Episode
             && matches!(root.kind, db::MediaKind::Series | db::MediaKind::Season)
     }
 
@@ -997,7 +1029,7 @@ impl TreeAddon for OpendalAddon {
         root: &db::Media,
         ctx: &AppContext,
     ) -> Result<Option<Vec<db::Media>>> {
-        if self.media_kind != "episode" {
+        if self.media_kind != OpendalKind::Episode {
             return Ok(None);
         }
 
@@ -1112,18 +1144,7 @@ impl TreeAddon for OpendalAddon {
                         // Leave title empty so the TMDB meta addon can fill in the proper
                         // episode name via refresh_meta (which apply_title_format then wraps).
                         let title = String::new();
-                        let descriptor = if self.backend == "local" {
-                            crate::stream::StreamDescriptor::Local(
-                                std::path::PathBuf::from(&f.path),
-                            )
-                        } else {
-                            crate::stream::StreamDescriptor::Opendal {
-                                addon_id: self.addon_id,
-                                path: f
-                                    .path
-                                    .clone(),
-                            }
-                        };
+                        let descriptor = self.descriptor_for(&f.path);
                         Some(db::Media {
                             id: common::get_stable_uuid(format!(
                                 "episode:{}:{}:{}",
@@ -1318,6 +1339,31 @@ fn music_layout(
     }
 }
 
+/// A subtitle seen during a scan, waiting for the whole listing so it can be
+/// linked to the video beside it. `dir` comes from the full stored path, so the
+/// same relative folder under two scan roots stays distinct.
+struct PendingSub {
+    dir: String,
+    path: String,
+    name: String,
+}
+
+/// What the scan knows about an identified video, to hand on to its subtitles.
+struct IndexedVideo {
+    imdb_id: String,
+    title: Option<String>,
+    season: Option<i64>,
+    episode: Option<i64>,
+    year: Option<i64>,
+}
+
+/// The folder an entry sits in, as listed.
+fn parent_dir(entry_rel: &str) -> String {
+    entry_rel
+        .rsplit_once('/')
+        .map_or_else(String::new, |(dir, _)| dir.to_string())
+}
+
 async fn scan_addon(
     ctx: &AppContext,
     tmdb: &Option<sdks::RestClient<sdks::BearerAuth>>,
@@ -1327,18 +1373,15 @@ async fn scan_addon(
         .preset
         .config
         .expose();
-    let media_kind = cfg["media_kind"]
-        .as_str()
-        .unwrap_or("movie")
-        .to_string();
+    let media_kind = OpendalKind::from_cfg(cfg);
     let is_local = addon
         .preset
         .kind
         == "opendal-local";
 
-    info!(addon = %addon.name, kind = %addon.preset.kind, media_kind, "opendal: scanning");
+    info!(addon = %addon.name, kind = %addon.preset.kind, media_kind = %media_kind, "opendal: scanning");
 
-    let is_media_ext: fn(&str) -> bool = if media_kind == "track" {
+    let is_media_ext: fn(&str) -> bool = if media_kind == OpendalKind::Track {
         |ext| {
             ext == "strm"
                 || remux_sdks::remux::AudioContainer::parse_known(ext).is_some()
@@ -1376,7 +1419,7 @@ async fn scan_addon(
     let mut seen_ids: Vec<Uuid> = Vec::new();
     let mut upserted = 0usize;
 
-    let probe_on_scan = addon.probe_on_scan && media_kind != "track";
+    let probe_on_scan = addon.probe_on_scan && media_kind != OpendalKind::Track;
     // With probing off, existing probe data is kept, but it must still be dropped
     // when its file changes, so changes are tracked while any probe data remains.
     let track_probes = probe_on_scan
@@ -1407,6 +1450,9 @@ async fn scan_addon(
     };
     let mut probe_jobs: Vec<ProbeJob> = Vec::new();
     let mut path_id_memo = PathIdMemo::default();
+    let mut videos: std::collections::HashMap<(String, String), IndexedVideo> =
+        Default::default();
+    let mut pending_subs: Vec<PendingSub> = Vec::new();
 
     // Debrid-style WebDAV shares only ever add folders, so a folder that has not
     // changed since it was indexed is not walked again. This is opt-in
@@ -1469,145 +1515,14 @@ async fn scan_addon(
                 .unwrap_or("")
                 .to_lowercase();
 
-            // Subtitle files: parse IMDB from filename (same convention as video files).
+            // Subtitle files are linked to their video once the whole listing
+            // has been seen, whatever order the two were listed in.
             if SUBTITLE_EXTENSIONS.contains(&ext.as_str()) {
-                let stem = stem_without_ext(&name);
-                let (base_stem, _, _, _) = split_subtitle_stem(&stem);
-                let jellyfin_ids = db::ExternalIds::from_path(&path);
-                let parsed = hunch::hunch(&base_stem);
-
-                let (imdb_id, season, episode, year, title_str) =
-                    match media_kind.as_str() {
-                        "episode" => {
-                            let season = parsed
-                                .season()
-                                .map(|s| s as i64);
-                            let episode = parsed
-                                .episode()
-                                .map(|e| e as i64);
-                            let year = parsed
-                                .year()
-                                .map(|y| y as i64);
-                            let clean_title = parsed
-                                .title()
-                                .unwrap_or(base_stem.as_str())
-                                .to_string();
-                            let existing_imdb =
-                                fetch_existing_imdb(ctx, addon.id, &path).await?;
-                            let imdb_id = if let Some(id) = existing_imdb {
-                                Some(id)
-                            } else if !jellyfin_ids.is_empty() {
-                                if let Some(client) = tmdb {
-                                    resolve_path_ids(
-                                        &mut path_id_memo,
-                                        &jellyfin_ids,
-                                        true,
-                                        client,
-                                    )
-                                    .await
-                                } else {
-                                    jellyfin_ids
-                                        .imdb
-                                        .clone()
-                                        .map(Into::into)
-                                }
-                            } else {
-                                if let Some(client) = tmdb {
-                                    MediaResolveService::resolve_imdb_from_search(
-                                        client,
-                                        &clean_title,
-                                        None,
-                                        true,
-                                    )
-                                    .await
-                                    .map(Into::into)
-                                } else {
-                                    None
-                                }
-                            };
-                            (imdb_id, season, episode, year, clean_title)
-                        }
-                        _ => {
-                            let year = parsed
-                                .year()
-                                .map(|y| y as i64);
-                            let clean_title = parsed
-                                .title()
-                                .unwrap_or(base_stem.as_str())
-                                .to_string();
-                            let existing_imdb =
-                                fetch_existing_imdb(ctx, addon.id, &path).await?;
-                            let imdb_id = if let Some(id) = existing_imdb {
-                                Some(id)
-                            } else if !jellyfin_ids.is_empty() {
-                                if let Some(client) = tmdb {
-                                    resolve_path_ids(
-                                        &mut path_id_memo,
-                                        &jellyfin_ids,
-                                        false,
-                                        client,
-                                    )
-                                    .await
-                                } else {
-                                    jellyfin_ids
-                                        .imdb
-                                        .clone()
-                                        .map(Into::into)
-                                }
-                            } else {
-                                if let Some(client) = tmdb {
-                                    MediaResolveService::resolve_imdb_from_search(
-                                        client,
-                                        &clean_title,
-                                        year,
-                                        false,
-                                    )
-                                    .await
-                                    .map(Into::into)
-                                } else {
-                                    None
-                                }
-                            };
-                            (imdb_id, None, None, year, clean_title)
-                        }
-                    };
-
-                if imdb_id.is_none() {
-                    debug!(path, "opendal: subtitle has no IMDB id, skipping");
-                    continue;
-                }
-
-                let sub_id = common::get_stable_uuid(format!("{}:{}", addon.id, path));
-                seen_ids.push(sub_id);
-                let now = Utc::now()
-                    .naive_utc()
-                    .to_string();
-                sqlx::query(
-                    "INSERT INTO opendal_files \
-                     (id, addon_id, media_kind, path, name, title, imdb_id, season, episode, track_number, year, size, scanned_at) \
-                     VALUES (?, ?, 'subtitle', ?, ?, ?, ?, ?, ?, NULL, ?, NULL, ?) \
-                     ON CONFLICT(id) DO UPDATE SET \
-                       path = excluded.path, name = excluded.name, \
-                       title = excluded.title, \
-                       imdb_id = COALESCE(opendal_files.imdb_id, excluded.imdb_id), \
-                       season = excluded.season, episode = excluded.episode, \
-                       year = excluded.year, scanned_at = excluded.scanned_at",
-                )
-                .bind(sub_id)
-                .bind(addon.id)
-                .bind(&path)
-                .bind(&name)
-                .bind(&title_str)
-                .bind(imdb_id.as_deref())
-                .bind(season)
-                .bind(episode)
-                .bind(year)
-                .bind(&now)
-                .execute(&ctx.db)
-                .await?;
-
-                debug!(path, "opendal: indexed subtitle");
-                upserted += 1;
+                pending_subs.push(PendingSub {
+                    dir: parent_dir(&path),
+                    path,
+                    name,
+                });
                 continue;
             }
 
@@ -1729,9 +1644,8 @@ async fn scan_addon(
             let jellyfin_ids = db::ExternalIds::from_path(&path);
 
             let (title, season, episode, track_number, year, imdb_id) = match media_kind
-                .as_str()
             {
-                "track" => {
+                OpendalKind::Track => {
                     let track_number = track_num_re
                         .captures(&stem)
                         .and_then(|c| c.get(1))
@@ -1754,7 +1668,7 @@ async fn scan_addon(
                         .to_string();
                     (Some(title), None, None, track_number, None, None)
                 }
-                "episode" => {
+                OpendalKind::Episode => {
                     let parsed = hunch::hunch(&stem);
                     let season = parsed
                         .season()
@@ -1891,9 +1805,22 @@ async fn scan_addon(
                 }
             };
 
+            if let Some(imdb) = imdb_id.as_deref() {
+                videos.insert(
+                    (parent_dir(&path), stem.to_lowercase()),
+                    IndexedVideo {
+                        imdb_id: imdb.to_string(),
+                        title: title.clone(),
+                        season,
+                        episode,
+                        year,
+                    },
+                );
+            }
+
             // Jellyfin music layout, see `music_layout`. Without embedded tags the
             // folder names are the source of truth for artist/album.
-            let (artist, album, disc_number) = if media_kind == "track" {
+            let (artist, album, disc_number) = if media_kind == OpendalKind::Track {
                 music_layout(&entry_rel, &list_from)
             } else {
                 (None, None, None)
@@ -1947,7 +1874,7 @@ async fn scan_addon(
             )
             .bind(row_id)
             .bind(addon.id)
-            .bind(&media_kind)
+            .bind(media_kind.as_ref())
             .bind(&stored_path)
             .bind(&name)
             .bind(title.as_deref())
@@ -2026,6 +1953,172 @@ async fn scan_addon(
                 Err(e) => return Err(e.into()),
             }
         }
+    }
+
+    // Link each subtitle to the video beside it (same folder, same name up to
+    // its language/flag suffixes), which has already been identified. Only a
+    // subtitle with no such video falls back to identifying itself.
+    for PendingSub { dir, path, name } in pending_subs {
+        let stem = stem_without_ext(&name);
+        let (base_stem, _, _, _) = split_subtitle_stem(&stem);
+        // The video next to it already has the ids: no second lookup.
+        let sibling = videos
+            .get(&(dir.clone(), stem.to_lowercase()))
+            .or_else(|| videos.get(&(dir.clone(), base_stem.to_lowercase())));
+        let jellyfin_ids = db::ExternalIds::from_path(&path);
+        let parsed = hunch::hunch(&base_stem);
+
+        let (imdb_id, season, episode, year, title_str) = if let Some(video) = sibling {
+            (
+                Some(
+                    video
+                        .imdb_id
+                        .clone(),
+                ),
+                video.season,
+                video.episode,
+                video.year,
+                video
+                    .title
+                    .clone()
+                    .unwrap_or_else(|| base_stem.clone()),
+            )
+        } else {
+            match media_kind {
+                OpendalKind::Episode => {
+                    let season = parsed
+                        .season()
+                        .map(|s| s as i64);
+                    let episode = parsed
+                        .episode()
+                        .map(|e| e as i64);
+                    let year = parsed
+                        .year()
+                        .map(|y| y as i64);
+                    let clean_title = parsed
+                        .title()
+                        .unwrap_or(base_stem.as_str())
+                        .to_string();
+                    let existing_imdb =
+                        fetch_existing_imdb(ctx, addon.id, &path).await?;
+                    let imdb_id = if let Some(id) = existing_imdb {
+                        Some(id)
+                    } else if !jellyfin_ids.is_empty() {
+                        if let Some(client) = tmdb {
+                            resolve_path_ids(
+                                &mut path_id_memo,
+                                &jellyfin_ids,
+                                true,
+                                client,
+                            )
+                            .await
+                        } else {
+                            jellyfin_ids
+                                .imdb
+                                .clone()
+                                .map(Into::into)
+                        }
+                    } else {
+                        if let Some(client) = tmdb {
+                            MediaResolveService::resolve_imdb_from_search(
+                                client,
+                                &clean_title,
+                                None,
+                                true,
+                            )
+                            .await
+                            .map(Into::into)
+                        } else {
+                            None
+                        }
+                    };
+                    (imdb_id, season, episode, year, clean_title)
+                }
+                _ => {
+                    let year = parsed
+                        .year()
+                        .map(|y| y as i64);
+                    let clean_title = parsed
+                        .title()
+                        .unwrap_or(base_stem.as_str())
+                        .to_string();
+                    let existing_imdb =
+                        fetch_existing_imdb(ctx, addon.id, &path).await?;
+                    let imdb_id = if let Some(id) = existing_imdb {
+                        Some(id)
+                    } else if !jellyfin_ids.is_empty() {
+                        if let Some(client) = tmdb {
+                            resolve_path_ids(
+                                &mut path_id_memo,
+                                &jellyfin_ids,
+                                false,
+                                client,
+                            )
+                            .await
+                        } else {
+                            jellyfin_ids
+                                .imdb
+                                .clone()
+                                .map(Into::into)
+                        }
+                    } else {
+                        if let Some(client) = tmdb {
+                            MediaResolveService::resolve_imdb_from_search(
+                                client,
+                                &clean_title,
+                                year,
+                                false,
+                            )
+                            .await
+                            .map(Into::into)
+                        } else {
+                            None
+                        }
+                    };
+                    (imdb_id, None, None, year, clean_title)
+                }
+            }
+        };
+
+        if imdb_id.is_none() {
+            info!(
+                path,
+                "opendal: subtitle has no IMDB id and no video beside it, skipping"
+            );
+            continue;
+        }
+
+        let sub_id = common::get_stable_uuid(format!("{}:{}", addon.id, path));
+        seen_ids.push(sub_id);
+        let now = Utc::now()
+            .naive_utc()
+            .to_string();
+        sqlx::query(
+                    "INSERT INTO opendal_files \
+                     (id, addon_id, media_kind, path, name, title, imdb_id, season, episode, track_number, year, size, scanned_at) \
+                     VALUES (?, ?, 'subtitle', ?, ?, ?, ?, ?, ?, NULL, ?, NULL, ?) \
+                     ON CONFLICT(id) DO UPDATE SET \
+                       path = excluded.path, name = excluded.name, \
+                       title = excluded.title, \
+                       imdb_id = excluded.imdb_id, \
+                       season = excluded.season, episode = excluded.episode, \
+                       year = excluded.year, scanned_at = excluded.scanned_at",
+                )
+                .bind(sub_id)
+                .bind(addon.id)
+                .bind(&path)
+                .bind(&name)
+                .bind(&title_str)
+                .bind(imdb_id.as_deref())
+                .bind(season)
+                .bind(episode)
+                .bind(year)
+                .bind(&now)
+                .execute(&ctx.db)
+                .await?;
+
+        debug!(path, "opendal: indexed subtitle");
+        upserted += 1;
     }
 
     let deleted = prune_stale_paths(ctx, addon.id, &seen_ids).await?;
@@ -2192,6 +2285,40 @@ async fn run_probe_jobs(ctx: &AppContext, addon: &Addon, jobs: Vec<ProbeJob>) {
     info!(addon = %addon.name, stored, "opendal: probing complete");
 }
 
+/// The response for a storage backend that failed to serve `path`, with what the
+/// backend actually said logged: a file that is gone is a 404, but a refused
+/// login or an unreachable server is not, and answering 404 for those sent
+/// people looking for a missing file.
+fn backend_error(
+    addon_id: Uuid,
+    path: &str,
+    step: &str,
+    error: opendal::Error,
+) -> axum_anyhow::ApiError {
+    use axum::http::StatusCode;
+    let (status, detail) = match error.kind() {
+        opendal::ErrorKind::NotFound => (
+            StatusCode::NOT_FOUND,
+            "file not found in the storage backend",
+        ),
+        opendal::ErrorKind::PermissionDenied => (
+            StatusCode::BAD_GATEWAY,
+            "the storage backend refused access (check its credentials)",
+        ),
+        opendal::ErrorKind::RateLimited => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "the storage backend is rate limiting requests",
+        ),
+        _ => (StatusCode::BAD_GATEWAY, "the storage backend failed"),
+    };
+    warn!(%addon_id, path, step, kind = ?error.kind(), error = %error, "opendal backend request failed");
+    axum_anyhow::ApiError::builder()
+        .status(status)
+        .title("stream")
+        .detail(detail)
+        .build()
+}
+
 /// Directory form of a configured WebDAV path (always with a trailing slash).
 ///
 /// opendal's WebDAV backend cannot list recursively on its own, so it falls back to a
@@ -2293,7 +2420,7 @@ impl IncrementalIndex {
             oldest = Some(oldest.map_or(at, |o| o.min(at)));
             // Files that cannot be resolved are normally not stored at all, so a
             // row with no id is the only trace of a failed resolution there can be.
-            let unresolved = media_kind != "track"
+            let unresolved = media_kind != OpendalKind::Track.as_ref()
                 && imdb_id
                     .as_deref()
                     .is_none_or(str::is_empty);
@@ -2596,6 +2723,40 @@ async fn prune_stale_paths(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn strm_urls_are_played_as_urls_on_every_backend() {
+        use crate::stream::StreamDescriptor;
+        let addon = |backend: &str| OpendalAddon {
+            addon_id: Uuid::nil(),
+            operator: Arc::new(
+                opendal::Operator::new(opendal::services::Memory::default())
+                    .unwrap()
+                    .finish(),
+            ),
+            root: String::new(),
+            backend: backend.to_string(),
+            media_kind: OpendalKind::Movie,
+        };
+        let url = "https://user:pass@host/strm/e/token";
+        for backend in ["webdav", "local"] {
+            assert!(
+                matches!(
+                    addon(backend).descriptor_for(url),
+                    StreamDescriptor::Http { url: ref u, .. } if u == url
+                ),
+                "{backend}"
+            );
+        }
+        assert!(matches!(
+            addon("webdav").descriptor_for("/movies/1917.mkv"),
+            StreamDescriptor::Opendal { .. }
+        ));
+        assert!(matches!(
+            addon("local").descriptor_for("/movies/1917.mkv"),
+            StreamDescriptor::Local(_)
+        ));
+    }
+
     use std::sync::{Arc, atomic::AtomicU64};
 
     use chrono::Utc;
@@ -2608,7 +2769,6 @@ mod tests {
     use crate::{
         Config,
         addons::{Addon, AddonPresetRef},
-        api,
         common::{self, ProgressReporter},
         db,
         integration_test::{new_test_server, new_test_server_with_config},
@@ -2738,6 +2898,89 @@ mod tests {
             }
         });
         (base, hits)
+    }
+
+    /// A server that answers every request with `status` and no body.
+    async fn webdav_answering(status: &'static str) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let base = format!(
+            "http://{}",
+            listener
+                .local_addr()
+                .unwrap()
+        );
+        tokio::spawn(async move {
+            loop {
+                let (mut sock, _) = listener
+                    .accept()
+                    .await
+                    .unwrap();
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    let _ = sock
+                        .read(&mut buf)
+                        .await;
+                    let resp = format!(
+                        "HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    );
+                    let _ = sock
+                        .write_all(resp.as_bytes())
+                        .await;
+                });
+            }
+        });
+        base
+    }
+
+    async fn serve_status(status: &'static str) -> axum::http::StatusCode {
+        let base = webdav_answering(status).await;
+        let addon = OpendalAddon {
+            addon_id: Uuid::new_v4(),
+            operator: Arc::new(
+                opendal::Operator::new(
+                    opendal::services::Webdav::default().endpoint(&base),
+                )
+                .unwrap()
+                .finish(),
+            ),
+            root: base,
+            backend: "webdav".to_string(),
+            media_kind: OpendalKind::Movie,
+        };
+        let descriptor = crate::stream::StreamDescriptor::Opendal {
+            addon_id: addon.addon_id,
+            path: "movies/a.mkv".to_string(),
+        };
+        addon
+            .serve_stream(&descriptor, &axum::http::HeaderMap::new())
+            .await
+            .err()
+            .expect("the backend refused")
+            .status()
+    }
+
+    /// Only a file that is really gone is a 404. A refused login or a failing
+    /// server must not look like a missing file.
+    #[tokio::test]
+    async fn serving_a_file_reports_what_the_backend_said() {
+        use axum::http::StatusCode;
+        assert_eq!(serve_status("404 Not Found").await, StatusCode::NOT_FOUND);
+        assert_eq!(
+            serve_status("401 Unauthorized").await,
+            StatusCode::BAD_GATEWAY
+        );
+        assert_eq!(serve_status("403 Forbidden").await, StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            serve_status("500 Internal Server Error").await,
+            StatusCode::BAD_GATEWAY
+        );
+        assert_eq!(
+            serve_status("429 Too Many Requests").await,
+            StatusCode::BAD_GATEWAY
+        );
     }
 
     // A top-level WebDAV path configured without a trailing slash used to make opendal
@@ -2921,7 +3164,9 @@ mod tests {
             operator: Arc::new(operator),
             root,
             backend: "local".to_string(),
-            media_kind: media_kind.to_string(),
+            media_kind: media_kind
+                .parse()
+                .unwrap(),
         };
 
         (addon_kind, db_addon)
@@ -3055,6 +3300,16 @@ mod tests {
                 assert!(
                     matches!(s.descriptor, StreamDescriptor::Local(_)),
                     "{}: expected Local descriptor",
+                    f.rel_path
+                );
+                // Subtitle ranking compares sidecars against this name.
+                assert_eq!(
+                    s.filename
+                        .as_deref(),
+                    std::path::Path::new(f.rel_path)
+                        .file_name()
+                        .and_then(|n| n.to_str()),
+                    "{}: stream should carry the file name",
                     f.rel_path
                 );
             }
@@ -3994,7 +4249,9 @@ mod tests {
         .unwrap();
         assert_eq!(sub_count, 3, "expected 3 subtitle rows");
 
-        // subtitle_fetch returns SubtitleInfo with Opendal descriptors.
+        // subtitle_fetch returns SubtitleInfo with Local descriptors for a local
+        // backend: the operator is rooted at the library folder, so an Opendal
+        // descriptor would resolve the absolute path under it a second time.
         let movie_media = db::Media {
             id: crate::common::get_stable_uuid("movie:tt0133093".to_string()),
             kind: db::MediaKind::Movie,
@@ -4011,10 +4268,10 @@ mod tests {
         assert_eq!(infos.len(), 3, "subtitle_fetch should return 3 subtitles");
 
         for info in &infos {
-            assert!(
-                matches!(info.url, Some(StreamDescriptor::Opendal { .. })),
-                "expected Opendal descriptor"
-            );
+            let Some(StreamDescriptor::Local(path)) = &info.url else {
+                panic!("expected Local descriptor, got {:?}", info.url);
+            };
+            assert!(path.is_file(), "{path:?} should be a servable file");
         }
 
         let en = infos
@@ -4051,6 +4308,110 @@ mod tests {
         assert!(de.is_hi);
     }
 
+    // E2E: a subtitle takes the ids of the video beside it
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn opendal_subtitle_is_linked_to_its_video() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir
+            .path()
+            .to_str()
+            .unwrap()
+            .to_string();
+        // Neither name carries an id, and a .strm keeps its target URL as path:
+        // the only thing tying the subtitle to the film is the folder and name.
+        let strm_url = "https://example.invalid/stream/obscure.mkv";
+        for (folder, video, body) in [
+            ("Obscure Film", "Obscure Film.mkv", "x"),
+            ("Strm Film", "Strm Film.strm", strm_url),
+            ("Saga", "Saw.mkv", "x"),
+            ("Saga", "Saw.II.mkv", "y"),
+        ] {
+            let film = dir
+                .path()
+                .join(folder);
+            std::fs::create_dir_all(&film).unwrap();
+            std::fs::write(film.join(video), body).unwrap();
+            let stem = video
+                .rsplit_once('.')
+                .unwrap()
+                .0;
+            std::fs::write(film.join(format!("{stem}.srt")), b"subtitle").unwrap();
+        }
+        let (_, guard) = new_test_server()
+            .await
+            .unwrap();
+        let ctx = &guard.0;
+        let (addon, db_addon) = make_local_addon(ctx, dir.path(), "movie").await;
+
+        // The films were identified by an earlier scan.
+        for (video_path, name, imdb) in [
+            (
+                format!("{root}/Obscure Film/Obscure Film.mkv"),
+                "Obscure Film.mkv",
+                "tt0000001",
+            ),
+            (strm_url.to_string(), "Strm Film.strm", "tt0000002"),
+            (format!("{root}/Saga/Saw.mkv"), "Saw.mkv", "tt0000003"),
+            (format!("{root}/Saga/Saw.II.mkv"), "Saw.II.mkv", "tt0000004"),
+        ] {
+            sqlx::query(
+                "INSERT INTO opendal_files (id, addon_id, media_kind, path, name, imdb_id, scanned_at) \
+                 VALUES (?, ?, 'movie', ?, ?, ?, '2026-01-01 00:00:00')",
+            )
+            .bind(Uuid::new_v4())
+            .bind(db_addon.id)
+            .bind(&video_path)
+            .bind(name)
+            .bind(imdb)
+            .execute(&ctx.db)
+            .await
+            .unwrap();
+        }
+
+        // A subtitle indexed earlier under the wrong id is relinked.
+        let stale = format!("{root}/Obscure Film/Obscure Film.srt");
+        sqlx::query(
+            "INSERT INTO opendal_files (id, addon_id, media_kind, path, name, imdb_id, scanned_at) \
+             VALUES (?, ?, 'subtitle', ?, 'Obscure Film.srt', 'tt9999999', '2026-01-01 00:00:00')",
+        )
+        .bind(crate::common::get_stable_uuid(format!(
+            "{}:{}",
+            db_addon.id, stale
+        )))
+        .bind(db_addon.id)
+        .bind(&stale)
+        .execute(&ctx.db)
+        .await
+        .unwrap();
+
+        addon
+            .refresh_index(ctx, &db_addon, noop_progress())
+            .await
+            .unwrap();
+
+        let rows: Vec<(String, String)> = sqlx::query_as(
+            "SELECT name, imdb_id FROM opendal_files \
+             WHERE addon_id = ? AND media_kind = 'subtitle' ORDER BY path",
+        )
+        .bind(db_addon.id)
+        .fetch_all(&ctx.db)
+        .await
+        .unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                ("Obscure Film.srt".to_string(), "tt0000001".to_string()),
+                ("Saw.II.srt".to_string(), "tt0000004".to_string()),
+                ("Saw.srt".to_string(), "tt0000003".to_string()),
+                ("Strm Film.srt".to_string(), "tt0000002".to_string()),
+            ],
+            "each subtitle takes the id of the video beside it, `Saw.II` not `Saw`'s"
+        );
+    }
+
+    // -----------------------------------------------------------------------
     // -----------------------------------------------------------------------
     // E2E: subtitle without an IMDB id is not indexed
     // -----------------------------------------------------------------------
@@ -4743,13 +5104,12 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(streams.len(), 1);
-        let path = match &streams[0].descriptor {
-            StreamDescriptor::Local(p) => p
-                .to_string_lossy()
-                .to_string(),
-            other => panic!("expected Local descriptor, got {other:?}"),
+        // ...and it is played as that URL, not opened as a file on the backend.
+        let played = match &streams[0].descriptor {
+            StreamDescriptor::Http { url, .. } => url.clone(),
+            other => panic!("expected Http descriptor, got {other:?}"),
         };
-        assert_eq!(path, url, "stream path must be the URL from the .strm file");
+        assert_eq!(played, url, "stream must play the URL from the .strm file");
     }
 
     // -----------------------------------------------------------------------
@@ -5033,24 +5393,22 @@ mod tests {
     const PROBE_MOVIE: &str = "[imdbid-tt0133093] The Matrix (1999).mp4";
 
     fn make_probeable_mp4(path: &std::path::Path) -> bool {
-        std::process::Command::new(
-            std::env::var("FFMPEG_PATH").unwrap_or_else(|_| "ffmpeg".into()),
-        )
-        .args([
-            "-v",
-            "error",
-            "-f",
-            "lavfi",
-            "-i",
-            "testsrc=duration=1:size=64x64:rate=5",
-            "-pix_fmt",
-            "yuv420p",
-            "-y",
-        ])
-        .arg(path)
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+        std::process::Command::new(crate::tools::ffmpeg())
+            .args([
+                "-v",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc=duration=1:size=64x64:rate=5",
+                "-pix_fmt",
+                "yuv420p",
+                "-y",
+            ])
+            .arg(path)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
     }
 
     async fn stored_probe(ctx: &AppContext, addon_id: Uuid) -> bool {
@@ -5722,7 +6080,7 @@ mod tests {
             &catalog,
             &catalog.catalog_id,
             100,
-            stream,
+            crate::addons::CatalogStream::from(stream),
             &noop_progress(),
         )
         .await

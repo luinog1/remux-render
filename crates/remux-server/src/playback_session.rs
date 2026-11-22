@@ -2,7 +2,7 @@ use chrono::{DateTime, Utc};
 use dashmap::DashMap;
 use std::{path::PathBuf, sync::Arc, time::Duration};
 use tokio::task::JoinHandle;
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 use uuid::Uuid;
 
 use crate::{
@@ -11,6 +11,11 @@ use crate::{
     playback::{decision::PlaybackPermissions, session::TranscodeSession},
 };
 use remux_sdks::remux::{PlayMethod, PlaybackInfo, QueueItem};
+
+/// Held per play session while its transcode is created: no duplicate
+/// ffmpeg, and a stop arriving meanwhile waits to find it.
+pub(crate) static TRANSCODE_CREATE_LOCKS: crate::keyed_lock::KeyedLock<String> =
+    crate::keyed_lock::KeyedLock::new();
 
 #[derive(Clone)]
 pub struct PlaybackSession {
@@ -68,6 +73,14 @@ impl PlaybackSession {
             }
         }
     }
+
+    /// False for a transcode stub until a start or progress report names its
+    /// item.
+    pub(crate) fn is_reported(&self) -> bool {
+        !self
+            .item_id
+            .is_nil()
+    }
 }
 
 /// What a stream endpoint actually served for a playback session.
@@ -118,18 +131,20 @@ pub struct FfmpegTrack {
 }
 
 impl FfmpegTrack {
-    /// `output` is FFmpeg's codec argument: `copy` or an encoder target.
-    pub fn new(output: &str, source_codec: Option<&str>) -> Self {
-        if output.eq_ignore_ascii_case("copy") {
-            Self {
+    /// What FFmpeg does with the stream: copy it, or encode to a codec.
+    pub fn new(
+        output: &crate::playback::codec::CodecTarget,
+        source_codec: Option<&str>,
+    ) -> Self {
+        match output {
+            crate::playback::codec::CodecTarget::Copy => Self {
                 codec: source_codec.map(str::to_string),
                 copied: true,
-            }
-        } else {
-            Self {
-                codec: Some(output.to_string()),
+            },
+            crate::playback::codec::CodecTarget::Transcode(codec) => Self {
+                codec: Some(codec.clone()),
                 copied: false,
-            }
+            },
         }
     }
 }
@@ -144,8 +159,9 @@ pub struct PlaybackSessionManager {
         Arc<DashMap<String, (DateTime<Utc>, Vec<Arc<crate::torrent::TorrentLease>>)>>,
     pending_play_methods: Arc<DashMap<String, (DateTime<Utc>, ServedPlayback)>>,
     // Makes that handoff atomic: a request cannot be stranded in pending
-    // while playback-start inserts its session.
-    handoff: Arc<std::sync::Mutex<()>>,
+    // while playback-start inserts its session. True once `stop_all` began:
+    // no transcode is attached after.
+    handoff: Arc<std::sync::Mutex<bool>>,
     base_dir: PathBuf,
 }
 
@@ -157,7 +173,7 @@ impl PlaybackSessionManager {
             sessions: Arc::new(DashMap::new()),
             pending_torrents: Arc::new(DashMap::new()),
             pending_play_methods: Arc::new(DashMap::new()),
-            handoff: Arc::new(std::sync::Mutex::new(())),
+            handoff: Arc::new(std::sync::Mutex::new(false)),
             base_dir,
         }
     }
@@ -401,13 +417,15 @@ impl PlaybackSessionManager {
     ///
     /// Updates the in-memory session state, notifies the transcode buffer
     /// monitor, persists the playback position to the DB, and logs stream-
-    /// selection changes.
+    /// selection changes. `release` is the stream being played, which the
+    /// remembered track indexes are saved with.
     pub async fn progress(
         &self,
         db: &sqlx::SqlitePool,
         user: &db::User,
         psid: &str,
         data: &PlaybackInfo,
+        release: Option<Uuid>,
     ) -> anyhow::Result<()> {
         let ps_snapshot = self.get(psid);
         let ps = match ps_snapshot.as_ref() {
@@ -495,6 +513,14 @@ impl PlaybackSessionManager {
         }
 
         self.update(psid, |ps| {
+            // A stream switch's new PlaySessionId is reported with progress
+            // only: the stub becomes the reporting user's.
+            if ps
+                .user_id
+                .is_nil()
+            {
+                ps.user_id = user.id;
+            }
             if !data
                 .item_id
                 .is_nil()
@@ -572,7 +598,6 @@ impl PlaybackSessionManager {
             } else {
                 None
             };
-
             db::UserMediaState::update_playback(
                 db,
                 user,
@@ -580,6 +605,7 @@ impl PlaybackSessionManager {
                 position_ticks,
                 audio_idx,
                 subtitle_idx,
+                release,
                 media.runtime,
             )
             .await?;
@@ -602,9 +628,15 @@ impl PlaybackSessionManager {
         psid: &str,
         data: &PlaybackInfo,
     ) -> anyhow::Result<bool> {
+        // Wait out a transcode being created for this session, so the stop
+        // finds it.
+        let create = TRANSCODE_CREATE_LOCKS
+            .lock_if_exists(&psid.to_string())
+            .await;
         let ps = self
             .stop(psid)
             .await;
+        drop(create);
 
         let item_id = Some(data.item_id)
             .filter(|id| !id.is_nil())
@@ -676,6 +708,7 @@ impl PlaybackSessionManager {
             final_ticks,
             None, // don't overwrite stream selections on stop
             None,
+            None,
             media.runtime, // Some(runtime) triggers watched-threshold check
         )
         .await
@@ -707,21 +740,9 @@ impl PlaybackSessionManager {
     /// Removes stale sessions for the same device so `get_sessions` always
     /// finds the most recent playback.
     pub async fn insert(&self, mut session: PlaybackSession) {
-        if session
-            .transcode
-            .is_none()
-        {
-            if let Some(existing) = self
-                .sessions
-                .get(&session.play_session_id)
-            {
-                session.transcode = existing
-                    .value()
-                    .transcode
-                    .clone();
-            }
-        }
         // Remove any previous session for this device (different play_session_id).
+        // Unreported transcode stubs are left alone: a start report without
+        // (or with another) PlaySessionId must not kill the stream it reports.
         if !session
             .device_id
             .is_empty()
@@ -733,6 +754,8 @@ impl PlaybackSessionManager {
                     e.value()
                         .device_id
                         == session.device_id
+                        && e.value()
+                            .is_reported()
                         && e.key() != &session.play_session_id
                 })
                 .map(|e| {
@@ -759,6 +782,15 @@ impl PlaybackSessionManager {
             .sessions
             .get(&session.play_session_id)
         {
+            // Keep a transcode master.m3u8 attached before this report.
+            if session
+                .transcode
+                .is_none()
+            {
+                session.transcode = existing
+                    .transcode
+                    .clone();
+            }
             if session
                 .served
                 .is_none()
@@ -835,7 +867,7 @@ impl PlaybackSessionManager {
             .collect()
     }
 
-    /// Return the most recently active session for a device.
+    /// Return the most recently active reported session for a device.
     /// Used as a fallback when the client omits PlaySessionId (e.g. DirectPlay).
     pub fn get_by_device(&self, device_id: &str) -> Option<PlaybackSession> {
         self.sessions
@@ -844,6 +876,8 @@ impl PlaybackSessionManager {
                 e.value()
                     .device_id
                     == device_id
+                    && e.value()
+                        .is_reported()
             })
             .max_by_key(|e| {
                 e.value()
@@ -926,80 +960,150 @@ impl PlaybackSessionManager {
     /// transcode isn't lost. `insert` will later overwrite the stub fields while
     /// preserving the transcode.
     ///
-    /// When creating a stub, we inherit the `device_id` from the most recently
-    /// active session that currently has no transcode. This covers quality-switch
-    /// flows where the client sends a new play_session_id without first calling
-    /// POST /Sessions/Playing — without this, `get_sessions` can't find the new
-    /// transcode by device_id until the client reports playback again.
-    pub fn attach_transcode(
+    /// The stub records the requesting device. The device's other transcodes
+    /// of the same user and item are stopped: a client retrying under a new
+    /// PlaySessionId may never stop the old one. Returns false, attaching
+    /// nothing, once shutdown has begun (`stop_all`).
+    pub async fn attach_transcode(
         &self,
         id: &str,
+        device_id: &str,
         ts: Arc<tokio::sync::RwLock<TranscodeSession>>,
-    ) {
-        if let Some(mut entry) = self
-            .sessions
-            .get_mut(id)
-        {
-            entry
-                .value_mut()
-                .transcode = Some(ts);
-        } else {
-            // Inherit device_id from the freshest transcodeless session so that
-            // get_sessions can find this stub by device_id immediately.
-            let inherited_device_id = self
+    ) -> bool {
+        let (user_id, item_id) = {
+            let t = ts
+                .read()
+                .await;
+            (t.user_id, t.item_id)
+        };
+        // The std guard must not live across an await: handlers need Send.
+        let others: Vec<_> = {
+            let closed = self
+                .handoff
+                .lock()
+                .expect("handoff lock is not poisoned");
+            if *closed {
+                return false;
+            }
+            let others = self
                 .sessions
                 .iter()
-                .filter(|e| {
-                    e.value()
-                        .transcode
-                        .is_none()
-                        && !e
-                            .value()
-                            .device_id
-                            .is_empty()
+                .filter(|e| e.key() != id && e.device_id == device_id)
+                .filter_map(|e| {
+                    Some((
+                        e.key()
+                            .clone(),
+                        e.transcode
+                            .clone()?,
+                    ))
                 })
-                .max_by_key(|e| {
-                    e.value()
-                        .last_activity
-                })
-                .map(|e| {
-                    e.value()
-                        .device_id
-                        .clone()
-                })
-                .unwrap_or_default();
+                .collect();
+            if let Some(mut entry) = self
+                .sessions
+                .get_mut(id)
+            {
+                entry
+                    .value_mut()
+                    .transcode = Some(ts);
+            } else {
+                self.sessions
+                    .insert(
+                        id.to_string(),
+                        PlaybackSession {
+                            play_session_id: id.to_string(),
+                            transcode: Some(ts),
+                            user_id: Uuid::nil(),
+                            item_id: Uuid::nil(),
+                            media_source_id: None,
+                            device_id: device_id.to_string(),
+                            client_name: String::new(),
+                            position_ticks: 0,
+                            can_seek: true,
+                            is_paused: false,
+                            last_paused_at: None,
+                            is_muted: false,
+                            volume_level: None,
+                            audio_stream_index: None,
+                            subtitle_stream_index: None,
+                            play_method: None,
+                            served: None,
+                            now_playing_queue: None,
+                            playlist_item_id: None,
+                            started_at: Utc::now(),
+                            last_activity: Utc::now(),
+                            group_id: None,
+                            item_kind: None,
+                            torrents: Vec::new(),
+                        },
+                    );
+            }
+            others
+        };
+        self.stop_transcodes_of(others, user_id, item_id)
+            .await;
+        true
+    }
 
-            self.sessions
-                .insert(
-                    id.to_string(),
-                    PlaybackSession {
-                        play_session_id: id.to_string(),
-                        transcode: Some(ts),
-                        user_id: Uuid::nil(),
-                        item_id: Uuid::nil(),
-                        media_source_id: None,
-                        device_id: inherited_device_id,
-                        client_name: String::new(),
-                        position_ticks: 0,
-                        can_seek: true,
-                        is_paused: false,
-                        last_paused_at: None,
-                        is_muted: false,
-                        volume_level: None,
-                        audio_stream_index: None,
-                        subtitle_stream_index: None,
-                        play_method: None,
-                        served: None,
-                        now_playing_queue: None,
-                        playlist_item_id: None,
-                        started_at: Utc::now(),
-                        last_activity: Utc::now(),
-                        group_id: None,
-                        item_kind: None,
-                        torrents: Vec::new(),
-                    },
+    /// A stop report without PlaySessionId names no transcode stub, so it ends
+    /// the device's unreported transcodes of the user's item, as a retry does.
+    pub async fn stop_unreported(&self, device_id: &str, user_id: Uuid, item_id: Uuid) {
+        let stubs = self
+            .sessions
+            .iter()
+            .filter(|e| e.device_id == device_id && !e.is_reported())
+            .filter_map(|e| {
+                Some((
+                    e.key()
+                        .clone(),
+                    e.transcode
+                        .clone()?,
+                ))
+            })
+            .collect();
+        self.stop_transcodes_of(stubs, user_id, item_id)
+            .await;
+    }
+
+    /// Stops those `transcodes` (by play session) that are `user_id`'s of
+    /// `item_id`.
+    async fn stop_transcodes_of(
+        &self,
+        transcodes: Vec<(String, Arc<tokio::sync::RwLock<TranscodeSession>>)>,
+        user_id: Uuid,
+        item_id: Uuid,
+    ) {
+        // Spawned and awaited: a client abandoning this request (a retry
+        // storm cancels its masters) must not cut a stop short after the
+        // transcode left its slot.
+        let sessions = self.clone();
+        let _ = tokio::spawn(async move {
+            for (other_id, other) in transcodes {
+                let same = {
+                    let t = other
+                        .read()
+                        .await;
+                    t.user_id == user_id && t.item_id == item_id
+                };
+                if !same {
+                    continue;
+                }
+                info!(
+                    play_session_id = %other_id,
+                    "Stopping the device's other transcode of the item"
                 );
-        }
+                if let Some(mut s) = sessions
+                    .sessions
+                    .get_mut(&other_id)
+                    && s.transcode
+                        .as_ref()
+                        .is_some_and(|t| Arc::ptr_eq(t, &other))
+                {
+                    s.transcode = None;
+                }
+                kill_transcode(other).await;
+            }
+        })
+        .await;
     }
 
     /// Stop and remove the transcode from a session (e.g. on seek or client stop),
@@ -1077,15 +1181,25 @@ impl PlaybackSessionManager {
     }
 
     /// Path where a given HLS segment lives on disk (used for disk-based recovery).
-    pub fn segment_path(&self, play_session_id: &str, segment_id: &str) -> PathBuf {
+    pub async fn segment_path(
+        &self,
+        play_session_id: &str,
+        segment_id: &str,
+    ) -> PathBuf {
         let session_dir = self
             .base_dir
             .join(play_session_id);
 
-        if let Ok(entries) = std::fs::read_dir(&session_dir) {
+        if let Ok(mut entries) = tokio::fs::read_dir(&session_dir).await {
             let mut latest_dir: Option<(PathBuf, std::time::SystemTime)> = None;
-            for entry in entries.flatten() {
-                if let Ok(metadata) = entry.metadata() {
+            while let Ok(Some(entry)) = entries
+                .next_entry()
+                .await
+            {
+                if let Ok(metadata) = entry
+                    .metadata()
+                    .await
+                {
                     if metadata.is_dir() {
                         let modified = metadata
                             .modified()
@@ -1119,6 +1233,38 @@ impl PlaybackSessionManager {
                     .clone()
             })
             .collect()
+    }
+
+    /// Server shutdown: refuse new transcodes, then stop every session,
+    /// giving up after 10 s.
+    pub async fn stop_all(&self) {
+        let ids = {
+            let mut closed = self
+                .handoff
+                .lock()
+                .expect("handoff lock is not poisoned");
+            *closed = true;
+            self.active_session_ids()
+        };
+        let stop = futures::future::join_all(
+            ids.iter()
+                .map(|id| self.stop(id)),
+        );
+        if tokio::time::timeout(Duration::from_secs(10), stop)
+            .await
+            .is_err()
+        {
+            warn!("timed out stopping playback sessions");
+        }
+    }
+
+    /// Undo `stop_all`'s refusal of new transcodes, for a process that keeps
+    /// serving after all (a restart that failed to spawn its successor).
+    pub fn reopen(&self) {
+        *self
+            .handoff
+            .lock()
+            .expect("handoff lock is not poisoned") = false;
     }
 
     /// Spawn a background task that reaps sessions idle longer than `max_age`.
@@ -1196,6 +1342,7 @@ async fn kill_transcode(ts: Arc<tokio::sync::RwLock<TranscodeSession>>) {
         let mut s = ts
             .write()
             .await;
+        s.stopped = true;
         (
             s.kill_tx
                 .take(),
@@ -1210,7 +1357,7 @@ async fn kill_transcode(ts: Arc<tokio::sync::RwLock<TranscodeSession>>) {
         let _ = kill_tx.send(());
         notification.await;
     }
-    let _ = std::fs::remove_dir_all(&output_dir);
+    let _ = tokio::fs::remove_dir_all(&output_dir).await;
 }
 
 /// Clamp a client-reported play method to what this user's permissions allow,
@@ -1237,14 +1384,14 @@ mod tests {
     #[test]
     fn ffmpeg_track_names_the_codec_the_client_receives() {
         assert_eq!(
-            FfmpegTrack::new("copy", Some("hevc")),
+            FfmpegTrack::new(&"copy".into(), Some("hevc")),
             FfmpegTrack {
                 codec: Some("hevc".to_string()),
                 copied: true,
             }
         );
         assert_eq!(
-            FfmpegTrack::new("h264", Some("hevc")),
+            FfmpegTrack::new(&"h264".into(), Some("hevc")),
             FfmpegTrack {
                 codec: Some("h264".to_string()),
                 copied: false,
@@ -1252,7 +1399,7 @@ mod tests {
         );
         // No source video: nothing to name, so clients see audio-only output.
         assert_eq!(
-            FfmpegTrack::new("copy", None),
+            FfmpegTrack::new(&"copy".into(), None),
             FfmpegTrack {
                 codec: None,
                 copied: true,
@@ -1260,8 +1407,8 @@ mod tests {
         );
         // A remux is still FFmpeg output, but its video is the source's.
         let remux = ServedPlayback::Ffmpeg {
-            video: FfmpegTrack::new("copy", Some("hevc")),
-            audio: FfmpegTrack::new("copy", Some("eac3")),
+            video: FfmpegTrack::new(&"copy".into(), Some("hevc")),
+            audio: FfmpegTrack::new(&"copy".into(), Some("eac3")),
         };
         assert_eq!(remux.play_method(), PlayMethod::Transcode);
         assert!(remux.video_copied());
@@ -1269,8 +1416,8 @@ mod tests {
 
     fn transcoded() -> ServedPlayback {
         ServedPlayback::Ffmpeg {
-            video: FfmpegTrack::new("h264", Some("hevc")),
-            audio: FfmpegTrack::new("aac", Some("dts")),
+            video: FfmpegTrack::new(&"h264".into(), Some("hevc")),
+            audio: FfmpegTrack::new(&"aac".into(), Some("dts")),
         }
     }
 

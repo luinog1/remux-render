@@ -49,14 +49,14 @@ jobs:
         uses: actions/cache@v4
         with:
           path: jellyfin-web/
-          key: jellyfin-web-v12.1
+          key: jellyfin-web-v12.4
 
       - name: Checkout jellyfin-web
         if: steps.cache.outputs.cache-hit != 'true'
         uses: actions/checkout@v4
         with:
           repository: jellyfin/jellyfin-web
-          ref: v12.1
+          ref: v12.4
 
       - name: Setup Node
         if: steps.cache.outputs.cache-hit != 'true'
@@ -254,7 +254,7 @@ jobs:
   build-desktop:
     if: inputs.desktop
     name: Build desktop (${{ matrix.target }})
-    needs: [build-dashboard, build-jellyfin-web]
+    needs: [build-dashboard, build-jellyfin-web, fetch-remux-web]
     runs-on: ${{ matrix.os }}
     env:
       SCCACHE_GHA_ENABLED: "true"
@@ -301,8 +301,13 @@ jobs:
           df -h /
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@master
         with:
+          # Windows stays on 1.99 for now: with Cargo 1.100's per-unit build
+          # dirs, sccache expands Cargo's @argfile into a rustc command line
+          # past Windows' 32K limit (os error 206). Back to stable once an
+          # sccache release fixes that.
+          toolchain: ${{ matrix.os == 'windows-latest' && '1.99' || 'stable' }}
           targets: ${{ matrix.target }}
 
       - name: Set up sccache
@@ -353,12 +358,19 @@ jobs:
           name: jellyfin-web-dist
           path: jellyfin-web/
 
+      - name: Download remux-web artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: remux-web-dist
+          path: remux-web/
+
       - name: Bundle remux-desktop (Linux / macOS)
         if: runner.os != 'Windows'
         env:
           SQLX_OFFLINE: "true"
           DASHBOARD_PATH: ${{ github.workspace }}/target/dx/remux-dashboard/release/web/public
           WEB_PATH: ${{ github.workspace }}/jellyfin-web
+          REMUX_WEB_PATH: ${{ github.workspace }}/remux-web
         run: cargo bundle --release --target ${{ matrix.target }} -p remux-desktop
 
       - name: Build remux-desktop (Windows)
@@ -367,6 +379,7 @@ jobs:
           SQLX_OFFLINE: "true"
           DASHBOARD_PATH: ${{ github.workspace }}/target/dx/remux-dashboard/release/web/public
           WEB_PATH: ${{ github.workspace }}/jellyfin-web
+          REMUX_WEB_PATH: ${{ github.workspace }}/remux-web
         run: cargo build --release --target ${{ matrix.target }} -p remux-desktop
 
       - name: Sign and package bundle (macOS .dmg)
@@ -378,7 +391,7 @@ jobs:
           df -h /
           # The dashboard and jellyfin-web are already embedded in the binary at
           # compile time; drop the downloaded copies so hdiutil has headroom.
-          rm -rf jellyfin-web
+          rm -rf jellyfin-web remux-web
           rm -rf target/dx/remux-dashboard/release/web/public
           # Cargo incremental artifacts are dead weight after a successful link.
           rm -rf target/${{ matrix.target }}/release/incremental

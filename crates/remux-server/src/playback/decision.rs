@@ -1,8 +1,7 @@
 use crate::{
     api, db,
-    device_profile::{
-        DeviceProfileExt, SubtitleCodec, VideoCodec, subtitle_codec_matches_profile,
-    },
+    device_profile::{DeviceProfileExt, SubtitleCodec, VideoCodec},
+    playback::codec::CodecTarget,
 };
 use remux_sdks::remux::{
     DlnaProfileType, EmbeddedSubtitleHandling, EncodingOptions, PlayMethod,
@@ -69,25 +68,25 @@ impl PlaybackPermissions {
         subtitle_burn_requested: bool,
     ) -> ResolvedPlaybackCodecs {
         let burn_subtitle = subtitle_burn_requested && self.video_transcoding;
+        let requested_video = CodecTarget::from(requested_video);
+        let requested_audio = CodecTarget::from(requested_audio);
         let video = if burn_subtitle
-            || (!codec_is_copy(requested_video) && self.video_transcoding)
+            || (!requested_video.is_copy() && self.video_transcoding)
         {
-            "h264"
+            CodecTarget::Transcode("h264".into())
         } else {
-            "copy"
-        }
-        .to_string();
-        let audio = if codec_is_copy(requested_audio) || !self.audio_transcoding {
-            "copy".to_string()
+            CodecTarget::Copy
+        };
+        let audio = if self.audio_transcoding {
+            requested_audio
         } else {
-            requested_audio.to_string()
+            CodecTarget::Copy
         };
         // Re-encoding audio into the codec it already has, without reshaping
-        // it, is a pure remux in effect; the codec string above is left alone
-        // so a genuine AAC downmix still reaches FFmpeg when remuxing is on.
-        let direct_play_only = codec_is_copy(&video)
-            && (codec_is_copy(&audio) || audio_passthrough)
-            && !self.remuxing;
+        // it, is a pure remux in effect; the codec above is left alone so a
+        // genuine AAC downmix still reaches FFmpeg when remuxing is on.
+        let direct_play_only =
+            video.is_copy() && (audio.is_copy() || audio_passthrough) && !self.remuxing;
 
         ResolvedPlaybackCodecs {
             video,
@@ -118,8 +117,8 @@ impl PlaybackPermissions {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ResolvedPlaybackCodecs {
-    pub video: String,
-    pub audio: String,
+    pub video: CodecTarget,
+    pub audio: CodecTarget,
     pub direct_play_only: bool,
     pub burn_subtitle: bool,
 }
@@ -137,8 +136,7 @@ pub(crate) fn selected_audio_stream(
                 .media_streams
                 .iter()
                 .find(|s| {
-                    s.index == index
-                        && matches!(s.type_, Some(api::MediaStreamType::Audio))
+                    s.index == index && matches!(s.type_, api::MediaStreamType::Audio)
                 })
         })
         .or_else(|| source.audio_stream())
@@ -165,10 +163,6 @@ pub(crate) fn audio_is_passthrough(
     requested_codec.eq_ignore_ascii_case(source_codec)
         && !exceeds(max_channels, source_channels)
         && !exceeds(max_bitrate, source_bitrate)
-}
-
-fn codec_is_copy(codec: &str) -> bool {
-    codec.eq_ignore_ascii_case("copy")
 }
 
 /// Per-request config shared across all streams in the playback loop.
@@ -373,7 +367,7 @@ fn build_video_transcode(
     // Jellyfin Web advertises both fMP4 and MPEG-TS HLS profiles. Jellyfin
     // selects TS for live H.264; match the profile to our HLS output, which
     // is TS except when copying HEVC as fMP4/CMAF.
-    let is_hevc_copy = video_codec == "copy"
+    let is_hevc_copy = video_codec.is_copy()
         && source
             .video_stream()
             .and_then(|s| {
@@ -450,8 +444,8 @@ fn build_video_transcode(
         reasons.contains(&api::TranscodeReason::StreamCountExceedsLimit(String::new()));
     let container_not_playable =
         reasons.contains(&api::TranscodeReason::ContainerNotSupported(String::new()));
-    if video_codec == "copy"
-        && audio_codec == "copy"
+    if video_codec.is_copy()
+        && audio_codec.is_copy()
         && !needs_hevc_retag
         && !needs_stream_filter
         && !container_not_playable
@@ -486,6 +480,13 @@ fn build_video_transcode(
     let sub_method = subtitle_method
         .map(|m| format!("&SubtitleMethod={m}"))
         .unwrap_or_default();
+    // The HLS request carries no PlaybackInfo body, so a channel cap the
+    // client asked for there has to travel on the URL.
+    let max_channels = q
+        .max_audio_channels
+        .filter(|&c| c > 0)
+        .map(|c| format!("&TranscodingMaxAudioChannels={c}"))
+        .unwrap_or_default();
     let start_time = q
         .start_time_ticks
         .map(|t| format!("&StartTimeTicks={t}"))
@@ -504,7 +505,7 @@ fn build_video_transcode(
 
     let url = if protocol.eq_ignore_ascii_case("hls") {
         format!(
-            "/videos/{}/master.m3u8?PlaySessionId={}&MediaSourceId={}&VideoCodec={}&AudioCodec={}{}{}{}{}{}{}{}&ApiKey={}",
+            "/videos/{}/master.m3u8?PlaySessionId={}&MediaSourceId={}&VideoCodec={}&AudioCodec={}{}{}{}{}{}{}{}{}&ApiKey={}",
             cfg.item_id,
             cfg.play_session_id,
             source.id,
@@ -516,6 +517,7 @@ fn build_video_transcode(
             sub_idx,
             sub_method,
             start_time,
+            max_channels,
             video_codec_tag,
             session
                 .device
@@ -524,7 +526,7 @@ fn build_video_transcode(
         )
     } else {
         format!(
-            "/videos/{}/stream.{}?PlaySessionId={}&MediaSourceId={}&VideoCodec={}&AudioCodec={}{}{}{}{}{}{}{}&ApiKey={}",
+            "/videos/{}/stream.{}?PlaySessionId={}&MediaSourceId={}&VideoCodec={}&AudioCodec={}{}{}{}{}{}{}{}{}&ApiKey={}",
             cfg.item_id,
             container,
             cfg.play_session_id,
@@ -537,6 +539,7 @@ fn build_video_transcode(
             sub_idx,
             sub_method,
             start_time,
+            max_channels,
             video_codec_tag,
             session
                 .device
@@ -565,8 +568,7 @@ fn subtitle_burn_method(
             .media_streams
             .iter()
             .find(|s| {
-                s.index == idx
-                    && matches!(s.type_, Some(api::MediaStreamType::Subtitle))
+                s.index == idx && matches!(s.type_, api::MediaStreamType::Subtitle)
             })
     })?;
 
@@ -613,7 +615,7 @@ pub(crate) fn apply_subtitle_delivery(
         .media_streams
         .iter_mut()
     {
-        if stream.type_ != Some(api::MediaStreamType::Subtitle) {
+        if stream.type_ != api::MediaStreamType::Subtitle {
             continue;
         }
         let codec = stream
@@ -660,7 +662,6 @@ pub(crate) fn apply_subtitle_delivery(
             ));
             stream.delivery_method = Some(api::SubtitleDeliveryMethod::External);
             stream.is_external_url = Some(false);
-            stream.is_external = false;
         };
         if stream.is_external {
             // Already an external URL — no extraction involved, feasibility
@@ -710,6 +711,25 @@ pub(crate) fn apply_subtitle_delivery(
         // delivery method rather than an External URL that would just fail
         // when fetched.
     }
+
+    // Container attachments (MKV fonts for ASS/SSA): jellyfin-web loads every
+    // font one into its libass renderer. They're read from the source like an
+    // embedded subtitle, so they're only offered when that's allowed —
+    // otherwise drop them rather than advertise URLs that would 404. Always
+    // sent as a list, like Jellyfin.
+    let attachments = source
+        .media_attachments
+        .get_or_insert_default();
+    if allow_extraction {
+        for attachment in attachments.iter_mut() {
+            let index = attachment.index;
+            attachment.delivery_url = Some(format!(
+                "/Videos/{item_id}/{source_id}/Attachments/{index}?ApiKey={access_token}",
+            ));
+        }
+    } else {
+        attachments.clear();
+    }
 }
 
 #[cfg(test)]
@@ -735,7 +755,7 @@ mod tests {
             id: Uuid::new_v4(),
             media_streams: vec![api::MediaStream {
                 codec: Some("flac".to_string()),
-                type_: Some(api::MediaStreamType::Audio),
+                type_: api::MediaStreamType::Audio,
                 index: 0,
                 ..Default::default()
             }],
@@ -785,13 +805,13 @@ mod tests {
             media_streams: vec![
                 api::MediaStream {
                     codec: Some("h264".to_string()),
-                    type_: Some(api::MediaStreamType::Video),
+                    type_: api::MediaStreamType::Video,
                     index: 0,
                     ..Default::default()
                 },
                 api::MediaStream {
                     codec: Some("aac".to_string()),
-                    type_: Some(api::MediaStreamType::Audio),
+                    type_: api::MediaStreamType::Audio,
                     index: 1,
                     ..Default::default()
                 },
@@ -939,8 +959,8 @@ mod tests {
 
         let codecs = permissions.resolve_codecs("h264", "aac", false, false);
 
-        assert_eq!(codecs.video, "copy");
-        assert_eq!(codecs.audio, "copy");
+        assert_eq!(codecs.video, CodecTarget::from("copy"));
+        assert_eq!(codecs.audio, CodecTarget::from("copy"));
         assert!(codecs.direct_play_only);
         assert!(!permissions.processing_available());
     }
@@ -963,7 +983,7 @@ mod tests {
         assert!(passthrough);
         let codecs = permissions.resolve_codecs("copy", "aac", passthrough, false);
         assert!(codecs.direct_play_only);
-        assert_eq!(codecs.audio, "aac");
+        assert_eq!(codecs.audio, CodecTarget::from("aac"));
 
         let downmix =
             audio_is_passthrough("aac", Some("aac"), Some(6), None, Some(2), None);
@@ -995,7 +1015,7 @@ mod tests {
     #[test]
     fn selected_audio_stream_follows_the_requested_index() {
         let audio = |index, codec: &str| api::MediaStream {
-            type_: Some(api::MediaStreamType::Audio),
+            type_: api::MediaStreamType::Audio,
             index,
             codec: Some(codec.to_string()),
             ..Default::default()
@@ -1031,13 +1051,13 @@ mod tests {
 
         for permissions in [globally_disabled, user_disabled] {
             let codecs = permissions.resolve_codecs("copy", "copy", false, true);
-            assert_eq!(codecs.video, "copy");
+            assert_eq!(codecs.video, CodecTarget::from("copy"));
             assert!(!codecs.burn_subtitle);
         }
 
         let allowed = PlaybackPermissions::for_user(&EncodingOptions::default(), None)
             .resolve_codecs("copy", "copy", false, true);
-        assert_eq!(allowed.video, "h264");
+        assert_eq!(allowed.video, CodecTarget::from("h264"));
         assert!(allowed.burn_subtitle);
     }
 
@@ -1239,6 +1259,34 @@ mod tests {
     }
 
     #[test]
+    fn requested_channel_cap_is_carried_on_the_transcoding_url() {
+        let session =
+            make_session_with_policy(remux_sdks::remux::UserPolicy::default());
+        let source = make_video_source(VideoContainer::Mkv);
+        let mut q = force_transcode_query();
+        q.device_profile = Some(api::DeviceProfile::default());
+        q.max_audio_channels = Some(2);
+        let TranscodeDecision::Transcode(outcome) = build_transcode_decision(
+            &source,
+            &api::TranscodeReasons::default(),
+            None,
+            &q,
+            &session,
+            &base_cfg(EncodingOptions::default()),
+            true,
+        ) else {
+            panic!("expected a transcode");
+        };
+        assert!(
+            outcome
+                .url
+                .contains("&TranscodingMaxAudioChannels=2"),
+            "{}",
+            outcome.url
+        );
+    }
+
+    #[test]
     fn hevc_copy_url_carries_the_resolved_sample_entry_tag() {
         let url = hevc_copy_outcome("hevc", Some("hev1")).url;
         assert!(url.contains("&VideoCodecTag=hev1"), "{url}");
@@ -1325,7 +1373,7 @@ mod tests {
         let mut source = make_video_source(VideoContainer::Mkv);
         let stream = |codec: &str, type_, index| api::MediaStream {
             codec: Some(codec.to_string()),
-            type_: Some(type_),
+            type_,
             index,
             ..Default::default()
         };
@@ -1374,19 +1422,19 @@ mod tests {
         source.media_streams = vec![
             api::MediaStream {
                 codec: Some("h264".to_string()),
-                type_: Some(api::MediaStreamType::Video),
+                type_: api::MediaStreamType::Video,
                 index: 0,
                 ..Default::default()
             },
             api::MediaStream {
                 codec: Some("aac".to_string()),
-                type_: Some(api::MediaStreamType::Audio),
+                type_: api::MediaStreamType::Audio,
                 index: 1,
                 ..Default::default()
             },
             api::MediaStream {
                 codec: Some("hdmv_pgs_subtitle".to_string()),
-                type_: Some(api::MediaStreamType::Subtitle),
+                type_: api::MediaStreamType::Subtitle,
                 index: 2,
                 ..Default::default()
             },
@@ -1467,14 +1515,14 @@ mod tests {
             media_streams: vec![
                 api::MediaStream {
                     codec: Some(text_codec.to_string()),
-                    type_: Some(api::MediaStreamType::Subtitle),
+                    type_: api::MediaStreamType::Subtitle,
                     is_text_subtitle_stream: true,
                     index: 0,
                     ..Default::default()
                 },
                 api::MediaStream {
                     codec: Some(image_codec.to_string()),
-                    type_: Some(api::MediaStreamType::Subtitle),
+                    type_: api::MediaStreamType::Subtitle,
                     is_text_subtitle_stream: false,
                     index: 1,
                     ..Default::default()
@@ -1625,6 +1673,10 @@ mod tests {
                 .unwrap_or_default()
                 .contains("ApiKey=real-token"),
             "external stream should still carry a working delivery URL"
+        );
+        assert!(
+            text.is_external,
+            "a subtitle file stays external, as Jellyfin reports it"
         );
     }
 }

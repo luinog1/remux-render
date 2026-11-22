@@ -4,8 +4,8 @@ mod ffmpeg;
 
 use anyhow::Result;
 use std::{
-    path::{Path, PathBuf},
-    time::{Duration, SystemTime},
+    path::PathBuf,
+    sync::{Arc, OnceLock},
 };
 use tao::event_loop::{ControlFlow, EventLoop};
 use tray_icon::{
@@ -19,14 +19,13 @@ include!(concat!(env!("OUT_DIR"), "/dashboard_embed.rs"));
 #[cfg(jellyfin_web_built)]
 include!(concat!(env!("OUT_DIR"), "/jellyfin_web_embed.rs"));
 
+#[cfg(remux_web_built)]
+include!(concat!(env!("OUT_DIR"), "/remux_web_embed.rs"));
+
 fn data_dir() -> PathBuf {
     dirs::data_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join("remux")
-}
-
-fn log_dir() -> PathBuf {
-    data_dir().join("logs")
 }
 
 fn server_url(config: &remux_server::Config) -> String {
@@ -56,56 +55,53 @@ fn ensure_data_dirs(config: &remux_server::Config) -> Result<()> {
     Ok(())
 }
 
-fn cleanup_old_logs(dir: &Path) {
-    let cutoff = SystemTime::now()
-        .checked_sub(Duration::from_secs(5 * 24 * 3600))
-        .unwrap_or(SystemTime::UNIX_EPOCH);
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let name = entry
-            .file_name()
-            .to_string_lossy()
-            .into_owned();
-        if name.starts_with("remux-") && name.ends_with(".log") {
-            if let Ok(meta) = entry.metadata() {
-                if meta
-                    .modified()
-                    .map(|t| t < cutoff)
-                    .unwrap_or(false)
-                {
-                    let _ = std::fs::remove_file(entry.path());
-                }
-            }
-        }
-    }
-}
-
 fn main() -> Result<()> {
-    let log_dir = log_dir();
-    std::fs::create_dir_all(&log_dir)?;
-    cleanup_old_logs(&log_dir);
-
     let mut config = remux_server::load_config_from_env()?;
     config.data_dir = data_dir();
     let config = config.resolve();
+    let log_dir = remux_server::logging::prepare_log_dir(
+        config.log_file_enabled,
+        config
+            .log_dir
+            .as_deref(),
+    );
     remux_server::setup_logging(
-        Some(&log_dir),
+        log_dir.as_deref(),
+        config.log_file_max_files,
         config
             .otlp_endpoint
             .as_deref(),
     );
+    if let Some(log_dir) = &log_dir {
+        remux_server::logging::cleanup_old_logs(
+            log_dir,
+            config.log_file_retention_days,
+        );
+    }
     ensure_data_dirs(&config)?;
 
     // Start the remux server in a background tokio thread with embedded assets.
     let rt = tokio::runtime::Runtime::new()?;
+    let rt_handle = rt
+        .handle()
+        .clone();
+    // Filled once the server is up, so Quit can shut it down.
+    let app: Arc<OnceLock<remux_server::AppContext>> = Arc::new(OnceLock::new());
+    let server_app = app.clone();
     let server_config = config.clone();
+    let cleanup_dir = log_dir.clone();
+    let cleanup_retention = config.log_file_retention_days;
     let data_dir_for_ffmpeg = config
         .data_dir
         .clone();
     std::thread::spawn(move || {
         rt.block_on(async move {
+            if let Some(log_dir) = cleanup_dir {
+                remux_server::logging::start_periodic_cleanup(
+                    log_dir,
+                    cleanup_retention,
+                );
+            }
             if let Err(e) = ffmpeg::ensure_ffmpeg(&data_dir_for_ffmpeg).await {
                 tracing::warn!(
                     "ffmpeg could not be downloaded and was not found on this system: {e:#}. \
@@ -114,7 +110,7 @@ fn main() -> Result<()> {
                      environment variable."
                 );
             }
-            if let Err(e) = serve(server_config).await {
+            if let Err(e) = serve(server_config, &server_app).await {
                 tracing::error!("server error: {e:#}");
             }
         });
@@ -135,7 +131,7 @@ fn main() -> Result<()> {
     };
 
     let open_item = MenuItem::new("Open", true, None);
-    let logs_item = MenuItem::new("Logs", true, None);
+    let logs_item = MenuItem::new("Logs", log_dir.is_some(), None);
     let quit_item = MenuItem::new("Quit", true, None);
     let open_id = open_item
         .id()
@@ -172,16 +168,25 @@ fn main() -> Result<()> {
                 tracing::info!("opening {url}");
                 let _ = open::that(&url);
             } else if ev.id == logs_id {
-                let _ = open::that(&log_dir);
+                if let Some(log_dir) = &log_dir {
+                    let _ = open::that(log_dir);
+                }
             } else if ev.id == quit_id {
                 tracing::info!("quit");
+                // Exiting runs no destructors: ffmpeg would outlive the app.
+                if let Some(ctx) = app.get() {
+                    rt_handle.block_on(ctx.shutdown());
+                }
                 *control_flow = ControlFlow::Exit;
             }
         }
     });
 }
 
-async fn serve(config: remux_server::Config) -> anyhow::Result<()> {
+async fn serve(
+    config: remux_server::Config,
+    app: &OnceLock<remux_server::AppContext>,
+) -> anyhow::Result<()> {
     #[cfg(dashboard_built)]
     let admin = remux_server::embedded_static::EmbeddedDir {
         dir: &DASHBOARD,
@@ -190,25 +195,37 @@ async fn serve(config: remux_server::Config) -> anyhow::Result<()> {
     .into_admin_service();
 
     #[cfg(not(dashboard_built))]
-    let admin = {
-        let paths = remux_server::FilesystemPaths::load_from_env();
-        remux_server::admin_from_filesystem(&paths.dashboard_path)
-    };
+    let admin = remux_server::admin_from_filesystem(
+        &config
+            .paths
+            .dashboard_path,
+    );
 
     let addr = std::net::SocketAddr::new(config.host, config.port);
-    let (router, _) = remux_server::init_app(config, None, admin, |pool| {
-        #[cfg(jellyfin_web_built)]
-        {
-            remux_server::WebClientService::from_embedded(&JELLYFIN_WEB, pool)
-        }
+    #[cfg(not(jellyfin_web_built))]
+    let web_path = config
+        .paths
+        .web_path
+        .clone();
+    #[cfg(remux_web_built)]
+    let remux_web = Some(remux_server::RemuxWeb::from_embedded(&REMUX_WEB));
+    #[cfg(not(remux_web_built))]
+    let remux_web = None;
 
-        #[cfg(not(jellyfin_web_built))]
-        {
-            let paths = remux_server::FilesystemPaths::load_from_env();
-            remux_server::WebClientService::from_filesystem(&paths.web_path, pool)
-        }
-    })
-    .await?;
+    let (router, ctx) =
+        remux_server::init_app(config, None, admin, remux_web, |pool| {
+            #[cfg(jellyfin_web_built)]
+            {
+                remux_server::WebClientService::from_embedded(&JELLYFIN_WEB, pool)
+            }
+
+            #[cfg(not(jellyfin_web_built))]
+            {
+                remux_server::WebClientService::from_filesystem(&web_path, pool)
+            }
+        })
+        .await?;
+    let _ = app.set(ctx);
     remux_server::bind_and_serve(router, addr).await
 }
 

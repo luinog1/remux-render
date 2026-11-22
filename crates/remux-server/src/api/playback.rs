@@ -1,11 +1,13 @@
+use crate::ids::UserId;
 use anyhow::anyhow;
 use axum::Json;
 
 use super::subtitles::{
     SidecarSubtitleRoute, SubtitleDedupSettings, append_external_subtitles,
     drop_unsupported_embedded_subtitles_with_external_match,
-    filter_external_subtitles_for_source, inject_sidecar_subtitles, provider_filename,
-    save_sidecar_subtitle_routes,
+    filter_external_subtitles_for_source, inject_sidecar_subtitles, local_sidecars,
+    provider_filename, push_local_sidecars, save_sidecar_subtitle_routes,
+    sidecar_block_start, without_sidecars,
 };
 use axum::{
     body::Body,
@@ -13,36 +15,26 @@ use axum::{
     response::IntoResponse,
 };
 use axum_extra::extract::Query;
-use chrono::Utc;
-use futures_util::{StreamExt, TryStreamExt};
 use headers;
 use http::{Response, StatusCode};
-use remux_macros::{delete, get, post, query};
-use remux_sdks::remux::{PlayMethod, VideoContainer};
-use remux_utils::Store;
-use serde::Deserialize;
-use serde_json::json;
-use serde_with::{DurationSeconds, serde_as};
-use std::{io, time::Duration};
-use tokio_util::io::ReaderStream;
+use remux_macros::{get, post, query};
+use remux_sdks::remux::VideoContainer;
+use std::io;
 use tracing::{debug, error, info, trace, warn};
-use url::Url;
 use uuid::Uuid;
 
 use crate::{
-    AppState, api,
-    api::MediaSourceInfoExt,
-    common,
+    AppState, api, common,
     common::{TickUnit, ToRunTimeTicks},
     db,
     db::auth,
-    playback::hw_accel,
+    playback::{codec::CodecTarget, hw_accel},
     playback_session::{FfmpegTrack, ServedPlayback},
 };
 
 use crate::{
-    IntoApiError, OptionExt, ResultExt,
-    device_profile::{DeviceProfileExt, SourceRankingContext, SubtitleCodec},
+    IntoApiError, OptionExt,
+    device_profile::SourceRankingContext,
     errors::LogErr,
     playback::{
         decision::{
@@ -51,11 +43,8 @@ use crate::{
             selected_audio_stream,
         },
         engine::ProgressiveFormat,
-        session::{TranscodeSession, TranscodeState},
     },
-    sdks,
     services::{MediaResolveService, ProbeResult, StreamService, StreamServiceConfig},
-    torrent,
 };
 use axum_anyhow::ApiResult as Result;
 
@@ -166,14 +155,20 @@ async fn load_saved_selections(
     db: &sqlx::SqlitePool,
     user_id: &uuid::Uuid,
     media_id: &uuid::Uuid,
-) -> (Option<i64>, Option<i64>) {
+) -> (
+    Option<i64>,
+    Option<i64>,
+    remux_sdks::remux::RememberedLanguages,
+) {
     let media = crate::db::Media::get_by_id(db, media_id)
         .await
         .ok()
         .flatten();
     let Some(media) = media else {
-        return (None, None);
+        return (None, None, Default::default());
     };
+    let mut languages =
+        crate::db::UserMediaState::remembered_languages(db, user_id, &media.id).await;
     match sqlx::query_as::<_, crate::db::UserMediaState>(
         "SELECT * FROM user_media_state WHERE user_id = ?1 AND media_id = ?2",
     )
@@ -182,8 +177,12 @@ async fn load_saved_selections(
     .fetch_optional(db)
     .await
     {
-        Ok(Some(state)) => (state.audio_idx, state.subtitle_idx),
-        _ => (None, None),
+        Ok(Some(state)) => {
+            let (audio, subtitle, source) = state.remembered_indexes();
+            languages.indexes_source = source;
+            (audio, subtitle, languages)
+        }
+        _ => (None, None, languages),
     }
 }
 
@@ -216,6 +215,29 @@ async fn items_playbackinfo_inner(
     id: Uuid,
     mut q: api::PlaybackInfoQuery,
 ) -> Result<impl IntoResponse> {
+    let (id, media_source_id) = StreamService::version_target(
+        &state.ctx,
+        Some(UserId(
+            session
+                .user
+                .id,
+        )),
+        id,
+        q.media_source_id,
+    )
+    .await;
+    q.media_source_id = media_source_id;
+    if let Some(running) = StreamService::running_release(
+        &state.ctx,
+        &session
+            .device
+            .id,
+        id,
+        q.media_source_id,
+    ) {
+        debug!(%running, "PlaybackInfo stays on the release being played");
+        q.media_source_id = Some(running);
+    }
     let media_source_id = q.media_source_id;
 
     trace!(?id, ?q, "items_playbackinfo");
@@ -354,7 +376,11 @@ async fn items_playbackinfo_inner(
                 .id,
         ),
     });
-    let is_live = media.is_live();
+    // A pinned or picked stream is a child of the channel: the channel decides.
+    let is_live = media.is_live()
+        || title
+            .as_ref()
+            .is_some_and(|item| item.is_live());
 
     // A live channel's source is often an addon relay URL. It may be a valid
     // HLS stream, but browsers cannot reliably open it directly: redirects,
@@ -419,15 +445,22 @@ async fn items_playbackinfo_inner(
     // `sort_device_profile` (fresh-with-persisted-fallback) so this ranking
     // pass's own bitrate cap is consistent with the resolution/codec
     // judgments it's already making from that same profile.
-    let sort_max_bitrate: Option<i64> = match (
+    // MaxStaticBitrate joins in here only: it picks the version, while
+    // `max_bitrate` above stays what the client asked to transcode that
+    // version to.
+    let sort_max_bitrate: Option<i64> = [
         q.max_streaming_bitrate,
         sort_device_profile
             .as_ref()
             .and_then(|p| p.max_streaming_bitrate),
-    ) {
-        (Some(a), Some(b)) => Some(a.min(b)),
-        (a, b) => a.or(b),
-    };
+        sort_device_profile
+            .as_ref()
+            .and_then(|p| p.max_static_bitrate)
+            .filter(|b| *b > 0),
+    ]
+    .into_iter()
+    .flatten()
+    .min();
     let ranking = (sort_mode != remux_sdks::remux::SortMediaSourcesMode::Disabled)
         .then(|| SourceRankingContext {
             mode: sort_mode,
@@ -456,7 +489,7 @@ async fn items_playbackinfo_inner(
     let server_subtitle_lang = probe_cfg
         .preferred_metadata_language
         .as_deref();
-    let (saved_audio, saved_subtitle) = load_saved_selections(
+    let (saved_audio, saved_subtitle, saved_languages) = load_saved_selections(
         &state
             .ctx
             .db,
@@ -479,6 +512,7 @@ async fn items_playbackinfo_inner(
         requested_subtitle: q.subtitle_stream_index,
         remembered_audio: saved_audio,
         remembered_subtitle: saved_subtitle,
+        remembered_languages: &saved_languages,
     };
 
     let port = state
@@ -496,7 +530,7 @@ async fn items_playbackinfo_inner(
     let (probed, subtitle_media) = tokio::join!(
         async {
             service
-                .load(media)
+                .load(media, ranking, ranking_prefs)
                 .await?;
             service
                 .probe_candidates(ranking, ranking_prefs)
@@ -520,6 +554,26 @@ async fn items_playbackinfo_inner(
         }
     );
     let probed = probed?;
+    // The files next to the video, numbered as a block right after each
+    // source's own streams, the same way the item lists them.
+    let local_subtitles = match subtitle_media.clone() {
+        Some(mut item) => {
+            state
+                .ctx
+                .addons
+                .fetch_local_subtitles(
+                    &mut item,
+                    &state.ctx,
+                    Some(
+                        session
+                            .user
+                            .id,
+                    ),
+                )
+                .await
+        }
+        None => Vec::new(),
+    };
     let item_runtime_seconds = subtitle_media
         .as_ref()
         .and_then(|item| item.runtime);
@@ -565,6 +619,8 @@ async fn items_playbackinfo_inner(
         external_subtitles,
     } in probed.results
     {
+        // Before any stream is dropped for the device, as the item does.
+        let sidecar_start = sidecar_block_start(&source);
         // Metadata-only torrent probes may not know the container duration yet.
         // Keep the authoritative Movie/Episode duration in PlaybackInfo so
         // clients do not treat a normal VOD source as an indefinite stream.
@@ -612,11 +668,38 @@ async fn items_playbackinfo_inner(
             );
         }
 
+        let external_subtitles = match sidecar_start {
+            Some(start) => {
+                let sidecars = local_sidecars(
+                    &local_subtitles,
+                    effective_stream
+                        .stream_info
+                        .as_ref()
+                        .and_then(|info| {
+                            info.filename
+                                .as_deref()
+                        }),
+                );
+                push_local_sidecars(
+                    &mut source,
+                    start,
+                    &sidecars,
+                    id,
+                    session
+                        .device
+                        .access_token
+                        .expose(),
+                );
+                without_sidecars(&external_subtitles, &sidecars)
+            }
+            None => external_subtitles,
+        };
+
         // Resolve default audio/subtitle stream indexes for this source. These are
         // per-request API values (never persisted); resolving before the transcode
         // decision and subtitle delivery means those consumers see the stream the
         // client will actually get.
-        source.resolve_default_streams(
+        source.resolve_default_streams_remembering(
             &user_cfg,
             server_subtitle_lang,
             original_language.as_deref(),
@@ -624,6 +707,7 @@ async fn items_playbackinfo_inner(
             q.subtitle_stream_index,
             saved_audio,
             saved_subtitle,
+            &saved_languages,
         );
         let effective_sub_idx = q
             .subtitle_stream_index
@@ -774,7 +858,7 @@ async fn items_playbackinfo_inner(
                 .iter()
                 .find(|s| {
                     s.index == index
-                        && s.type_ == Some(api::MediaStreamType::Subtitle)
+                        && s.type_ == api::MediaStreamType::Subtitle
                         && s.delivery_method
                             == Some(api::SubtitleDeliveryMethod::External)
                 })
@@ -798,7 +882,7 @@ async fn items_playbackinfo_inner(
                 .iter()
                 .any(|s| {
                     s.index == index
-                        && s.type_ == Some(api::MediaStreamType::Subtitle)
+                        && s.type_ == api::MediaStreamType::Subtitle
                         && !s.is_external
                         && s.is_text_subtitle_stream()
                 })
@@ -832,7 +916,7 @@ async fn items_playbackinfo_inner(
             if let Some(video) = source
                 .media_streams
                 .iter_mut()
-                .find(|s| matches!(s.type_, Some(api::MediaStreamType::Video)))
+                .find(|s| matches!(s.type_, api::MediaStreamType::Video))
             {
                 crate::device_profile::annotate_video_display_title(
                     video,
@@ -844,7 +928,7 @@ async fn items_playbackinfo_inner(
 
         // Recompute from codec — never trust the stored DB value (may be stale).
         for s in &mut source.media_streams {
-            if matches!(s.type_, Some(api::MediaStreamType::Subtitle)) {
+            if matches!(s.type_, api::MediaStreamType::Subtitle) {
                 s.is_text_subtitle_stream = s.is_text_subtitle_stream();
             }
         }
@@ -887,7 +971,7 @@ async fn items_playbackinfo_inner(
     // matching can also pick addon subtitles (same request context as the
     // per-source resolve inside the probe loop).
     for source in &mut media_sources {
-        source.resolve_default_streams(
+        source.resolve_default_streams_remembering(
             &user_cfg,
             server_subtitle_lang,
             original_language.as_deref(),
@@ -895,6 +979,7 @@ async fn items_playbackinfo_inner(
             q.subtitle_stream_index,
             saved_audio,
             saved_subtitle,
+            &saved_languages,
         );
     }
 
@@ -910,6 +995,13 @@ async fn items_playbackinfo_inner(
     } else {
         0
     };
+    if let Some(source) = media_sources.get(selected_idx) {
+        StreamService::save_advertised_tracks(
+            &state.ctx,
+            &play_session_id,
+            &source.media_streams,
+        );
+    }
     if let Some(extras) = source_extras.get(selected_idx) {
         service.save_selected_stream(
             &play_session_id,
@@ -1036,7 +1128,7 @@ async fn items_playbackinfo_inner(
         }
     }
 
-    let error_code = if media_sources.is_empty() {
+    let _error_code = if media_sources.is_empty() {
         media_sources.push(api::MediaSourceInfo {
             id,
             e_tag: id,
@@ -1053,9 +1145,9 @@ async fn items_playbackinfo_inner(
             formats: Some(vec![]),
             required_http_headers: Some(std::collections::HashMap::new()),
             media_streams: vec![api::MediaStream {
-                type_: Some(api::MediaStreamType::Video),
+                type_: api::MediaStreamType::Video,
                 codec: Some("h264".to_string()),
-                is_default: Some(true),
+                is_default: true,
                 index: 0,
                 width: Some(640),
                 height: Some(360),
@@ -1071,7 +1163,7 @@ async fn items_playbackinfo_inner(
     if session
         .device
         .is_4k_capable
-        != Some(true)
+        .is_none()
     {
         crate::services::four_k_capability::remember_sources(
             &state.ctx,
@@ -1280,36 +1372,6 @@ pub async fn videos_stream_by_container(
     videos_stream_inner(headers, state, user_id, device_id, id, q).await
 }
 
-fn ext_from_descriptor(descriptor: &crate::stream::StreamDescriptor) -> String {
-    match descriptor {
-        crate::stream::StreamDescriptor::Local(path) => path
-            .extension()
-            .and_then(|e| e.to_str())
-            .unwrap_or("mkv")
-            .to_string(),
-        crate::stream::StreamDescriptor::Http { url, .. }
-        | crate::stream::StreamDescriptor::Rtsp { url } => url
-            .split('?')
-            .next()
-            .unwrap_or(url.as_str())
-            .rsplit('.')
-            .next()
-            .filter(|e| !e.is_empty() && e.len() <= 5)
-            .unwrap_or("mkv")
-            .to_string(),
-        crate::stream::StreamDescriptor::Torrent { file_hint, .. } => file_hint
-            .as_deref()
-            .and_then(|h| {
-                std::path::Path::new(h)
-                    .extension()
-                    .and_then(|e| e.to_str())
-            })
-            .unwrap_or("mkv")
-            .to_string(),
-        _ => "mkv".to_string(),
-    }
-}
-
 /// A Matroska source can be served unchanged when the requested output is
 /// Matroska. `stream.mkv` callers commonly omit `AudioCodec`; unlike the
 /// progressive endpoint's FFmpeg default, that does not itself request an
@@ -1365,15 +1427,24 @@ async fn videos_stream_inner(
     // ID, group ID, or original stream ID even after probe fallback;
     // resolving that ID directly would serve a different stream than the
     // one whose media info the client was given.
+    // A version held as the item id maps back to its owner first, so the saved
+    // selection is looked up under the same key PlaybackInfo stored it with.
+    let (id, media_source_id) = StreamService::version_target(
+        &state.ctx,
+        user_id.map(UserId),
+        id,
+        q.media_source_id,
+    )
+    .await;
     let selected = StreamService::selected_stream_id(
         &state.ctx,
         device_id.as_deref(),
         id,
-        q.media_source_id,
+        media_source_id,
         q.play_session_id
             .as_deref(),
     );
-    let requested_id = selected.or(q.media_source_id);
+    let requested_id = selected.or(media_source_id);
     let media = StreamService::lookup(
         &state.ctx,
         id,
@@ -1604,7 +1675,7 @@ async fn videos_stream_inner(
     let video_codec = resolved_codecs.video;
     let audio_codec = resolved_codecs.audio;
     // Keep a copy before the video_codec is moved into params (needed for Content-Type logic)
-    let is_copy_video = video_codec == "copy";
+    let is_copy_video = video_codec.is_copy();
 
     info!(
         "starting progressive transcode for: {:?} (container={}, vcodec={}, acodec={}, start_ticks={:?}, bitrate={:?}, video_transcoding={})",
@@ -1637,17 +1708,15 @@ async fn videos_stream_inner(
     });
     // Copying audio the output container can't carry makes ffmpeg fail
     // mid-stream. Encode it instead, or refuse if audio transcoding is off.
-    let format = ProgressiveFormat::for_request(&container, &video_codec);
-    let audio_codec = if audio_codec == "copy"
+    let format = ProgressiveFormat::for_request(&container, video_codec.is_copy());
+    let audio_codec = if audio_codec.is_copy()
         && !format.can_copy_audio(source_audio_codec.as_deref())
     {
         if !permissions.audio_transcoding {
             return Err(anyhow!("Forbidden")
                 .context_forbidden("Progressive playback requires audio transcoding"));
         }
-        format
-            .fallback_audio_codec()
-            .to_string()
+        CodecTarget::from(format.fallback_audio_codec())
     } else {
         audio_codec
     };
@@ -1709,15 +1778,15 @@ async fn videos_stream_inner(
     }
 
     record_served(ServedPlayback::Ffmpeg {
-        video: FfmpegTrack::new(&video_codec, source_video_codec.as_deref()),
-        audio: FfmpegTrack::new(&audio_codec, source_audio_codec.as_deref()),
+        video: FfmpegTrack::new(&video_codec.clone(), source_video_codec.as_deref()),
+        audio: FfmpegTrack::new(&audio_codec.clone(), source_audio_codec.as_deref()),
     });
 
     let params = crate::playback::engine::ProgressiveTranscodeParams {
         input_url: url,
         container: container.clone(),
-        video_codec,
-        audio_codec,
+        video_codec: video_codec.clone(),
+        audio_codec: audio_codec.clone(),
         start_time_ticks: q.start_time_ticks,
         max_width: q
             .max_width
@@ -1780,9 +1849,6 @@ async fn videos_stream_inner(
         h264_crf: encoding_opts
             .h264_crf
             .unwrap_or(23),
-        h265_crf: encoding_opts
-            .h265_crf
-            .unwrap_or(28),
         normalize_audio_loudness: encoding_opts
             .normalize_audio_loudness
             .unwrap_or(false),
@@ -1816,9 +1882,9 @@ async fn videos_stream_inner(
 /// Returns additional parts for a multi-file video item.
 #[get("/videos/{id}/additionalparts")]
 pub async fn video_additional_parts(
-    State(state): State<AppState>,
+    State(_state): State<AppState>,
     _session: auth::AuthSession,
-    Path(id): Path<Uuid>,
+    Path(_id): Path<Uuid>,
 ) -> Result<impl IntoResponse> {
     Ok(Json(api::BaseItemDtoQueryResult::default()))
 }
@@ -1839,7 +1905,7 @@ pub async fn audio_universal(
     .await?
     .context_not_found("track not found")?;
 
-    state
+    let _ = state
         .ctx
         .addons
         .refresh_streams(
@@ -1897,7 +1963,7 @@ pub async fn audio_universal(
                     .as_ref(),
                 p.media_streams
                     .iter()
-                    .find(|s| s.type_ == Some(api::MediaStreamType::Audio))
+                    .find(|s| s.type_ == api::MediaStreamType::Audio)
                     .and_then(|s| {
                         s.codec
                             .as_deref()
@@ -1969,21 +2035,50 @@ pub struct UniversalAudioQuery {
     pub media_source_id: Option<Uuid>,
 }
 
+/// Smallest and largest body a bitrate test may ask for. Jellyfin's range;
+/// outside it the request is rejected rather than answered with a different
+/// size, because a client divides by the size it asked for.
+const BITRATE_TEST_DEFAULT_BYTES: u64 = 102_400;
+const BITRATE_TEST_MAX_BYTES: u64 = 100_000_000;
+const BITRATE_TEST_CHUNK_BYTES: u64 = 64 * 1024;
+
 /// Bitrate test endpoint - returns a body of the requested size for bandwidth measurement.
+///
+/// The body is random and streamed in chunks: random so compression on the
+/// way (a proxy) cannot shrink it and inflate the measured speed, streamed so
+/// the first byte leaves immediately instead of after building the whole body.
 #[get("/playback/bitratetest")]
 pub async fn playback_bitratetest_sized(
     Query(q): Query<BitrateTestQuery>,
 ) -> Result<impl IntoResponse> {
     let size = q
         .size
-        .unwrap_or(100_000)
-        .min(10_000_000) as usize;
-    let body = vec![0u8; size];
+        .unwrap_or(BITRATE_TEST_DEFAULT_BYTES);
+    (1..=BITRATE_TEST_MAX_BYTES)
+        .contains(&size)
+        .then_some(())
+        .context_bad_request(&format!(
+            "The requested size must be between 1 and {BITRATE_TEST_MAX_BYTES}"
+        ))?;
+    let body = futures_util::stream::unfold(size, |left| async move {
+        if left == 0 {
+            return None;
+        }
+        let len = left.min(BITRATE_TEST_CHUNK_BYTES) as usize;
+        let mut chunk = vec![0u8; len];
+        rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut chunk);
+        Some((
+            Ok::<_, io::Error>(bytes::Bytes::from(chunk)),
+            left - len as u64,
+        ))
+    });
     Ok(Response::builder()
         .status(StatusCode::OK)
         .header("Content-Type", "application/octet-stream")
         .header("Content-Length", size.to_string())
-        .body(Body::from(body))
+        .header("Content-Encoding", "identity")
+        .header("Cache-Control", "no-store")
+        .body(Body::from_stream(body))
         .unwrap())
 }
 
@@ -1999,10 +2094,191 @@ mod tests {
     use serde_json::json;
 
     use crate::integration_test::{
-        AUTH_HEADER, assert_api_keys_are_real, auth_header_with_token,
-        authenticated_server, insert_test_source, insert_test_source_of_kind,
+        assert_api_keys_are_real, auth_header_with_token, authenticated_server,
+        insert_test_source, insert_test_source_of_kind,
         insert_test_source_with_external_subtitle, new_test_server,
     };
+
+    #[tokio::test]
+    async fn bitrate_test_returns_exactly_the_requested_size() {
+        let (server, _guard, token) = authenticated_server().await;
+        let auth = auth_header_with_token(&token);
+
+        for size in [1usize, 65_536, 65_537, 300_000] {
+            let response = server
+                .get(&format!("/playback/bitratetest?size={size}"))
+                .add_header(http::header::AUTHORIZATION, auth.clone())
+                .await;
+            response.assert_status_ok();
+            assert_eq!(
+                response.header(http::header::CONTENT_LENGTH),
+                size.to_string()
+                    .as_str()
+            );
+            assert_eq!(
+                response
+                    .as_bytes()
+                    .len(),
+                size
+            );
+        }
+
+        let body = server
+            .get("/playback/bitratetest?size=200000")
+            .add_header(http::header::AUTHORIZATION, auth.clone())
+            .await
+            .into_bytes();
+        assert!(
+            body.iter()
+                .any(|b| *b != 0),
+            "a zero-filled body would compress away on the wire"
+        );
+
+        let default = server
+            .get("/playback/bitratetest")
+            .add_header(http::header::AUTHORIZATION, auth)
+            .await;
+        default.assert_status_ok();
+        assert_eq!(
+            default
+                .as_bytes()
+                .len(),
+            102_400
+        );
+    }
+
+    #[tokio::test]
+    async fn bitrate_test_rejects_sizes_it_will_not_serve() {
+        let (server, _guard, token) = authenticated_server().await;
+        let auth = auth_header_with_token(&token);
+
+        for size in ["0", "-1", "100000001", "1000000000", "abc"] {
+            let response = server
+                .get(&format!("/playback/bitratetest?size={size}"))
+                .add_header(http::header::AUTHORIZATION, auth.clone())
+                .expect_failure()
+                .await;
+            assert_eq!(
+                response.status_code(),
+                StatusCode::BAD_REQUEST,
+                "size={size}"
+            );
+        }
+    }
+
+    /// A device whose profile carries a `MaxStaticBitrate` gets the release below
+    /// it first, whether the profile comes with the request or was stored by
+    /// capabilities. A client that sends a different profile later replaces it.
+    #[tokio::test]
+    async fn a_device_bitrate_ceiling_picks_the_version_that_fits() {
+        use crate::integration_test::seed_movie;
+
+        let (server, guard, token) = authenticated_server().await;
+        let ctx = &guard.0;
+        let auth = HeaderValue::from_str(&auth_header_with_token(&token)).unwrap();
+        let owner = seed_movie(ctx).await;
+        let now = chrono::Utc::now().naive_utc();
+        for (name, bitrate) in [("heavy", 50_000_000), ("light", 5_000_000)] {
+            let template = insert_test_source(ctx).await;
+            let mut probe = template
+                .probe_data
+                .unwrap();
+            probe.bitrate = Some(bitrate);
+            let mut release = crate::db::Media {
+                title: name.to_string(),
+                kind: crate::db::MediaKind::Stream,
+                parent_id: Some(owner.id),
+                stream_info: template.stream_info,
+                probe_data: Some(probe),
+                created_at: now,
+                updated_at: now,
+                ..Default::default()
+            };
+            release
+                .save(&ctx.db)
+                .await
+                .unwrap();
+        }
+        sqlx::query("UPDATE media SET streams_refreshed_at = ? WHERE id = ?")
+            .bind(chrono::Utc::now().naive_utc() - chrono::Duration::seconds(5))
+            .bind(owner.id)
+            .execute(&ctx.db)
+            .await
+            .unwrap();
+
+        let ranked = async |body: serde_json::Value| {
+            let resp = server
+                .post(&format!("/items/{}/playbackinfo", owner.id))
+                .add_header(http::header::AUTHORIZATION, auth.clone())
+                .json(&body)
+                .await;
+            resp.assert_status_ok();
+            let body: serde_json::Value = resp.json();
+            body["MediaSources"][0]["Bitrate"]
+                .as_i64()
+                .unwrap()
+        };
+        let profile = |static_bitrate: Option<i64>| {
+            let mut profile = json!({
+                "Name": "Remux Client",
+                "DirectPlayProfiles": [
+                    { "Type": "Video", "Container": "*", "VideoCodec": "*", "AudioCodec": "*" }
+                ],
+                "TranscodingProfiles": [],
+                "CodecProfiles": []
+            });
+            if let Some(bitrate) = static_bitrate {
+                profile["MaxStaticBitrate"] = json!(bitrate);
+            }
+            profile
+        };
+
+        assert_eq!(
+            ranked(json!({})).await,
+            50_000_000,
+            "without a ceiling the heavier release leads"
+        );
+
+        // Reported through capabilities, then used by a request that sends no profile.
+        server
+            .post("/sessions/capabilities/full")
+            .add_header(http::header::AUTHORIZATION, auth.clone())
+            .json(&json!({
+                "PlayableMediaTypes": ["Video"],
+                "DeviceProfile": profile(Some(8_000_000))
+            }))
+            .await
+            .assert_status(StatusCode::NO_CONTENT);
+        assert_eq!(ranked(json!({})).await, 5_000_000);
+
+        // Sent with the request itself.
+        assert_eq!(
+            ranked(json!({ "DeviceProfile": profile(Some(8_000_000)) })).await,
+            5_000_000
+        );
+
+        // Zero is no ceiling.
+        assert_eq!(
+            ranked(json!({ "DeviceProfile": profile(Some(0)) })).await,
+            50_000_000
+        );
+
+        // A later profile without one replaces it: the client has to send it
+        // in both places.
+        assert_eq!(
+            ranked(json!({ "DeviceProfile": profile(None) })).await,
+            50_000_000
+        );
+        assert_eq!(ranked(json!({})).await, 50_000_000);
+    }
+
+    async fn device_user(ctx: &crate::AppContext, token: &str) -> uuid::Uuid {
+        crate::db::auth::Device::get_by_access_token(&ctx.db, token)
+            .await
+            .unwrap()
+            .unwrap()
+            .user_id
+    }
 
     #[test]
     fn universal_direct_plays_only_what_the_client_lists() {
@@ -2109,13 +2385,13 @@ mod tests {
                 media_streams: vec![
                     MediaStream {
                         codec: Some("h264".to_string()),
-                        type_: Some(MediaStreamType::Video),
+                        type_: MediaStreamType::Video,
                         index: 0,
                         ..Default::default()
                     },
                     MediaStream {
                         codec: Some("flac".to_string()),
-                        type_: Some(MediaStreamType::Audio),
+                        type_: MediaStreamType::Audio,
                         index: 1,
                         ..Default::default()
                     },
@@ -2194,13 +2470,13 @@ mod tests {
                     MediaStream {
                         codec: Some("h264".to_string()),
                         ref_frames: Some(1),
-                        type_: Some(MediaStreamType::Video),
+                        type_: MediaStreamType::Video,
                         index: 0,
                         ..Default::default()
                     },
                     MediaStream {
                         codec: Some("aac".to_string()),
-                        type_: Some(MediaStreamType::Audio),
+                        type_: MediaStreamType::Audio,
                         index: 1,
                         ..Default::default()
                     },
@@ -2423,6 +2699,115 @@ mod tests {
             .await;
         response.assert_status_ok();
         assert_eq!(response.text(), "fallback stream");
+    }
+
+    #[tokio::test]
+    async fn download_without_playback_info_skips_an_error_clip_release() {
+        let upstream = httpmock::MockServer::start();
+        let mut blocked = upstream.mock(|when, then| {
+            when.method(httpmock::Method::GET)
+                .path("/blocked");
+            then.status(307)
+                .header("Location", "/static/unavailable_for_legal_reasons.mp4");
+        });
+        for (path, body) in [
+            ("/static/unavailable_for_legal_reasons.mp4", "error clip"),
+            ("/release.mkv", "release"),
+        ] {
+            upstream.mock(|when, then| {
+                when.method(httpmock::Method::GET)
+                    .path(path);
+                then.status(200)
+                    .body(body);
+            });
+        }
+
+        let (server, guard, token) = authenticated_server().await;
+        let ctx = &guard.0;
+        // An episode with two releases in stored order.
+        let item_with = async |imdb: &str, paths: [&str; 2]| {
+            let episode = crate::integration_test::seed_episode_with(
+                ctx,
+                crate::db::ExternalIds {
+                    imdb: crate::db::NonEmptyString::try_new(imdb.to_string()).ok(),
+                    ..Default::default()
+                },
+            )
+            .await;
+            for (idx, path) in paths
+                .into_iter()
+                .enumerate()
+            {
+                let mut source = insert_test_source(ctx).await;
+                source
+                    .stream_info
+                    .as_mut()
+                    .unwrap()
+                    .descriptor =
+                    crate::stream::StreamDescriptor::http(upstream.url(path));
+                source
+                    .save(&ctx.db)
+                    .await
+                    .unwrap();
+                sqlx::query("UPDATE media SET parent_id = ?, idx = ? WHERE id = ?")
+                    .bind(episode.id)
+                    .bind(idx as i64)
+                    .bind(source.id)
+                    .execute(&ctx.db)
+                    .await
+                    .unwrap();
+            }
+            // Fresh streams: no addon refresh, and both rows count as current.
+            sqlx::query("UPDATE media SET streams_refreshed_at = ? WHERE id = ?")
+                .bind(chrono::Utc::now().naive_utc() - chrono::Duration::seconds(30))
+                .bind(episode.id)
+                .execute(&ctx.db)
+                .await
+                .unwrap();
+            episode.id
+        };
+        let download = async |id: uuid::Uuid| {
+            server
+                .get(&format!("/items/{id}/download"))
+                .add_header(
+                    http::header::AUTHORIZATION,
+                    HeaderValue::from_str(&auth_header_with_token(&token)).unwrap(),
+                )
+                .await
+        };
+
+        // The first release now resolves to the clip.
+        let episode = item_with("tt0306414", ["/blocked", "/release.mkv"]).await;
+        let response = download(episode).await;
+        response.assert_status_ok();
+        assert_eq!(response.text(), "release");
+
+        // The pick holds for later (Range) requests even once the first
+        // release works again, so the client keeps getting the same file.
+        blocked.delete();
+        upstream.mock(|when, then| {
+            when.method(httpmock::Method::GET)
+                .path("/blocked");
+            then.status(200)
+                .body("first release");
+        });
+        let response = download(episode).await;
+        response.assert_status_ok();
+        assert_eq!(response.text(), "release");
+
+        // A release that doesn't answer the check in time, like a slow
+        // debrid resolve, isn't gone and keeps its place.
+        upstream.mock(|when, then| {
+            when.method(httpmock::Method::GET)
+                .path("/slow");
+            then.status(200)
+                .delay(std::time::Duration::from_secs(6))
+                .body("slow release");
+        });
+        let episode = item_with("tt0000002", ["/slow", "/release.mkv"]).await;
+        let response = download(episode).await;
+        response.assert_status_ok();
+        assert_eq!(response.text(), "slow release");
     }
 
     #[test]
@@ -2978,11 +3363,11 @@ mod tests {
                 play_session_id,
                 crate::playback_session::ServedPlayback::Ffmpeg {
                     video: crate::playback_session::FfmpegTrack::new(
-                        "h264",
+                        &"h264".into(),
                         Some("hevc"),
                     ),
                     audio: crate::playback_session::FfmpegTrack::new(
-                        "copy",
+                        &"copy".into(),
                         Some("aac"),
                     ),
                 },
@@ -3275,6 +3660,348 @@ mod tests {
                 "SupportsDirectPlay": true,
             }]
         }));
+    }
+
+    /// A trailer row plays its own URL, like a source that is its own item.
+    #[tokio::test]
+    async fn a_trailer_plays_its_own_url() {
+        let (server, guard, token) = authenticated_server().await;
+        let auth = auth_header_with_token(&token);
+        let trailer = crate::integration_test::insert_test_source_of_kind(
+            &guard.0,
+            crate::db::MediaKind::Trailer,
+        )
+        .await;
+
+        let resp = server
+            .post(&format!("/items/{}/playbackinfo", trailer.id))
+            .add_header(
+                http::header::AUTHORIZATION,
+                HeaderValue::from_str(&auth).unwrap(),
+            )
+            .json(&json!({}))
+            .await;
+
+        resp.assert_status_ok();
+        resp.assert_json_contains(&json!({
+            "MediaSources": [{
+                "Id": trailer.id.simple().to_string(),
+                "SupportsDirectPlay": true,
+            }]
+        }));
+    }
+
+    /// A client that changes audio track mid-playback asks PlaybackInfo again
+    /// with the item id (the id auto-play handed out for source 0). That must
+    /// stay on the release being played, not rank the releases anew, or the
+    /// track index chosen for the old release lands on another language.
+    #[tokio::test]
+    async fn playbackinfo_during_playback_stays_on_the_playing_release() {
+        use crate::{
+            integration_test::{auth_header_with_token, seed_movie},
+            services::stream_service::{StreamService, StreamServiceConfig},
+        };
+
+        let (server, guard, token) = authenticated_server().await;
+        let ctx = &guard.0;
+        let auth = HeaderValue::from_str(&auth_header_with_token(&token)).unwrap();
+        let owner = seed_movie(ctx).await;
+        let now = chrono::Utc::now().naive_utc();
+        let mut releases = vec![];
+        for name in ["first", "second"] {
+            let template = insert_test_source(ctx).await;
+            let mut release = crate::db::Media {
+                title: name.to_string(),
+                kind: crate::db::MediaKind::Stream,
+                parent_id: Some(owner.id),
+                stream_info: template.stream_info,
+                probe_data: template.probe_data,
+                created_at: now,
+                updated_at: now,
+                ..Default::default()
+            };
+            release
+                .save(&ctx.db)
+                .await
+                .unwrap();
+            releases.push(release);
+        }
+        // Already refreshed, so no refresh drops the releases as stale.
+        sqlx::query("UPDATE media SET streams_refreshed_at = ? WHERE id = ?")
+            .bind(chrono::Utc::now().naive_utc() - chrono::Duration::seconds(5))
+            .bind(owner.id)
+            .execute(&ctx.db)
+            .await
+            .unwrap();
+        // The release playing is the one that does not rank first.
+        let playing = releases
+            .iter()
+            .map(|r| r.id)
+            .max()
+            .unwrap();
+        let device = crate::db::auth::Device::get_by_access_token(&ctx.db, &token)
+            .await
+            .unwrap()
+            .unwrap();
+        StreamService::new(StreamServiceConfig {
+            ctx: ctx.clone(),
+            item_id: owner.id,
+            requested_id: None,
+            show_ungrouped: true,
+            stream_filter: None,
+            user_id: Some(device.user_id),
+        })
+        .save_selected_stream("running", &device.id, false, playing, playing);
+
+        let ask = async || {
+            let resp = server
+                .post(&format!(
+                    "/items/{}/playbackinfo?MediaSourceId={}&AudioStreamIndex=1",
+                    owner.id, owner.id
+                ))
+                .add_header(http::header::AUTHORIZATION, auth.clone())
+                .json(&json!({}))
+                .await;
+            resp.assert_status_ok();
+            let body: serde_json::Value = resp.json();
+            let ids = body["MediaSources"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|s| {
+                    s["Id"]
+                        .as_str()
+                        .unwrap()
+                        .to_string()
+                })
+                .collect::<Vec<_>>();
+            (
+                ids,
+                body["PlaySessionId"]
+                    .as_str()
+                    .unwrap()
+                    .to_string(),
+            )
+        };
+
+        assert_eq!(
+            ask()
+                .await
+                .0[0],
+            owner
+                .id
+                .simple()
+                .to_string(),
+            "nothing is playing: auto-play lists the best release under the item id"
+        );
+
+        server
+            .post("/sessions/playing")
+            .add_header(http::header::AUTHORIZATION, auth.clone())
+            .json(&json!({
+                "ItemId": owner.id.simple().to_string(),
+                "PlaySessionId": "running",
+            }))
+            .await
+            .assert_status(StatusCode::NO_CONTENT);
+        let playing_ids = vec![
+            playing
+                .simple()
+                .to_string(),
+        ];
+        let (ids, next_session) = ask().await;
+        assert_eq!(ids, playing_ids, "playback is running: stay on its release");
+
+        // The client starts the session the answer named; a second switch
+        // (by item id again, or without any id) must still stay on it.
+        server
+            .post("/sessions/playing")
+            .add_header(http::header::AUTHORIZATION, auth.clone())
+            .json(&json!({
+                "ItemId": owner.id.simple().to_string(),
+                "PlaySessionId": next_session,
+            }))
+            .await
+            .assert_status(StatusCode::NO_CONTENT);
+        assert_eq!(
+            ask()
+                .await
+                .0,
+            playing_ids,
+            "the restarted session keeps the release too"
+        );
+
+        server
+            .post("/sessions/playing/stopped")
+            .add_header(http::header::AUTHORIZATION, auth.clone())
+            .json(&json!({
+                "ItemId": owner.id.simple().to_string(),
+                "PlaySessionId": next_session,
+            }))
+            .await
+            .assert_status(StatusCode::NO_CONTENT);
+        assert_eq!(
+            ask()
+                .await
+                .0
+                .len(),
+            2,
+            "playback ended: a fresh play ranks anew"
+        );
+    }
+
+    /// Switching audio (and subtitles) while watching one title is remembered
+    /// as a language, and the next title starts with it — whatever release it
+    /// plays and wherever that language sits in its track list.
+    #[tokio::test]
+    async fn a_chosen_track_language_carries_over_to_the_next_title() {
+        use remux_sdks::remux::{MediaStream, MediaStreamType};
+
+        let (server, guard, token) = authenticated_server().await;
+        let ctx = &guard.0;
+        let auth = HeaderValue::from_str(&auth_header_with_token(&token)).unwrap();
+        let now = chrono::Utc::now().naive_utc();
+
+        // One movie with a single release, audio tracks in the given order.
+        let movie_with = async |title: &str, imdb: &str, languages: [&str; 2]| {
+            let mut movie = crate::db::Media {
+                title: title.to_string(),
+                external_ids: crate::db::ExternalIds {
+                    imdb: crate::db::NonEmptyString::try_new(imdb.to_string()).ok(),
+                    ..Default::default()
+                },
+                kind: crate::db::MediaKind::Movie,
+                runtime: Some(7200),
+                created_at: now,
+                updated_at: now,
+                ..Default::default()
+            };
+            movie
+                .save(&ctx.db)
+                .await
+                .unwrap();
+            sqlx::query("UPDATE media SET streams_refreshed_at = ? WHERE id = ?")
+                .bind(now - chrono::Duration::seconds(5))
+                .bind(movie.id)
+                .execute(&ctx.db)
+                .await
+                .unwrap();
+            let template = insert_test_source(ctx).await;
+            let mut probe = template
+                .probe_data
+                .clone()
+                .unwrap();
+            probe
+                .media_streams
+                .truncate(1);
+            for (offset, language) in languages
+                .iter()
+                .enumerate()
+            {
+                probe
+                    .media_streams
+                    .push(MediaStream {
+                        codec: Some("aac".to_string()),
+                        type_: MediaStreamType::Audio,
+                        index: 1 + offset as i64,
+                        language: Some(language.to_string()),
+                        ..Default::default()
+                    });
+            }
+            let mut release = crate::db::Media {
+                title: format!("{title} release"),
+                kind: crate::db::MediaKind::Stream,
+                parent_id: Some(movie.id),
+                stream_info: template.stream_info,
+                probe_data: Some(probe),
+                created_at: now,
+                updated_at: now,
+                ..Default::default()
+            };
+            release
+                .save(&ctx.db)
+                .await
+                .unwrap();
+            movie
+        };
+        let first = movie_with("First", "tt0000001", ["eng", "fra"]).await;
+        // The same two languages, the other way round.
+        let second = movie_with("Second", "tt0000002", ["fra", "eng"]).await;
+
+        let playback_info = async |movie: &crate::db::Media| {
+            let resp = server
+                .post(&format!(
+                    "/items/{}/playbackinfo?UserId={}",
+                    movie.id, "ignored"
+                ))
+                .add_header(http::header::AUTHORIZATION, auth.clone())
+                .json(&json!({}))
+                .await;
+            resp.assert_status_ok();
+            resp.json::<serde_json::Value>()
+        };
+
+        let info = playback_info(&first).await;
+        assert_eq!(
+            info["MediaSources"][0]["DefaultAudioStreamIndex"],
+            json!(null),
+            "nothing remembered and no preference: no default"
+        );
+        let psid = info["PlaySessionId"]
+            .as_str()
+            .unwrap();
+
+        let report = |path: &'static str, audio: i64| {
+            let body = json!({
+                "ItemId": first.id.simple().to_string(),
+                "PlaySessionId": psid,
+                "AudioStreamIndex": audio,
+                "SubtitleStreamIndex": -1,
+            });
+            let request = server
+                .post(path)
+                .add_header(http::header::AUTHORIZATION, auth.clone())
+                .json(&body);
+            async move {
+                request
+                    .await
+                    .assert_status(StatusCode::NO_CONTENT)
+            }
+        };
+        report("/sessions/playing", 1).await;
+        // The client repeating the track it started on is not a choice.
+        report("/sessions/playing/progress", 1).await;
+        let remembered = async || {
+            crate::db::UserMediaState::remembered_languages(
+                &ctx.db,
+                &device_user(ctx, &token).await,
+                &second.id,
+            )
+            .await
+        };
+        assert_eq!(
+            remembered()
+                .await
+                .audio,
+            None
+        );
+
+        // Switching to French while watching is.
+        report("/sessions/playing/progress", 2).await;
+        assert_eq!(
+            remembered()
+                .await
+                .audio
+                .as_deref(),
+            Some("fr")
+        );
+
+        let info = playback_info(&second).await;
+        assert_eq!(
+            info["MediaSources"][0]["DefaultAudioStreamIndex"],
+            json!(1),
+            "French is the first track of the other title's release"
+        );
     }
 
     #[tokio::test]
@@ -3818,7 +4545,7 @@ mod tests {
                     MediaStream {
                         codec: Some("h264".to_string()),
                         ref_frames: Some(1),
-                        type_: Some(MediaStreamType::Video),
+                        type_: MediaStreamType::Video,
                         index: 0,
                         width: Some(1920),
                         height: Some(1080),
@@ -3826,13 +4553,13 @@ mod tests {
                     },
                     MediaStream {
                         codec: Some("aac".to_string()),
-                        type_: Some(MediaStreamType::Audio),
+                        type_: MediaStreamType::Audio,
                         index: 1,
                         ..Default::default()
                     },
                     MediaStream {
                         codec: Some("hdmv_pgs_subtitle".to_string()),
-                        type_: Some(MediaStreamType::Subtitle),
+                        type_: MediaStreamType::Subtitle,
                         index: 2,
                         is_text_subtitle_stream: false,
                         ..Default::default()
@@ -4033,7 +4760,7 @@ mod tests {
                 MediaStream {
                     codec: Some("h264".to_string()),
                     ref_frames: Some(1),
-                    type_: Some(MediaStreamType::Video),
+                    type_: MediaStreamType::Video,
                     index: 0,
                     width: Some(1920),
                     height: Some(1080),
@@ -4041,7 +4768,7 @@ mod tests {
                 },
                 MediaStream {
                     codec: Some("aac".to_string()),
-                    type_: Some(MediaStreamType::Audio),
+                    type_: MediaStreamType::Audio,
                     index: 1,
                     ..Default::default()
                 },
@@ -4282,7 +5009,7 @@ mod tests {
                 MediaStream {
                     codec: Some("h264".to_string()),
                     ref_frames: Some(1),
-                    type_: Some(MediaStreamType::Video),
+                    type_: MediaStreamType::Video,
                     index: 0,
                     width: Some(1920),
                     height: Some(1080),
@@ -4290,14 +5017,14 @@ mod tests {
                 },
                 MediaStream {
                     codec: Some("aac".to_string()),
-                    type_: Some(MediaStreamType::Audio),
+                    type_: MediaStreamType::Audio,
                     index: 1,
                     language: Some("nl".to_string()),
                     ..Default::default()
                 },
                 MediaStream {
                     codec: Some("aac".to_string()),
-                    type_: Some(MediaStreamType::Audio),
+                    type_: MediaStreamType::Audio,
                     index: 2,
                     language: Some("en".to_string()),
                     ..Default::default()
@@ -4446,7 +5173,7 @@ mod tests {
                 MediaStream {
                     codec: Some("h264".to_string()),
                     ref_frames: Some(1),
-                    type_: Some(MediaStreamType::Video),
+                    type_: MediaStreamType::Video,
                     index: 0,
                     width: Some(1920),
                     height: Some(1080),
@@ -4454,14 +5181,14 @@ mod tests {
                 },
                 MediaStream {
                     codec: Some("aac".to_string()),
-                    type_: Some(MediaStreamType::Audio),
+                    type_: MediaStreamType::Audio,
                     index: 1,
                     language: Some("nl".to_string()),
                     ..Default::default()
                 },
                 MediaStream {
                     codec: Some("aac".to_string()),
-                    type_: Some(MediaStreamType::Audio),
+                    type_: MediaStreamType::Audio,
                     index: 2,
                     language: Some("en".to_string()),
                     ..Default::default()
@@ -4542,14 +5269,14 @@ mod tests {
             container: Some(VideoContainer::Mp4),
             media_streams: vec![
                 MediaStream {
-                    type_: Some(MediaStreamType::Audio),
+                    type_: MediaStreamType::Audio,
                     index: 0,
                     language: Some("fre".to_string()),
-                    is_default: Some(true),
+                    is_default: true,
                     ..Default::default()
                 },
                 MediaStream {
-                    type_: Some(MediaStreamType::Audio),
+                    type_: MediaStreamType::Audio,
                     index: 1,
                     language: Some("eng".to_string()),
                     ..Default::default()
@@ -4617,7 +5344,21 @@ mod tests {
         let (server, guard, token) = authenticated_server().await;
         let auth = auth_header_with_token(&token);
         let media = insert_multilang_source(&guard.0).await;
-        let psid = "recall-audio-test";
+        // The index is saved with the release this play session's PlaybackInfo
+        // answer selected, as a client plays it.
+        let info: serde_json::Value = server
+            .post(&format!("/items/{}/playbackinfo", media.id))
+            .add_header(
+                http::header::AUTHORIZATION,
+                HeaderValue::from_str(&auth).unwrap(),
+            )
+            .json(&json!({}))
+            .await
+            .json();
+        let psid = info["PlaySessionId"]
+            .as_str()
+            .expect("PlaySessionId")
+            .to_string();
 
         server
             .post("/sessions/playing")
@@ -4661,6 +5402,148 @@ mod tests {
             body["MediaSources"][0]["DefaultAudioStreamIndex"].as_i64(),
             Some(2),
             "Saved audio selection (index 2) should be recalled as DefaultAudioStreamIndex"
+        );
+    }
+
+    /// A remembered track index belongs to the release it was played on. Another
+    /// release of the same episode with a different track order gets its
+    /// original-language default instead of the language at that index.
+    #[tokio::test]
+    async fn remembered_audio_index_stays_with_its_release() {
+        use crate::{
+            api::{MediaSourceInfo, MediaStream, MediaStreamType},
+            db,
+        };
+        use uuid::Uuid;
+        let (server, guard, token) = authenticated_server().await;
+        let auth = HeaderValue::from_str(&auth_header_with_token(&token)).unwrap();
+        let ctx = &guard.0;
+        let now = chrono::Utc::now().naive_utc();
+
+        let episode = crate::integration_test::seed_episode(ctx).await;
+        sqlx::query("UPDATE media SET original_language = 'en' WHERE id = ?")
+            .bind(episode.grandparent_id)
+            .execute(&ctx.db)
+            .await
+            .expect("set series original_language");
+        // Mark streams fresh so refresh_streams doesn't replace the fixtures.
+        sqlx::query("UPDATE media SET streams_refreshed_at = ? WHERE id = ?")
+            .bind(now - chrono::Duration::seconds(30))
+            .bind(episode.id)
+            .execute(&ctx.db)
+            .await
+            .expect("set streams_refreshed_at");
+
+        let audio = |index: i64, language: &str| MediaStream {
+            codec: Some("aac".to_string()),
+            type_: MediaStreamType::Audio,
+            index,
+            language: Some(language.to_string()),
+            ..Default::default()
+        };
+        let mut releases = Vec::new();
+        for (title, tracks) in [
+            ("compatible", [audio(1, "eng"), audio(2, "rus")]),
+            ("quality", [audio(1, "rus"), audio(2, "eng")]),
+        ] {
+            let mut source = db::Media {
+                title: title.to_string(),
+                kind: db::MediaKind::Stream,
+                parent_id: Some(episode.id),
+                stream_info: Some(crate::stream::StreamInfo {
+                    descriptor: crate::stream::StreamDescriptor::Local(
+                        format!("test-fixture-{title}.mp4").into(),
+                    ),
+                    ..Default::default()
+                }),
+                probe_data: Some(MediaSourceInfo {
+                    container: Some(VideoContainer::Mp4),
+                    media_streams: tracks.to_vec(),
+                    ..Default::default()
+                }),
+                created_at: now,
+                updated_at: now,
+                ..Default::default()
+            };
+            source
+                .save(&ctx.db)
+                .await
+                .expect("save source");
+            releases.push(source.id);
+        }
+        let (compatible, quality) = (releases[0], releases[1]);
+
+        let default_audio = |info: &serde_json::Value, release: Uuid| {
+            info["MediaSources"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|s| {
+                    s["Id"]
+                        .as_str()
+                        .and_then(|id| Uuid::parse_str(id).ok())
+                        == Some(release)
+                })
+                .unwrap_or_else(|| panic!("release {release} in {info}"))
+                ["DefaultAudioStreamIndex"]
+                .as_i64()
+        };
+        let playback_info = |release: Uuid| {
+            server
+                .post(&format!("/items/{}/playbackinfo", episode.id))
+                .add_header(http::header::AUTHORIZATION, auth.clone())
+                .json(&json!({ "MediaSourceId": release.to_string() }))
+        };
+
+        // Play the compatible release on its English track, index 1.
+        let info: serde_json::Value = playback_info(compatible)
+            .await
+            .json();
+        assert_eq!(default_audio(&info, compatible), Some(1));
+        let psid = info["PlaySessionId"]
+            .as_str()
+            .expect("PlaySessionId")
+            .to_string();
+        for (path, position) in [
+            ("/sessions/playing", 0),
+            ("/sessions/playing/progress", 100_000_000i64),
+        ] {
+            server
+                .post(path)
+                .add_header(http::header::AUTHORIZATION, auth.clone())
+                .json(&json!({
+                    "ItemId": episode.id.to_string(),
+                    "MediaSourceId": compatible.to_string(),
+                    "PlaySessionId": psid,
+                    "PositionTicks": position,
+                    "AudioStreamIndex": 1
+                }))
+                .await
+                .assert_status_success();
+        }
+
+        let info: serde_json::Value = playback_info(quality)
+            .await
+            .json();
+        assert_eq!(
+            default_audio(&info, quality),
+            Some(2),
+            "index 1 is Russian in this release: English comes from the original language"
+        );
+        let details: serde_json::Value = server
+            .get(&format!("/items/{}", episode.id))
+            .add_header(http::header::AUTHORIZATION, auth.clone())
+            .add_query_params(&[("Fields", "MediaSources")])
+            .await
+            .json();
+        assert_eq!(default_audio(&details, quality), Some(2), "item details");
+        let info: serde_json::Value = playback_info(compatible)
+            .await
+            .json();
+        assert_eq!(
+            default_audio(&info, compatible),
+            Some(1),
+            "the release it was saved on still recalls it"
         );
     }
 
@@ -4758,7 +5641,7 @@ mod tests {
         let now = chrono::Utc::now().naive_utc();
 
         // Groups: WEB (priority 0) and Blu-ray (priority 1)
-        let web_group = crate::db::StreamGroup::create(
+        let _web_group = crate::db::StreamGroup::create(
             &ctx.db,
             "1080p · WEB",
             StreamFilter {
@@ -4808,7 +5691,7 @@ mod tests {
                 api::MediaStream {
                     codec: Some("h264".to_string()),
                     ref_frames: Some(1),
-                    type_: Some(api::MediaStreamType::Video),
+                    type_: api::MediaStreamType::Video,
                     index: 0,
                     width: Some(1920),
                     height: Some(1080),
@@ -4816,7 +5699,7 @@ mod tests {
                 },
                 api::MediaStream {
                     codec: Some("aac".to_string()),
-                    type_: Some(api::MediaStreamType::Audio),
+                    type_: api::MediaStreamType::Audio,
                     index: 1,
                     ..Default::default()
                 },
@@ -5075,7 +5958,7 @@ mod tests {
                 MediaStream {
                     codec: Some("h264".to_string()),
                     ref_frames: Some(1),
-                    type_: Some(MediaStreamType::Video),
+                    type_: MediaStreamType::Video,
                     index: 0,
                     width: Some(1920),
                     height: Some(1080),
@@ -5083,13 +5966,13 @@ mod tests {
                 },
                 MediaStream {
                     codec: Some("aac".to_string()),
-                    type_: Some(MediaStreamType::Audio),
+                    type_: MediaStreamType::Audio,
                     index: 1,
                     ..Default::default()
                 },
                 MediaStream {
                     codec: Some("subrip".to_string()),
-                    type_: Some(MediaStreamType::Subtitle),
+                    type_: MediaStreamType::Subtitle,
                     index: 2,
                     language: Some("fra".to_string()),
                     is_text_subtitle_stream: true,
@@ -5097,7 +5980,7 @@ mod tests {
                 },
                 MediaStream {
                     codec: Some("subrip".to_string()),
-                    type_: Some(MediaStreamType::Subtitle),
+                    type_: MediaStreamType::Subtitle,
                     index: 3,
                     language: Some("eng".to_string()),
                     is_text_subtitle_stream: true,
@@ -5404,8 +6287,8 @@ mod tests {
             .as_mut()
         {
             for s in &mut pd.media_streams {
-                if matches!(s.type_, Some(crate::api::MediaStreamType::Subtitle)) {
-                    s.is_default = Some(s.index == 3);
+                if matches!(s.type_, crate::api::MediaStreamType::Subtitle) {
+                    s.is_default = s.index == 3;
                 }
             }
             pd.default_subtitle_stream_index = Some(3);
@@ -5550,13 +6433,13 @@ mod tests {
                 media_streams: vec![
                     MediaStream {
                         codec: Some("h264".to_string()),
-                        type_: Some(MediaStreamType::Video),
+                        type_: MediaStreamType::Video,
                         index: 0,
                         ..Default::default()
                     },
                     MediaStream {
                         codec: Some("aac".to_string()),
-                        type_: Some(MediaStreamType::Audio),
+                        type_: MediaStreamType::Audio,
                         index: 1,
                         ..Default::default()
                     },

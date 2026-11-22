@@ -19,8 +19,8 @@ pub fn auth_header_with_token(token: &str) -> String {
     )
 }
 
-/// RAII guard that shuts down the `AppContext` (releases torrent/DHT sockets)
-/// when the test ends. Hold this for the lifetime of the test.
+/// RAII guard that shuts down the `AppContext` (stops transcodes, releases
+/// torrent/DHT sockets) when the test ends. Hold this for the lifetime of the test.
 pub struct TestGuard(pub AppContext);
 
 impl Drop for TestGuard {
@@ -43,6 +43,20 @@ pub async fn new_test_server_with_config(
     config: Config,
 ) -> Result<(TestServer, TestGuard)> {
     let (app, ctx) = init_app_with_ctx(config).await?;
+    // Route through the same request URI normaliser as the real server
+    // (`bind_and_serve`), so tests see the paths production routing sees.
+    // The outer router records the raw URI as `OriginalUri` before the
+    // rewrite; production has no outer router, so drop it and let the app
+    // record the rewritten one (`WebClientService` builds redirects from it).
+    let app = axum::Router::new().fallback_service(tower::Layer::layer(
+        &tower::util::MapRequestLayer::new(|req: http::Request<axum::body::Body>| {
+            let mut req = crate::rewrite_request_uri(req);
+            req.extensions_mut()
+                .remove::<axum::extract::OriginalUri>();
+            req
+        }),
+        app,
+    ));
 
     let server = TestServer::builder()
         .save_cookies()
@@ -120,7 +134,7 @@ pub async fn insert_test_source_with_external_subtitle(ctx: &AppContext) -> db::
         db::MediaKind::Stream,
         vec![MediaStream {
             codec: Some("subrip".to_string()),
-            type_: Some(MediaStreamType::Subtitle),
+            type_: MediaStreamType::Subtitle,
             index: 2,
             is_external: true,
             language: Some("eng".to_string()),
@@ -169,7 +183,7 @@ async fn insert_source(
             MediaStream {
                 codec: Some("h264".to_string()),
                 ref_frames: Some(1),
-                type_: Some(MediaStreamType::Video),
+                type_: MediaStreamType::Video,
                 index: 0,
                 width: Some(1920),
                 height: Some(1080),
@@ -177,7 +191,7 @@ async fn insert_source(
             },
             MediaStream {
                 codec: Some("aac".to_string()),
-                type_: Some(MediaStreamType::Audio),
+                type_: MediaStreamType::Audio,
                 index: 1,
                 ..Default::default()
             },
@@ -439,7 +453,7 @@ pub async fn seed_probe_fallback(
 
     let owner = seed_movie(ctx).await;
     let dir = tempfile::tempdir().unwrap();
-    let mut local_source = async |name: &str| {
+    let local_source = async |name: &str| {
         let path = dir
             .path()
             .join(format!("{name}.mkv"));

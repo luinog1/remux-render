@@ -239,19 +239,12 @@ impl StreamDescriptor {
             Self::Local(path) => path
                 .to_string_lossy()
                 .into_owned(),
-            Self::Torrent { .. } | Self::Opendal { .. } => {
-                format!("http://127.0.0.1:{}/stream/{}", port, media_id)
-            }
-        }
-    }
-
-    /// URL to hand to the Jellyfin client for direct play.
-    /// `Http` streams play directly. Everything else routes through our stream proxy
-    /// (client can't access local FS; Torrent/Opendal need server-side resolution).
-    pub fn client_url(&self, media_id: Uuid, server_base: &str) -> String {
-        match self {
-            Self::Http { url, .. } => url.clone(),
-            _ => format!("{}/stream/{}", server_base.trim_end_matches('/'), media_id),
+            Self::Torrent { .. } | Self::Opendal { .. } => format!(
+                "http://127.0.0.1:{}/stream/{}?token={}",
+                port,
+                media_id,
+                stream_link_token(media_id)
+            ),
         }
     }
 
@@ -278,13 +271,22 @@ impl StreamDescriptor {
     /// archive signature; body-read errors leave the stream alive. Non-HTTP
     /// variants return `true`.
     pub async fn is_alive(&self) -> bool {
+        self.availability()
+            .await
+            .unwrap_or(false)
+    }
+
+    /// The check behind [`Self::is_alive`]: `None` when the ranged GET times
+    /// out, as a slow debrid resolve does, rather than answering as gone. A
+    /// host that never accepts the connection is gone.
+    pub(crate) async fn availability(&self) -> Option<bool> {
         let Self::Http {
             url,
             request_headers,
             ..
         } = self
         else {
-            return true;
+            return Some(true);
         };
         let mut request = AVAILABILITY_CLIENT.get(url);
         for (key, value) in request_headers {
@@ -292,23 +294,21 @@ impl StreamDescriptor {
         }
         request = request.header(http::header::RANGE, "bytes=0-7");
 
-        let Ok(mut response) = request
+        let mut response = match request
             .send()
             .await
-        else {
-            return false;
+        {
+            Ok(response) => response,
+            Err(e) if e.is_timeout() && !e.is_connect() => return None,
+            Err(_) => return Some(false),
         };
         if response
             .status()
             .as_u16()
             >= 400
-            || response
-                .url()
-                .path()
-                .rsplit_once("/static/")
-                .is_some_and(|(_, clip)| AIOSTREAMS_ERROR_CLIPS.contains(&clip))
+            || is_aiostreams_error_clip(response.url())
         {
-            return false;
+            return Some(false);
         }
 
         // Read only until the magic-number prefix is available; servers that
@@ -323,9 +323,11 @@ impl StreamDescriptor {
                 _ => break,
             }
         }
-        !ARCHIVE_MAGIC
-            .iter()
-            .any(|magic| head.starts_with(magic))
+        Some(
+            !ARCHIVE_MAGIC
+                .iter()
+                .any(|magic| head.starts_with(magic)),
+        )
     }
 
     /// Instantiate the runtime service for self-contained variants.
@@ -522,7 +524,7 @@ impl StreamInfo {
             .or(self
                 .name
                 .as_deref())?;
-        crate::db::min_screen_size(&hunch::hunch(src)).map(|s| s.to_owned())
+        crate::db::normalized_screen_size(&hunch::hunch(src), src)
     }
 }
 
@@ -544,6 +546,56 @@ static AVAILABILITY_CLIENT: std::sync::LazyLock<reqwest::Client> =
             .expect("failed to build availability client")
     });
 
+/// Key for the `/stream/{id}` links this server hands to its own ffmpeg and
+/// ffprobe (see [`StreamDescriptor::server_input`]). Random per run: those
+/// links are used right away and never outlive the process.
+static STREAM_LINK_KEY: std::sync::LazyLock<[u8; 32]> =
+    std::sync::LazyLock::new(rand::random);
+
+fn stream_link_mac(media_id: Uuid) -> hmac::Hmac<sha2::Sha256> {
+    use hmac::Mac;
+    let mut mac = hmac::Hmac::<sha2::Sha256>::new_from_slice(&*STREAM_LINK_KEY)
+        .expect("HMAC takes a key of any length");
+    mac.update(media_id.as_bytes());
+    mac
+}
+
+/// The token a `/stream/{id}` link carries. The route is unauthenticated (ffmpeg
+/// sends no credentials), and stream ids are derived from public data, so the
+/// token is what keeps anyone else from streaming through this server.
+pub(crate) fn stream_link_token(media_id: Uuid) -> String {
+    use hmac::Mac;
+    stream_link_mac(media_id)
+        .finalize()
+        .into_bytes()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+/// Whether `token` is [`stream_link_token`] for `media_id`, compared in
+/// constant time.
+pub(crate) fn is_stream_link_token(media_id: Uuid, token: &str) -> bool {
+    use hmac::Mac;
+    let bytes: Option<Vec<u8>> = (token.len() % 2 == 0)
+        .then(|| {
+            (0..token.len())
+                .step_by(2)
+                .map(|i| {
+                    token
+                        .get(i..i + 2)
+                        .and_then(|h| u8::from_str_radix(h, 16).ok())
+                })
+                .collect()
+        })
+        .flatten();
+    bytes.is_some_and(|b| {
+        stream_link_mac(media_id)
+            .verify_slice(&b)
+            .is_ok()
+    })
+}
+
 /// Clips AIOStreams redirects to (`/static/<clip>`) when a debrid resolve
 /// fails; they are playable MP4s, so status alone reads them as alive. Mirrors
 /// `StaticFiles` in AIOStreams `utils/static-errors.ts`, minus `200.mp4`.
@@ -560,6 +612,13 @@ const AIOSTREAMS_ERROR_CLIPS: &[&str] = &[
     "no_matching_file.mp4",
     "payment_required.mp4",
 ];
+
+/// Whether `url` (after redirects) is one of [`AIOSTREAMS_ERROR_CLIPS`].
+fn is_aiostreams_error_clip(url: &reqwest::Url) -> bool {
+    url.path()
+        .rsplit_once("/static/")
+        .is_some_and(|(_, clip)| AIOSTREAMS_ERROR_CLIPS.contains(&clip))
+}
 
 /// Archive signatures (RAR, 7z, ZIP) occasionally served by debrid links in
 /// place of the video file; ffmpeg cannot play them.
@@ -668,7 +727,26 @@ impl HttpSource {
             .await
             .context_bad_request("upstream request failed")?;
 
+        // A resolve can fail after any liveness check; AIOStreams then
+        // redirects to an error clip, which is not the release.
+        if is_aiostreams_error_clip(upstream.url()) {
+            return Err(anyhow::anyhow!(
+                "upstream redirected to an AIOStreams error clip"
+            ))
+            .context_bad_gateway("upstream redirected to an error clip");
+        }
+
         let upstream_status = upstream.status();
+        // reqwest follows redirects that carry a usable `Location`, so a 3xx
+        // reaching us has none (or the hop limit ran out). Mirroring it would
+        // send the client a redirect with no target, as the header whitelist
+        // below drops `Location`; fail loudly instead.
+        if upstream_status.is_redirection() {
+            return Err(anyhow::anyhow!(
+                "upstream answered {upstream_status} without a followable Location"
+            ))
+            .context_bad_gateway("upstream redirect has no usable target");
+        }
         let upstream_headers = upstream
             .headers()
             .clone();
@@ -1043,26 +1121,6 @@ pub fn mime_from_path(path: &std::path::Path) -> &'static str {
     "application/octet-stream"
 }
 
-/// Extract the `urn:btih:` info-hash from a magnet URI.
-fn extract_btih(magnet: &str) -> Option<String> {
-    url::Url::parse(magnet)
-        .ok()?
-        .query_pairs()
-        .find(|(k, _)| k == "xt")
-        .and_then(|(_, v)| {
-            v.strip_prefix("urn:btih:")
-                .map(|h| h.to_ascii_lowercase())
-        })
-}
-
-fn extract_query_param(url: &str, param: &str) -> Option<String> {
-    url::Url::parse(url)
-        .ok()?
-        .query_pairs()
-        .find(|(k, _)| k == param)
-        .map(|(_, v)| v.into_owned())
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
@@ -1154,6 +1212,19 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_host_that_never_connects_is_gone_not_slow() {
+        // TEST-NET-1: never routed, so the connect fails or hits the
+        // connect timeout.
+        let descriptor = StreamDescriptor::http("http://192.0.2.1/release.mkv");
+        assert_eq!(
+            descriptor
+                .availability()
+                .await,
+            Some(false)
+        );
+    }
+
+    #[tokio::test]
     async fn is_alive_rejects_error_clips_and_archives() {
         let server = httpmock::MockServer::start();
         server.mock(|when, then| {
@@ -1229,6 +1300,92 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(body.len(), 1024);
+    }
+
+    #[tokio::test]
+    async fn static_stream_never_mirrors_a_redirect_without_location() {
+        let server = httpmock::MockServer::start();
+        server.mock(|when, then| {
+            when.method(httpmock::Method::GET)
+                .path("/no-target");
+            then.status(307);
+        });
+        server.mock(|when, then| {
+            when.method(httpmock::Method::GET)
+                .path("/hop");
+            then.status(307)
+                .header("Location", "/file.flac");
+        });
+        server.mock(|when, then| {
+            when.method(httpmock::Method::GET)
+                .path("/file.flac");
+            then.status(200)
+                .body(vec![b'x'; 16]);
+        });
+
+        let serve = |path: &str| {
+            let source = HttpSource {
+                url: format!("{}{path}", server.base_url()),
+                request_headers: Default::default(),
+                response_headers: Default::default(),
+            };
+            async move {
+                let mut headers = http::HeaderMap::new();
+                headers.insert(
+                    http::header::RANGE,
+                    http::HeaderValue::from_static("bytes=0-"),
+                );
+                source
+                    .serve_inner(&headers, false)
+                    .await
+            }
+        };
+
+        // A 3xx with no Location must not reach the client as a 3xx.
+        assert!(
+            serve("/no-target")
+                .await
+                .is_err()
+        );
+
+        // A redirect with a Location is followed, not mirrored.
+        let followed = serve("/hop")
+            .await
+            .unwrap();
+        assert!(
+            followed
+                .status()
+                .is_success()
+        );
+    }
+
+    #[tokio::test]
+    async fn static_stream_refuses_an_aiostreams_error_clip() {
+        let server = httpmock::MockServer::start();
+        server.mock(|when, then| {
+            when.method(httpmock::Method::GET)
+                .path("/playback/blocked");
+            then.status(307)
+                .header("Location", "/static/unavailable_for_legal_reasons.mp4");
+        });
+        server.mock(|when, then| {
+            when.method(httpmock::Method::GET)
+                .path("/static/unavailable_for_legal_reasons.mp4");
+            then.status(200)
+                .body("error clip");
+        });
+        let source = HttpSource {
+            url: server.url("/playback/blocked"),
+            request_headers: Default::default(),
+            response_headers: Default::default(),
+        };
+
+        let blocked = source
+            .serve_inner(&http::HeaderMap::new(), false)
+            .await
+            .err()
+            .expect("the error clip must not be served");
+        assert_eq!(blocked.status(), http::StatusCode::BAD_GATEWAY);
     }
 
     #[tokio::test]

@@ -21,6 +21,9 @@ Remux is a Jellyfin-compatible media server that brings Stremio add-ons, local f
 - **Works with your Jellyfin clients**  
   Infuse, Swiftfin, Jellyfin for Android, and any other Jellyfin-compatible client works without changes.
 
+- **Official client and bundled web UI**  
+  Remux has its own client: [remux-client](https://github.com/lostb1t/remux-client). The server also bundles the web version, so you can open it in a browser right away without installing anything.
+
 - **Multiple content sources**  
   Stream from Stremio add-ons, local files, WebDAV servers, or torrents. Mix and match across a single library.
 
@@ -73,6 +76,12 @@ services:
     volumes:
       - /remux/data:/data
 ```
+
+### Server logs
+
+File logging is enabled by default and writes daily rolling logs under `<data_dir>/logs`. It retains at most five log files and removes files older than five days. **There is no per-file byte-size cap:** a single high-volume daily log can grow until the configured retention policy removes it or the underlying volume runs out of space; `log_file_max_files` limits file count, not size. Configure `log_file_enabled` (`LOG_FILE_ENABLED=false` to use stdout only), `log_dir` (`LOG_DIR` to move the files), `log_file_max_files` (`LOG_FILE_MAX_FILES`; `0` disables the count cap), and `log_file_retention_days` (`LOG_FILE_RETENTION_DAYS`; `0` disables age cleanup) through the normal Remux config system. If the directory is unavailable, Remux warns and continues with stdout logging.
+
+The dashboard log endpoint requires an administrator session and redacts common credential-shaped values, but arbitrary log content can still contain sensitive information. Treat logs as sensitive and do not rely on redaction as a complete secret scanner.
 
 ### Development
 

@@ -115,6 +115,8 @@ sqlx = { version = "0.8", features = [ "runtime-tokio", "sqlite", "uuid", "chron
 argon2 = { version = "0.5.3", default-features = true}
 # argo depends on 0,8
 rand = { version = "0.8", features = ["getrandom"] }
+hmac = "0.12"
+sha2 = "0.10"
 #md5 = "0.8.0"
 #cron_tab = { version = "0.2", features = ["sync", "async"] }
 tokio-cron-scheduler = "*"
@@ -126,7 +128,8 @@ rust_iso3166 = "0.1.14"
 quick-xml = { version = "0.37", features = ["encoding"] }
 opendal = { version = "0.52", features = ["services-webdav", "services-fs"] }
 
-librqbit = { version = "8", default-features = false, features = ["rust-tls", "http-api", "tracing-subscriber-utils"] }
+librqbit = { version = "9.1.0", default-features = false, features = ["rust-tls", "http-api", "tracing-subscriber-utils"] }
+librqbit-dualstack-sockets = "0.7"
 regex = "1"
 handlebars = "6"
 hunch = "2"

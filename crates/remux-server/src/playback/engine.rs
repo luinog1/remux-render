@@ -19,7 +19,10 @@ use crate::{
 };
 use remux_sdks::remux::{EncodingPreset, HardwareAccelerationType, VideoRangeType};
 
-use super::session::{SegmentContainer, TranscodeSession, TranscodeState};
+use super::{
+    codec::{CodecTarget, EncodeQuality, VideoEncoder, video_encode_args},
+    session::{SegmentContainer, TranscodeSession, TranscodeState},
+};
 
 pub async fn detect_hardware_acceleration() -> HardwareAccelerationType {
     let detected = probe_hw_accel().await;
@@ -41,7 +44,7 @@ pub async fn detect_vaapi_driver(vaapi_device: &str) -> String {
         vaapi_device
     };
 
-    let result = tokio::process::Command::new(ffmpeg_bin())
+    let result = tokio::process::Command::new(crate::tools::ffmpeg())
         .args([
             "-v",
             "verbose",
@@ -85,7 +88,7 @@ pub async fn detect_opencl_tonemap(vaapi_device: &str, vaapi_driver: &str) -> bo
         format!(",driver={vaapi_driver}")
     };
 
-    let filters = match tokio::process::Command::new(ffmpeg_bin())
+    let filters = match tokio::process::Command::new(crate::tools::ffmpeg())
         .args(["-hide_banner", "-filters"])
         .hide_console()
         .output()
@@ -104,7 +107,7 @@ pub async fn detect_opencl_tonemap(vaapi_device: &str, vaapi_driver: &str) -> bo
         return false;
     }
 
-    match tokio::process::Command::new(ffmpeg_bin())
+    match tokio::process::Command::new(crate::tools::ffmpeg())
         .args([
             "-v",
             "error",
@@ -138,7 +141,7 @@ pub async fn detect_opencl_tonemap(vaapi_device: &str, vaapi_driver: &str) -> bo
 }
 
 async fn probe_hw_accel() -> HardwareAccelerationType {
-    let supported = match tokio::process::Command::new(ffmpeg_bin())
+    let supported = match tokio::process::Command::new(crate::tools::ffmpeg())
         .args(["-hide_banner", "-hwaccels"])
         .hide_console()
         .output()
@@ -207,10 +210,9 @@ pub(crate) fn select_hw_accel(
 const MAX_BUFFER_SECS: u32 = 300;
 /// Seconds behind the playback position before a segment is eligible for deletion.
 const SEGMENT_KEEP_SECS: u32 = 30;
-
-fn ffmpeg_bin() -> String {
-    std::env::var("FFMPEG_PATH").unwrap_or_else(|_| "ffmpeg".into())
-}
+/// How far back a live stream can be rewound or paused: the length of its
+/// sliding HLS playlist.
+const LIVE_REWIND_SECS: u32 = 30 * 60;
 
 /// Send SIGSTOP/SIGCONT to a process by PID on Unix.
 #[cfg(unix)]
@@ -222,6 +224,13 @@ fn send_signal(_pid: u32, _sig: i32) {}
 
 /// Spawn the buffer-throttle task. It pauses/resumes ffmpeg so it never
 /// encodes more than MAX_BUFFER_SECS ahead of what the client has requested.
+///
+/// A live stream is never paused: the source keeps sending, so a stopped
+/// ffmpeg falls behind or loses the connection, and a client that sends no
+/// progress reports would read as "nothing played" and stall after
+/// MAX_BUFFER_SECS. Jellyfin throttles only recorded files. Its segments are
+/// kept for LIVE_REWIND_SECS (ffmpeg's sliding playlist deletes them), so a
+/// viewer can pause and rewind.
 ///
 /// `start_index` is this run's `-start_number` (see `segment_start_index`):
 /// segment file names are numbered from the seek position, not from 0, so
@@ -237,6 +246,7 @@ fn spawn_buffer_monitor(
     ffmpeg_pid: Arc<AtomicU32>,
     mut stop_rx: tokio::sync::oneshot::Receiver<()>,
     play_session_id: String,
+    is_live: bool,
 ) {
     tokio::spawn(async move {
         let mut paused = false;
@@ -260,7 +270,7 @@ fn spawn_buffer_monitor(
 
             let ahead = buffered_secs.saturating_sub(playback_secs);
 
-            if pid != 0 && !paused && ahead >= MAX_BUFFER_SECS {
+            if !is_live && pid != 0 && !paused && ahead >= MAX_BUFFER_SECS {
                 debug!(play_session_id, pid, ahead, "Buffer full — pausing ffmpeg");
                 #[cfg(unix)]
                 send_signal(pid, libc::SIGSTOP);
@@ -278,11 +288,13 @@ fn spawn_buffer_monitor(
                 paused = false;
             }
 
-            // Every 30 seconds, delete segments that are more than SEGMENT_KEEP_SECS
-            // behind the current playback position.
-            if ticks % 30 == 0 && playback_secs > SEGMENT_KEEP_SECS {
-                let cutoff_idx = (playback_secs - SEGMENT_KEEP_SECS) / segment_length;
-                delete_old_segments(&output_dir, cutoff_idx);
+            // Every 30 seconds, delete segments that are no longer needed.
+            if ticks % 30 == 0 {
+                if let Some(cutoff_idx) =
+                    cleanup_cutoff(is_live, playback_secs, segment_length)
+                {
+                    delete_old_segments(&output_dir, cutoff_idx);
+                }
             }
         }
 
@@ -295,6 +307,22 @@ fn spawn_buffer_monitor(
             }
         }
     });
+}
+
+/// The segment index below which segments can be deleted, if any: a few
+/// seconds behind the playback position of a recorded stream. A live stream
+/// has none, as its sliding playlist (see `LIVE_REWIND_SECS`) already deletes
+/// what it no longer lists, and clients may report no position at all.
+fn cleanup_cutoff(
+    is_live: bool,
+    playback_secs: u32,
+    segment_length: u32,
+) -> Option<u32> {
+    if is_live || playback_secs <= SEGMENT_KEEP_SECS {
+        return None;
+    }
+    let cutoff = (playback_secs - SEGMENT_KEEP_SECS) / segment_length.max(1);
+    (cutoff > 0).then_some(cutoff)
 }
 
 /// Parses the numeric index out of a segment filename — `segment_00042.ts`,
@@ -369,12 +397,62 @@ fn buffered_secs_from_segments(
     })
 }
 
+/// Keyframe placement for re-encoded HLS video, so every segment is as long
+/// as the playlist declares. `-hls_time` can only cut on a keyframe, and an
+/// encoder left to itself uses its own GOP (x264: 250 frames, ~10.4 s at
+/// 24 fps). The playlist is synthetic and fixed-length, and a seek or restart
+/// maps segment N to `N * segment_length`, so longer segments desync the
+/// client's timeline from the content.
+///
+/// Mirrors Jellyfin's `GetHlsVideoKeyFrameArguments`: forced keyframes, plus a
+/// GOP of one segment where the encoder ignores forced keyframes (QSV, NVENC,
+/// AMF, RKMPP, SVT-AV1) or to keep scene-cut keyframes from shifting the next
+/// forced one out of its segment.
+fn hls_keyframe_args(
+    codec: &str,
+    segment_length: u32,
+    frame_rate: Option<f32>,
+) -> Vec<String> {
+    let force_keyframes = || {
+        vec![
+            "-force_key_frames:0".to_string(),
+            format!("expr:gte(t,n_forced*{segment_length})"),
+        ]
+    };
+    let gop = || {
+        let frames = frame_rate
+            .filter(|fps| *fps > 0.0)
+            .map(|fps| (segment_length as f32 * fps).ceil() as u32)
+            .filter(|frames| *frames > 0)?;
+        Some(vec![
+            "-g:v:0".to_string(),
+            frames.to_string(),
+            "-keyint_min:v:0".to_string(),
+            frames.to_string(),
+        ])
+    };
+    let gop_only = ["_qsv", "_nvenc", "_amf", "_rkmpp"]
+        .iter()
+        .any(|sfx| codec.ends_with(sfx))
+        || codec == "libsvtav1";
+    if gop_only {
+        return gop().unwrap_or_default();
+    }
+    let mut args = force_keyframes();
+    match codec {
+        "libx264" => args.extend(["-sc_threshold:v:0".to_string(), "0".to_string()]),
+        c if c.ends_with("_vaapi") || c == "libx265" => {}
+        _ => args.extend(gop().unwrap_or_default()),
+    }
+    args
+}
+
 /// Parameters for starting a new HLS transcode job.
 pub struct TranscodeParams {
     pub input_url: String,
     pub output_dir: PathBuf,
-    pub video_codec: String, // "copy", "libx264", "libx265"
-    pub audio_codec: String, // "aac", "copy"
+    pub video_codec: CodecTarget,
+    pub audio_codec: CodecTarget,
     pub segment_length: u32, // seconds (default 6)
     pub start_time_ticks: Option<i64>,
     pub max_width: Option<u32>,
@@ -399,6 +477,12 @@ pub struct TranscodeParams {
     /// HEVC sample-entry tag (`hvc1`/`hev1`) resolved from the client's
     /// DeviceProfile; see `DeviceProfileExt::hevc_copy_tag`.
     pub hevc_copy_tag: Option<String>,
+    /// Copied HEVC goes into MPEG-TS segments instead of fMP4; see
+    /// `SegmentContainer::for_codecs`.
+    pub hevc_in_ts: bool,
+    /// Frame rate of the source video, used to size the GOP of encoders that
+    /// ignore forced keyframes; see `hls_keyframe_args`.
+    pub source_frame_rate: Option<f32>,
     pub accelerator: Box<dyn Accelerator>,
     /// HDR type of the source video, used to decide whether tone-mapping or
     /// SDR colour-space override is needed.
@@ -419,8 +503,6 @@ pub struct TranscodeParams {
     pub allow_av1_encoding: bool,
     /// CRF quality for software H.264 (libx264).
     pub h264_crf: u32,
-    /// CRF quality for software H.265 (libx265).
-    pub h265_crf: u32,
     /// True for live TV / RTSP streams — disables seeking and enables auto-restart on exit.
     pub is_live: bool,
     /// Apply `loudnorm=I=-14:TP=-1:LRA=11` when transcoding audio. Has no effect
@@ -433,8 +515,8 @@ impl Default for TranscodeParams {
         Self {
             input_url: String::new(),
             output_dir: PathBuf::new(),
-            video_codec: "copy".to_string(),
-            audio_codec: "aac".to_string(),
+            video_codec: CodecTarget::Copy,
+            audio_codec: CodecTarget::Transcode("aac".into()),
             segment_length: 6,
             start_time_ticks: None,
             max_width: None,
@@ -451,6 +533,8 @@ impl Default for TranscodeParams {
             source_video_codec: None,
             source_audio_codec: None,
             hevc_copy_tag: None,
+            hevc_in_ts: false,
+            source_frame_rate: None,
             accelerator: Box::new(NoAccel),
             source_video_range_type: None,
             enable_tonemapping: false,
@@ -461,7 +545,6 @@ impl Default for TranscodeParams {
             allow_hevc_encoding: false,
             allow_av1_encoding: false,
             h264_crf: 23,
-            h265_crf: 28,
             is_live: false,
             normalize_audio_loudness: false,
         }
@@ -736,7 +819,9 @@ pub(crate) fn build_hls_args(params: &TranscodeParams) -> Vec<String> {
         && params
             .subtitle_stream_index
             .is_some_and(|index| index >= 0)
-        && params.video_codec != "copy";
+        && !params
+            .video_codec
+            .is_copy();
 
     // Tone-map decision (only applies to HDR + transcode, never to copy). On
     // QSV the subtitle overlay runs on the GPU after tone mapping, so
@@ -752,36 +837,21 @@ pub(crate) fn build_hls_args(params: &TranscodeParams) -> Vec<String> {
     );
     let do_sw_tonemap = treatment == HdrTreatment::SwTonemap;
 
-    let ffmpeg_video_codec = {
-        let base = match params
-            .video_codec
-            .as_str()
-        {
-            "copy" => "copy",
-            _ => "libx264",
-        };
-        if base != "copy" && is_hw {
-            accel.encoder_name(base)
-        } else {
-            base.to_string()
-        }
-    };
+    let video_encoder = VideoEncoder::for_target(&params.video_codec, accel);
     // fMP4 (fragmented MP4) is required for HEVC on iOS Safari per Apple's HLS
     // authoring specification.  MPEG-TS cannot carry HEVC correctly in HLS.
     // Shared with TranscodeSession so segment paths and playlists agree.
     let segment_container = SegmentContainer::for_codecs(
-        &ffmpeg_video_codec,
+        video_encoder.is_copy(),
         params
             .source_video_codec
             .as_deref(),
+        params.hevc_in_ts,
     );
     let is_hevc_copy = segment_container == SegmentContainer::Fmp4;
 
-    let ffmpeg_audio_codec = match params
-        .audio_codec
-        .as_str()
-    {
-        "copy" => {
+    let ffmpeg_audio_codec = match params.audio_codec {
+        CodecTarget::Copy => {
             // IMPORTANT: do not remove this override.
             //
             // Some codecs can't be carried in the segment container (TrueHD,
@@ -959,7 +1029,7 @@ pub(crate) fn build_hls_args(params: &TranscodeParams) -> Vec<String> {
     } else {
         // QSV/VAAPI scale on the GPU whenever frames are VAAPI-resident; only
         // the SW tonemap path decodes to CPU memory and needs the CPU scale filter.
-        let scale_filter = if ffmpeg_video_codec != "copy" {
+        let scale_filter = if !video_encoder.is_copy() {
             if hw_gpu_resident(accel, treatment) {
                 Some(build_vaapi_scale_filter(
                     treatment,
@@ -975,10 +1045,10 @@ pub(crate) fn build_hls_args(params: &TranscodeParams) -> Vec<String> {
         let vf = match (&scale_filter, &hw_suffix) {
             (Some(s), Some(suf)) => Some(format!("{s},{suf}")),
             (Some(s), None) => Some(s.clone()),
-            (None, Some(suf)) if ffmpeg_video_codec != "copy" => Some(suf.clone()),
+            (None, Some(suf)) if !video_encoder.is_copy() => Some(suf.clone()),
             _ => None,
         };
-        let vf = if hdr && ffmpeg_video_codec != "copy" {
+        let vf = if hdr && !video_encoder.is_copy() {
             if do_sw_tonemap {
                 // Software tonemapx: CPU filter, output SDR. Rebuild filter chain
                 // from scale + tonemapx (bypassing hw_suffix which carries hwupload
@@ -1023,7 +1093,8 @@ pub(crate) fn build_hls_args(params: &TranscodeParams) -> Vec<String> {
         };
         if let Some(ref filter) = vf {
             args.extend(["-vf".into(), filter.clone()]);
-        } else if let Some(audio_idx) = params.audio_stream_index {
+        }
+        if let Some(audio_idx) = params.audio_stream_index {
             args.extend([
                 "-map".into(),
                 "0:v:0".into(),
@@ -1034,9 +1105,16 @@ pub(crate) fn build_hls_args(params: &TranscodeParams) -> Vec<String> {
     }
 
     // Video codec
-    args.extend(["-c:v".into(), ffmpeg_video_codec.clone()]);
-
-    if ffmpeg_video_codec == "copy" {
+    let quality = EncodeQuality {
+        preset: params
+            .encoding_preset
+            .unwrap_or_default()
+            .to_string(),
+        h264_crf: params.h264_crf,
+        video_bitrate: params.video_bitrate,
+    };
+    args.extend(video_encode_args(&video_encoder, &quality, true));
+    if video_encoder.is_copy() {
         if is_hevc_copy {
             args.extend([
                 "-tag:v".into(),
@@ -1060,70 +1138,13 @@ pub(crate) fn build_hls_args(params: &TranscodeParams) -> Vec<String> {
                 args.extend(["-bsf:v".into(), "dovi_rpu=strip=1".into()]);
             }
         }
-    } else if is_hw {
-        // HW encoders use bitrate control; CRF/preset/profile flags don't apply.
-        // h264_nvenc needs an explicit 8-bit output: 10-bit frames fail, and
-        // CUDA decode leaves frames in software memory so FFmpeg can convert
-        // them to yuv420p before the encoder.
-        if ffmpeg_video_codec == "h264_nvenc" {
-            args.extend(["-pix_fmt".into(), "yuv420p".into()]);
-        }
-        if let Some(bitrate) = params.video_bitrate {
-            args.extend(["-b:v".into(), bitrate.to_string()]);
-        }
-    } else if ffmpeg_video_codec == "libx264" {
-        let preset = params
-            .encoding_preset
-            .unwrap_or_default()
-            .to_string();
-        args.extend([
-            "-profile:v".into(),
-            "high".into(),
-            "-pix_fmt".into(),
-            "yuv420p".into(),
-            "-crf".into(),
-            params
-                .h264_crf
-                .to_string(),
-            "-preset".into(),
-            preset,
-            "-tune".into(),
-            "zerolatency".into(),
-        ]);
-        // Use client's max bitrate as a ceiling, not a CBR target.
-        if let Some(bitrate) = params.video_bitrate {
-            args.extend([
-                "-maxrate".into(),
-                bitrate.to_string(),
-                "-bufsize".into(),
-                (bitrate * 2).to_string(),
-            ]);
-        }
-    } else if ffmpeg_video_codec == "libx265" {
-        let preset = params
-            .encoding_preset
-            .unwrap_or_default()
-            .to_string();
-        args.extend([
-            "-pix_fmt".into(),
-            "yuv420p".into(),
-            "-crf".into(),
-            params
-                .h265_crf
-                .to_string(),
-            "-preset".into(),
-            preset,
-        ]);
-        if let Some(bitrate) = params.video_bitrate {
-            args.extend([
-                "-maxrate".into(),
-                bitrate.to_string(),
-                "-bufsize".into(),
-                (bitrate * 2).to_string(),
-            ]);
-        }
-    } else if let Some(bitrate) = params.video_bitrate {
-        args.extend(["-b:v".into(), bitrate.to_string()]);
+    }
+    if !video_encoder.is_copy() {
+        args.extend(hls_keyframe_args(
+            video_encoder.ffmpeg_name(),
+            params.segment_length,
+            params.source_frame_rate,
+        ));
     }
 
     // Audio codec
@@ -1184,15 +1205,30 @@ pub(crate) fn build_hls_args(params: &TranscodeParams) -> Vec<String> {
             .into_owned(),
     ]);
 
-    // Keep all segments for the playback session. This is also Jellyfin's
-    // live-TV HLS behavior: EVENT playlists grow for the duration of a live
-    // session and let clients start from its beginning.
-    args.extend([
-        "-hls_playlist_type".into(),
-        "event".into(),
-        "-hls_list_size".into(),
-        "0".into(),
-    ]);
+    if params.is_live {
+        // A sliding window of LIVE_REWIND_SECS: the playlist only lists the
+        // segments still kept, and ffmpeg deletes the ones that fall out of
+        // it, so a client never asks for a segment that is gone.
+        args.extend([
+            "-hls_list_size".into(),
+            (LIVE_REWIND_SECS
+                / params
+                    .segment_length
+                    .max(1))
+            .to_string(),
+            "-hls_flags".into(),
+            "delete_segments".into(),
+        ]);
+    } else {
+        // Keep all segments for the playback session: EVENT playlists grow
+        // for the duration of it and let clients start from its beginning.
+        args.extend([
+            "-hls_playlist_type".into(),
+            "event".into(),
+            "-hls_list_size".into(),
+            "0".into(),
+        ]);
+    }
 
     if is_hevc_copy {
         // Apple HLS spec: HEVC must be delivered in fMP4/CMAF segments, not MPEG-TS.
@@ -1235,7 +1271,7 @@ async fn run_ffmpeg(
     Option<std::result::Result<std::process::ExitStatus, std::io::Error>>,
     String,
 ) {
-    let mut cmd = tokio::process::Command::new(ffmpeg_bin());
+    let mut cmd = tokio::process::Command::new(crate::tools::ffmpeg());
     cmd.hide_console();
     cmd.args(&args)
         .stderr(Stdio::piped());
@@ -1257,7 +1293,7 @@ async fn run_ffmpeg(
         .unwrap_or(0);
     ffmpeg_pid_out.store(pid, Ordering::Relaxed);
     if pid > 0 {
-        let _ = std::fs::write(output_dir.join(".pid"), pid.to_string());
+        let _ = tokio::fs::write(output_dir.join(".pid"), pid.to_string()).await;
     }
     let stderr = child
         .stderr
@@ -1274,6 +1310,7 @@ async fn run_ffmpeg(
                 .await
             {
                 if !line.is_empty() {
+                    let line = crate::playback::probe::redact_urls_in(&line);
                     debug!("ffmpeg: {}", line);
                     buf.push_str(&line);
                     buf.push('\n');
@@ -1316,13 +1353,18 @@ pub async fn start_transcode(
         let mut s = session
             .write()
             .await;
+        // Stopped before it started: don't recreate the removed output dir.
+        if s.stopped {
+            return Ok(());
+        }
         s.state = TranscodeState::Running;
         let _ = s
             .state_tx
             .send(TranscodeState::Running);
     }
 
-    std::fs::create_dir_all(&params.output_dir)
+    tokio::fs::create_dir_all(&params.output_dir)
+        .await
         .map_err(|e| anyhow!("Failed to create output dir: {}", e))?;
 
     let session_clone = session.clone();
@@ -1334,7 +1376,10 @@ pub async fn start_transcode(
 
         loop {
             let args = build_hls_args(&params);
-            debug!("ffmpeg args: {}", args.join(" "));
+            debug!(
+                "ffmpeg args: {}",
+                crate::playback::probe::redact_urls_in(&args.join(" "))
+            );
 
             let (kill_tx, kill_rx) = tokio::sync::oneshot::channel::<()>();
             let (monitor_stop_tx, monitor_stop_rx) =
@@ -1345,6 +1390,14 @@ pub async fn start_transcode(
                 let mut s = session_clone
                     .write()
                     .await;
+                // Stopped between runs: don't respawn, and wake a stop that
+                // signalled the run that had just exited.
+                if s.stopped {
+                    debug!(session_id = %s.id, "transcode stopped before ffmpeg spawn");
+                    s.wait_done
+                        .notify_one();
+                    break;
+                }
                 s.start_time_secs = params
                     .start_time_ticks
                     .map(|t| (t / 10_000_000) as u32)
@@ -1360,6 +1413,7 @@ pub async fn start_transcode(
                     ffmpeg_pid.clone(),
                     monitor_stop_rx,
                     s.id.clone(),
+                    params.is_live,
                 );
                 s.output_dir
                     .clone()
@@ -1396,8 +1450,8 @@ pub async fn start_transcode(
                     "HW-accelerated transcode failed — retrying with software encoding"
                 );
                 // Clean partial output so the retry starts fresh.
-                let _ = std::fs::remove_dir_all(&params.output_dir);
-                let _ = std::fs::create_dir_all(&params.output_dir);
+                let _ = tokio::fs::remove_dir_all(&params.output_dir).await;
+                let _ = tokio::fs::create_dir_all(&params.output_dir).await;
                 params.accelerator = Box::new(NoAccel);
                 // VPP tonemap can't run without HW; preserve the user's intent by
                 // activating software tonemapping so HDR content isn't washed out.
@@ -1507,9 +1561,9 @@ pub async fn start_transcode(
 /// Parameters for a progressive (non-HLS) transcode that streams to stdout.
 pub struct ProgressiveTranscodeParams {
     pub input_url: String,
-    pub container: String,   // "mp4", "ts", "mkv", "webm"
-    pub video_codec: String, // "copy", "libx264", "libx265", "libvpx-vp9"
-    pub audio_codec: String, // "copy", "aac", "libopus"
+    pub container: String, // "mp4", "ts", "mkv", "webm"
+    pub video_codec: CodecTarget,
+    pub audio_codec: CodecTarget,
     pub start_time_ticks: Option<i64>,
     pub max_width: Option<u32>,
     pub max_height: Option<u32>,
@@ -1536,7 +1590,6 @@ pub struct ProgressiveTranscodeParams {
     pub allow_hevc_encoding: bool,
     pub allow_av1_encoding: bool,
     pub h264_crf: u32,
-    pub h265_crf: u32,
     /// Apply `loudnorm=I=-14:TP=-1:LRA=11` when transcoding audio. Has no effect
     /// when audio_codec is "copy". See EncodingOptions::normalize_audio_loudness.
     pub normalize_audio_loudness: bool,
@@ -1555,14 +1608,14 @@ pub(crate) enum ProgressiveFormat {
 impl ProgressiveFormat {
     /// The requested container, except that copied video into MP4 would need
     /// bitstream filters, so it is promoted to Matroska instead.
-    pub(crate) fn for_request(container: &str, video_codec: &str) -> Self {
+    pub(crate) fn for_request(container: &str, copy_video: bool) -> Self {
         let requested = match container {
             "ts" | "mpegts" => Self::Mpegts,
             "webm" => Self::Webm,
             "mkv" | "matroska" => Self::Matroska,
             _ => Self::Mp4,
         };
-        if video_codec == "copy" && requested == Self::Mp4 {
+        if copy_video && requested == Self::Mp4 {
             Self::Matroska
         } else {
             requested
@@ -1626,7 +1679,9 @@ pub(crate) fn build_progressive_args(
         && params
             .subtitle_stream_index
             .is_some_and(|index| index >= 0)
-        && params.video_codec != "copy";
+        && !params
+            .video_codec
+            .is_copy();
 
     let treatment = HdrTreatment::for_source(
         hdr,
@@ -1637,33 +1692,19 @@ pub(crate) fn build_progressive_args(
     );
     let do_sw_tonemap = treatment == HdrTreatment::SwTonemap;
 
-    let ffmpeg_video_codec = {
-        let base = match params
-            .video_codec
-            .as_str()
-        {
-            "copy" => "copy",
-            _ => "libx264",
-        };
-        if base != "copy" && is_hw {
-            accel.encoder_name(base)
-        } else {
-            base.to_string()
-        }
-    };
-    let ffmpeg_audio_codec = match params
-        .audio_codec
-        .as_str()
-    {
-        "copy" => "copy",
-        "aac" => "aac",
-        "libopus" | "opus" => "libopus",
-        "mp3" => "libmp3lame",
-        other => other,
+    let video_encoder = VideoEncoder::for_target(&params.video_codec, accel);
+    let ffmpeg_audio_codec = match &params.audio_codec {
+        CodecTarget::Copy => "copy",
+        CodecTarget::Transcode(codec) => match codec.as_str() {
+            "libopus" | "opus" => "libopus",
+            "mp3" => "libmp3lame",
+            other => other,
+        },
     };
 
-    let format = ProgressiveFormat::for_request(&params.container, &ffmpeg_video_codec)
-        .ffmpeg_name();
+    let format =
+        ProgressiveFormat::for_request(&params.container, video_encoder.is_copy())
+            .ffmpeg_name();
 
     let mut args: Vec<String> = vec![
         "-v".into(),
@@ -1710,7 +1751,7 @@ pub(crate) fn build_progressive_args(
     let hw_suffix = accel.hw_filter_suffix(treatment, &tonemap);
 
     // Stream mapping
-    let scale_filter = if ffmpeg_video_codec != "copy" {
+    let scale_filter = if !video_encoder.is_copy() {
         if hw_gpu_resident(accel, treatment) {
             Some(build_vaapi_scale_filter(
                 treatment,
@@ -1795,10 +1836,10 @@ pub(crate) fn build_progressive_args(
         let vf = match (&scale_filter, &hw_suffix) {
             (Some(s), Some(suf)) => Some(format!("{s},{suf}")),
             (Some(s), None) => Some(s.clone()),
-            (None, Some(suf)) if ffmpeg_video_codec != "copy" => Some(suf.clone()),
+            (None, Some(suf)) if !video_encoder.is_copy() => Some(suf.clone()),
             _ => None,
         };
-        let vf = if hdr && ffmpeg_video_codec != "copy" {
+        let vf = if hdr && !video_encoder.is_copy() {
             if do_sw_tonemap {
                 let algo = &params.tonemapping_algorithm;
                 let desat = params.tonemapping_desat;
@@ -1837,30 +1878,30 @@ pub(crate) fn build_progressive_args(
         };
         if let Some(ref filter) = vf {
             args.extend(["-vf".into(), filter.clone()]);
-        } else if params
-            .audio_stream_index
-            .is_some()
-            || params
-                .subtitle_stream_index
-                .is_some()
-        {
-            args.extend(["-map".into(), "0:v:0".into()]);
-            if let Some(audio_idx) = params.audio_stream_index {
-                args.extend(["-map".into(), format!("0:{}", audio_idx)]);
-            } else {
-                args.extend(["-map".into(), "0:a?".into()]);
-            }
-            if let Some(sub_idx) = params.subtitle_stream_index {
-                if sub_idx >= 0 {
-                    args.extend(["-map".into(), format!("0:{}?", sub_idx)]);
-                }
-            }
+        }
+        // Text subtitles are delivered separately; mapping one into the mp4
+        // output makes ffmpeg fail ("no encoder for codec none").
+        if let Some(audio_idx) = params.audio_stream_index {
+            args.extend([
+                "-map".into(),
+                "0:v:0".into(),
+                "-map".into(),
+                format!("0:{}", audio_idx),
+            ]);
         }
     }
 
     // Video
-    args.extend(["-c:v".into(), ffmpeg_video_codec.clone()]);
-    if ffmpeg_video_codec == "copy" {
+    let quality = EncodeQuality {
+        preset: params
+            .encoding_preset
+            .unwrap_or_default()
+            .to_string(),
+        h264_crf: params.h264_crf,
+        video_bitrate: params.video_bitrate,
+    };
+    args.extend(video_encode_args(&video_encoder, &quality, false));
+    if video_encoder.is_copy() {
         // Apply the HEVC sample-entry tag the client asked for.
         if params
             .source_video_codec
@@ -1883,67 +1924,6 @@ pub(crate) fn build_progressive_args(
                 .into(),
             ]);
         }
-    } else if is_hw {
-        // h264_nvenc needs an explicit 8-bit output: 10-bit frames fail, and
-        // CUDA decode leaves frames in software memory so FFmpeg can convert
-        // them to yuv420p before the encoder. The option applies with or
-        // without a bitrate.
-        if ffmpeg_video_codec == "h264_nvenc" {
-            args.extend(["-pix_fmt".into(), "yuv420p".into()]);
-        }
-        if let Some(bitrate) = params.video_bitrate {
-            args.extend(["-b:v".into(), bitrate.to_string()]);
-        }
-    } else if ffmpeg_video_codec == "libx264" {
-        let preset = params
-            .encoding_preset
-            .unwrap_or_default()
-            .to_string();
-        args.extend([
-            "-profile:v".into(),
-            "high".into(),
-            "-pix_fmt".into(),
-            "yuv420p".into(),
-            "-crf".into(),
-            params
-                .h264_crf
-                .to_string(),
-            "-preset".into(),
-            preset,
-        ]);
-        if let Some(bitrate) = params.video_bitrate {
-            args.extend([
-                "-maxrate".into(),
-                bitrate.to_string(),
-                "-bufsize".into(),
-                (bitrate * 2).to_string(),
-            ]);
-        }
-    } else if ffmpeg_video_codec == "libx265" {
-        let preset = params
-            .encoding_preset
-            .unwrap_or_default()
-            .to_string();
-        args.extend([
-            "-pix_fmt".into(),
-            "yuv420p".into(),
-            "-crf".into(),
-            params
-                .h265_crf
-                .to_string(),
-            "-preset".into(),
-            preset,
-        ]);
-        if let Some(bitrate) = params.video_bitrate {
-            args.extend([
-                "-maxrate".into(),
-                bitrate.to_string(),
-                "-bufsize".into(),
-                (bitrate * 2).to_string(),
-            ]);
-        }
-    } else if let Some(bitrate) = params.video_bitrate {
-        args.extend(["-b:v".into(), bitrate.to_string()]);
     }
 
     // Audio
@@ -1995,12 +1975,15 @@ pub fn start_progressive_transcode(
     impl futures::Stream<Item = std::result::Result<bytes::Bytes, std::io::Error>>,
 > {
     let args = build_progressive_args(&params);
-    debug!("ffmpeg progressive args: {:?}", args);
+    debug!(
+        "ffmpeg progressive args: {}",
+        crate::playback::probe::redact_urls_in(&args.join(" "))
+    );
 
     let env_overrides = params
         .accelerator
         .env_overrides();
-    let mut cmd = tokio::process::Command::new(ffmpeg_bin());
+    let mut cmd = tokio::process::Command::new(crate::tools::ffmpeg());
     cmd.hide_console();
     cmd.args(&args)
         .stdout(Stdio::piped())
@@ -2031,7 +2014,7 @@ pub fn start_progressive_transcode(
             .await
         {
             if !line.is_empty() {
-                debug!("ffmpeg: {}", line);
+                debug!("ffmpeg: {}", crate::playback::probe::redact_urls_in(&line));
             }
         }
         match child
@@ -2201,11 +2184,8 @@ pub fn generate_master_playlist(session: &TranscodeSession) -> String {
 
     let play_session_id = &session.id;
 
-    let video_codec_str: String = match session
-        .video_codec
-        .as_str()
-    {
-        "copy" => {
+    let video_codec_str: String = match &session.video_codec {
+        CodecTarget::Copy => {
             if session
                 .source_video_codec
                 .as_deref()
@@ -2235,19 +2215,22 @@ pub fn generate_master_playlist(session: &TranscodeSession) -> String {
                 "avc1.640028".to_string()
             }
         }
-        "h264" | "libx264" => "avc1.640028".to_string(),
-        // Encoding produces MPEG-TS segments, which carry no sample entry at
-        // all; hvc1 is the conventional RFC 6381 identifier there.
-        "hevc" | "libx265" => hevc_hls_codec_string(
-            "hvc1",
-            session
-                .source_video_profile
-                .as_deref(),
-            session.source_video_level,
-        ),
-        _ => "avc1.640028".to_string(),
+        CodecTarget::Transcode(codec) => match codec.as_str() {
+            // Encoding produces MPEG-TS segments, which carry no sample entry
+            // at all; hvc1 is the conventional RFC 6381 identifier there.
+            "hevc" | "libx265" => hevc_hls_codec_string(
+                "hvc1",
+                session
+                    .source_video_profile
+                    .as_deref(),
+                session.source_video_level,
+            ),
+            _ => "avc1.640028".to_string(),
+        },
     };
-    let audio_codec_str = if session.audio_codec == "copy"
+    let audio_codec_str = if session
+        .audio_codec
+        .is_copy()
         && session
             .segment_container()
             .can_copy_audio(
@@ -2298,7 +2281,10 @@ pub fn generate_master_playlist(session: &TranscodeSession) -> String {
     let codecs = format!("{},{}", video_codec_str, audio_codec_str);
 
     // VIDEO-RANGE: only meaningful for copy-mode (passthrough) video. Transcoded output is SDR.
-    let video_range_attr = if session.video_codec == "copy" {
+    let video_range_attr = if session
+        .video_codec
+        .is_copy()
+    {
         match session.source_video_range_type {
             Some(VideoRangeType::Hdr10)
             | Some(VideoRangeType::Hdr10Plus)
@@ -2332,7 +2318,7 @@ pub fn generate_master_playlist(session: &TranscodeSession) -> String {
         source_video_width = session.source_video_width,
         source_video_height = session.source_video_height,
         source_frame_rate = session.source_frame_rate,
-        video_codec = session.video_codec.as_str(),
+        video_codec = %session.video_codec,
         codecs = codecs.as_str(),
         "generating master HLS playlist"
     );
@@ -2370,11 +2356,54 @@ mod tests {
             .map(|w| w[1].as_str())
     }
 
+    fn mapped_streams(args: &[String]) -> Vec<&str> {
+        args.windows(2)
+            .filter(|w| w[0] == "-map")
+            .map(|w| w[1].as_str())
+            .collect()
+    }
+
     fn no_devices(_: &str) -> bool {
         false
     }
     fn all_devices(_: &str) -> bool {
         true
+    }
+
+    #[test]
+    fn a_recorded_stream_keeps_a_little_behind_the_playback_position() {
+        // 6 s segments: 130 s played, 30 s kept, so segments below 16 go.
+        assert_eq!(super::cleanup_cutoff(false, 130, 6), Some(16));
+        assert_eq!(super::cleanup_cutoff(false, 30, 6), None);
+        assert_eq!(super::cleanup_cutoff(false, 0, 6), None);
+    }
+
+    #[test]
+    fn a_live_stream_is_not_cleaned_up_by_position() {
+        // Its sliding playlist deletes segments; a client with no progress
+        // reports must not matter either way.
+        assert_eq!(super::cleanup_cutoff(true, 0, 6), None);
+        assert_eq!(super::cleanup_cutoff(true, 3600, 6), None);
+    }
+
+    #[test]
+    fn live_hls_is_a_thirty_minute_sliding_window_and_vod_an_event_playlist() {
+        let args_for = |is_live| {
+            super::build_hls_args(&super::TranscodeParams {
+                is_live,
+                segment_length: 6,
+                ..Default::default()
+            })
+        };
+        let live = args_for(true);
+        assert_eq!(arg_after(&live, "-hls_list_size"), Some("300"));
+        assert_eq!(arg_after(&live, "-hls_flags"), Some("delete_segments"));
+        assert_eq!(arg_after(&live, "-hls_playlist_type"), None);
+
+        let vod = args_for(false);
+        assert_eq!(arg_after(&vod, "-hls_list_size"), Some("0"));
+        assert_eq!(arg_after(&vod, "-hls_playlist_type"), Some("event"));
+        assert_eq!(arg_after(&vod, "-hls_flags"), None);
     }
 
     #[test]
@@ -2685,7 +2714,6 @@ mod tests {
             allow_hevc_encoding: false,
             allow_av1_encoding: false,
             h264_crf: 23,
-            h265_crf: 28,
             normalize_audio_loudness: false,
         }
     }
@@ -2727,6 +2755,85 @@ mod tests {
         assert_eq!(arg_after(&args, "-allowed_extensions"), Some("ALL"));
         assert_eq!(arg_after(&args, "-allowed_segment_extensions"), Some("ALL"));
         assert_eq!(arg_after(&args, "-extension_picky"), Some("0"));
+    }
+
+    fn encode_args(video_codec: &str, frame_rate: Option<f32>) -> Vec<String> {
+        hls_keyframe_args(video_codec, 6, frame_rate)
+    }
+
+    #[test]
+    fn software_encodes_cut_a_keyframe_at_every_segment() {
+        let args = encode_args("libx264", Some(23.976));
+        assert_eq!(
+            arg_after(&args, "-force_key_frames:0"),
+            Some("expr:gte(t,n_forced*6)")
+        );
+        assert_eq!(arg_after(&args, "-sc_threshold:v:0"), Some("0"));
+        assert_eq!(arg_after(&args, "-g:v:0"), None);
+    }
+
+    #[test]
+    fn encoders_that_ignore_forced_keyframes_get_a_segment_long_gop() {
+        for codec in ["h264_qsv", "h264_nvenc", "h264_amf", "hevc_rkmpp"] {
+            let args = encode_args(codec, Some(23.976));
+            assert_eq!(arg_after(&args, "-g:v:0"), Some("144"), "{codec}");
+            assert_eq!(arg_after(&args, "-keyint_min:v:0"), Some("144"), "{codec}");
+            assert_eq!(arg_after(&args, "-force_key_frames:0"), None, "{codec}");
+        }
+        // Without a frame rate there is no GOP to compute.
+        assert!(encode_args("h264_qsv", None).is_empty());
+    }
+
+    #[test]
+    fn vaapi_forces_keyframes_without_a_gop_and_others_get_both() {
+        let vaapi = encode_args("h264_vaapi", Some(25.0));
+        assert!(arg_after(&vaapi, "-force_key_frames:0").is_some());
+        assert_eq!(arg_after(&vaapi, "-g:v:0"), None);
+        let other = encode_args("h264_videotoolbox", Some(25.0));
+        assert!(arg_after(&other, "-force_key_frames:0").is_some());
+        assert_eq!(arg_after(&other, "-g:v:0"), Some("150"));
+    }
+
+    #[test]
+    fn hls_encode_gets_keyframe_args_and_copy_does_not() {
+        let encode = build_hls_args(&TranscodeParams {
+            video_codec: "h264".into(),
+            source_frame_rate: Some(24.0),
+            ..default_hls(PathBuf::from("/tmp/test_keyframes"))
+        });
+        assert_eq!(
+            arg_after(&encode, "-force_key_frames:0"),
+            Some("expr:gte(t,n_forced*6)")
+        );
+        let copy = build_hls_args(&TranscodeParams {
+            video_codec: "copy".into(),
+            source_frame_rate: Some(24.0),
+            ..default_hls(PathBuf::from("/tmp/test_keyframes"))
+        });
+        assert_eq!(arg_after(&copy, "-force_key_frames:0"), None);
+    }
+
+    #[test]
+    fn hls_hevc_copy_for_a_ts_client_uses_mpegts_segments() {
+        let args = build_hls_args(&TranscodeParams {
+            video_codec: "copy".into(),
+            source_video_codec: Some("hevc".into()),
+            hevc_in_ts: true,
+            ..default_hls(PathBuf::from("/tmp/test_hevc_ts"))
+        });
+
+        assert_eq!(arg_after(&args, "-hls_segment_type"), None);
+        assert_eq!(arg_after(&args, "-hls_fmp4_init_filename"), None);
+        assert_eq!(arg_after(&args, "-tag:v"), None);
+        assert!(
+            args.iter()
+                .any(|a| a.ends_with("%d.ts") || a.contains(".ts")),
+            "{args:?}"
+        );
+
+        let mut session = hevc_session("copy", None);
+        session.hevc_in_ts = true;
+        assert!(!session.use_fmp4());
     }
 
     #[test]
@@ -2908,6 +3015,7 @@ mod tests {
     fn hevc_session(video_codec: &str, tag: Option<&str>) -> TranscodeSession {
         TranscodeSession {
             id: "play-session".into(),
+            user_id: Uuid::nil(),
             item_id: Uuid::nil(),
             media_source_id: Uuid::nil(),
             output_dir: PathBuf::from("/tmp/test_master"),
@@ -2918,12 +3026,16 @@ mod tests {
             video_codec: video_codec.into(),
             audio_codec: "aac".into(),
             audio_stream_index: None,
+            audio_channels: None,
+            source_audio_index: None,
+            hevc_in_ts: false,
             subtitle_stream_index: None,
             burn_subtitle: false,
             segment_length: 6,
             transcode_reasons: TranscodeReasons::default(),
             kill_tx: None,
             wait_done: Arc::new(tokio::sync::Notify::new()),
+            stopped: false,
             last_segment_index: Arc::new(AtomicU32::new(0)),
             start_time_secs: 0,
             playback_offset_secs: Arc::new(AtomicU32::new(0)),
@@ -3046,15 +3158,15 @@ mod tests {
     #[test]
     fn progressive_format_promotes_copied_mp4_to_matroska() {
         assert_eq!(
-            ProgressiveFormat::for_request("mp4", "copy"),
+            ProgressiveFormat::for_request("mp4", true),
             ProgressiveFormat::Matroska
         );
         assert_eq!(
-            ProgressiveFormat::for_request("mp4", "libx264"),
+            ProgressiveFormat::for_request("mp4", false),
             ProgressiveFormat::Mp4
         );
         assert_eq!(
-            ProgressiveFormat::for_request("ts", "copy"),
+            ProgressiveFormat::for_request("ts", true),
             ProgressiveFormat::Mpegts
         );
     }
@@ -3133,6 +3245,7 @@ mod tests {
     fn resumed_vod_playlist_advertises_start_offset_and_full_seek_map() {
         let session = TranscodeSession {
             id: "play-session".into(),
+            user_id: Uuid::nil(),
             item_id: Uuid::nil(),
             media_source_id: Uuid::nil(),
             output_dir: PathBuf::from("/tmp/test_playlist"),
@@ -3143,12 +3256,16 @@ mod tests {
             video_codec: "copy".into(),
             audio_codec: "aac".into(),
             audio_stream_index: None,
+            audio_channels: None,
+            source_audio_index: None,
+            hevc_in_ts: false,
             subtitle_stream_index: None,
             burn_subtitle: false,
             segment_length: 6,
             transcode_reasons: TranscodeReasons::default(),
             kill_tx: None,
             wait_done: Arc::new(tokio::sync::Notify::new()),
+            stopped: false,
             last_segment_index: Arc::new(AtomicU32::new(0)),
             start_time_secs: 30,
             playback_offset_secs: Arc::new(AtomicU32::new(0)),
@@ -3206,6 +3323,19 @@ mod tests {
         let vf = arg_after(&args, "-vf").expect("-vf missing");
         assert!(vf.contains("min(1280,iw)"), "vf: {vf}");
         assert!(vf.contains(":-2"), "vf: {vf}");
+    }
+
+    #[test]
+    fn hls_video_filter_keeps_selected_audio_track() {
+        let args = build_hls_args(&TranscodeParams {
+            video_codec: "libx264".into(),
+            max_width: Some(1280),
+            audio_stream_index: Some(1),
+            ..default_hls(PathBuf::from("/tmp/test_vf_audio"))
+        });
+
+        assert!(args_contains(&args, "-vf"));
+        assert_eq!(mapped_streams(&args), ["0:v:0", "0:1"]);
     }
 
     #[test]
@@ -4563,6 +4693,32 @@ mod tests {
 
         assert_eq!(arg_after(&args, "-c:v"), Some("copy"));
         assert!(!args_contains(&args, "-filter_complex"));
+    }
+
+    #[test]
+    fn progressive_video_filter_keeps_selected_audio_track() {
+        let args = build_progressive_args(&ProgressiveTranscodeParams {
+            video_codec: "libx264".into(),
+            max_width: Some(1280),
+            audio_stream_index: Some(1),
+            ..default_progressive()
+        });
+
+        assert!(args_contains(&args, "-vf"));
+        assert_eq!(mapped_streams(&args), ["0:v:0", "0:1"]);
+    }
+
+    #[test]
+    fn progressive_text_subtitle_is_not_mapped_into_output() {
+        let args = build_progressive_args(&ProgressiveTranscodeParams {
+            video_codec: "libx264".into(),
+            max_width: Some(1280),
+            audio_stream_index: Some(1),
+            subtitle_stream_index: Some(2),
+            ..default_progressive()
+        });
+
+        assert_eq!(mapped_streams(&args), ["0:v:0", "0:1"]);
     }
 
     #[test]

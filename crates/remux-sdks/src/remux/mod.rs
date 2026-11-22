@@ -35,19 +35,11 @@ use crate::{Auth, Body, Endpoint, RestClient, stremio};
 #[strum(serialize_all = "PascalCase")]
 pub enum WebhookEvent {
     #[serde(alias = "PlaybackStarted")]
-    #[strum(
-        to_string = "PlaybackStart",
-        serialize = "PlaybackStart",
-        serialize = "PlaybackStarted"
-    )]
+    #[strum(to_string = "PlaybackStart", serialize = "PlaybackStarted")]
     PlaybackStart,
     PlaybackProgress,
     #[serde(alias = "PlaybackStopped")]
-    #[strum(
-        to_string = "PlaybackStop",
-        serialize = "PlaybackStop",
-        serialize = "PlaybackStopped"
-    )]
+    #[strum(to_string = "PlaybackStop", serialize = "PlaybackStopped")]
     PlaybackStop,
     UserDataSaved,
     UserUpdated,
@@ -774,9 +766,17 @@ pub struct ServerConfiguration {
     /// Maximum number of alternative streams to try before giving up (default: 3).
     #[default(Some(3_i64))]
     pub max_probe_fallback_streams: Option<i64>,
+    /// Group streams at all (default true). Off ignores every stream group
+    /// without touching their own enabled flags.
+    #[default(Some(true))]
+    pub stream_groups_enabled: Option<bool>,
     /// Show streams that don't match any group individually (default true).
     #[default(Some(true))]
     pub stream_groups_show_ungrouped: Option<bool>,
+    /// Rank the stream groups themselves with the media source sort mode, by
+    /// the best stream in each. Off keeps the order set on the groups page.
+    #[default(Some(false))]
+    pub stream_groups_auto_sort: Option<bool>,
     /// Enable submitting probe data to remuxdb (default true).
     #[default(Some(true))]
     pub remuxdb_enabled: Option<bool>,
@@ -797,6 +797,11 @@ pub struct ServerConfiguration {
     /// Disabled by default to retain Jellyfin's standard resume-only behaviour.
     #[default(Some(false))]
     pub enable_next_up_in_continue_watching: Option<bool>,
+    /// Ignore each user's saved `OrderedViews` and serve the admin's default
+    /// library order (dashboard drag-reorder) from `/userviews` and the user's
+    /// configuration. Saved user orders are kept and apply again once this is off.
+    #[default(Some(false))]
+    pub force_default_view_order: Option<bool>,
     /// How to order MediaSources for the requesting device when a DeviceProfile
     /// is available: `Disabled` (leave probe/addon order alone), `Best`
     /// (default — Direct Play and Direct Stream count equally, so quality
@@ -1274,6 +1279,9 @@ pub struct PublicSystemInfo {
     pub remux_version: String,
     pub operating_system: String,
     pub remux_started_at: Option<String>,
+    /// Mirrors `ForceDefaultViewOrder`: when true, users cannot reorder their
+    /// home screen libraries, so clients can disable their reorder controls.
+    pub remux_force_default_view_order: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1289,6 +1297,8 @@ pub struct SystemInfo {
     pub product_name: String,
     pub version: String,
     pub remux_version: String,
+    /// See `PublicSystemInfo::remux_force_default_view_order`.
+    pub remux_force_default_view_order: bool,
     #[default(false)]
     pub has_pending_restart: bool,
     #[default(false)]
@@ -1502,6 +1512,31 @@ pub struct DeviceInfoRemux {
     pub remote_end_point: Option<String>,
     pub user_id: Option<Uuid>,
     pub is_current_session: Option<bool>,
+    pub four_k: Option<FourKSupport>,
+}
+
+/// Whether a device is treated as able to show 4K when versions are ranked.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Default,
+    Serialize,
+    Deserialize,
+    strum_macros::Display,
+    strum_macros::EnumString,
+)]
+#[serde(rename_all = "PascalCase")]
+#[strum(serialize_all = "PascalCase")]
+pub enum FourKSupport {
+    /// Not known yet. Becomes Supported once the device has played 4K for
+    /// ten minutes.
+    #[default]
+    Auto,
+    Supported,
+    Unsupported,
 }
 
 // Jellyfin-compatible activity log entry shape.
@@ -1567,6 +1602,7 @@ pub struct SpecialViewOptionDto {
 )]
 #[serde_as]
 #[derive(default2::Default, Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all(serialize = "PascalCase"))]
 #[skip_serializing_none]
 pub struct GetItemsQuery {
     pub user_id: Option<Uuid>,
@@ -1834,6 +1870,22 @@ impl GetItemsQuery {
                     .then_some(true)
             })
     }
+
+    /// The like constraint, from `Filters=Likes` (liked) or `Filters=Dislikes`
+    /// (everything not liked, unrated items included, as in Jellyfin).
+    pub fn liked(&self) -> Option<bool> {
+        let filters = self
+            .filters
+            .as_deref()
+            .unwrap_or(&[]);
+        if filters.contains(&ItemFilter::Likes) {
+            Some(true)
+        } else if filters.contains(&ItemFilter::Dislikes) {
+            Some(false)
+        } else {
+            None
+        }
+    }
 }
 
 impl GetItemsQuery {
@@ -1893,10 +1945,6 @@ impl GetItemsQuery {
             .as_ref()
             .map(|tokens| AnyProviderIds::parse(tokens))
     }
-}
-
-fn bool_true() -> bool {
-    true
 }
 
 pub fn deserialize_query_bool_from_anything<'de, D>(d: D) -> Result<bool, D::Error>
@@ -2173,6 +2221,7 @@ pub struct VideoStreamQuery {
     pub live_stream_id: Option<String>,
 }
 
+#[skip_serializing_none]
 #[derive(Default, Debug, Serialize, Deserialize, Clone, PartialEq)]
 #[serde(rename_all = "PascalCase", default)]
 pub struct TranscodingProfile {
@@ -2189,10 +2238,15 @@ pub struct TranscodingProfile {
         serialize_with = "ser_csv"
     )]
     pub audio_codec: Option<Vec<AudioCodec>>,
+    /// Channel cap for audio the server re-encodes for this profile. Clients
+    /// send it as a string (`"6"`).
+    #[serde(deserialize_with = "deserialize_option_number_from_string")]
+    pub max_audio_channels: Option<i64>,
     #[serde(rename = "Type")]
     pub type_: Option<DlnaProfileType>,
 }
 
+#[skip_serializing_none]
 #[derive(Default, Debug, Serialize, Deserialize, Clone, PartialEq)]
 #[serde(rename_all = "PascalCase", default)]
 pub struct DeviceProfile {
@@ -2208,6 +2262,7 @@ pub struct DeviceProfile {
     pub subtitle_profiles: Vec<SubtitleProfile>,
 }
 
+#[skip_serializing_none]
 #[derive(Default, Debug, Serialize, Deserialize, Clone, PartialEq)]
 #[serde(rename_all = "PascalCase", default)]
 pub struct DirectPlayProfile {
@@ -2230,6 +2285,7 @@ pub struct DirectPlayProfile {
     pub type_: Option<DlnaProfileType>,
 }
 
+#[skip_serializing_none]
 #[derive(Default, Debug, Serialize, Deserialize, Clone, PartialEq)]
 #[serde(rename_all = "PascalCase", default)]
 pub struct ContainerProfile {
@@ -2239,6 +2295,7 @@ pub struct ContainerProfile {
     pub conditions: Vec<ProfileCondition>,
 }
 
+#[skip_serializing_none]
 #[derive(Default, Debug, Serialize, Deserialize, Clone, PartialEq)]
 #[serde(rename_all = "PascalCase", default)]
 pub struct CodecProfile {
@@ -2251,6 +2308,7 @@ pub struct CodecProfile {
     pub apply_conditions: Vec<ProfileCondition>,
 }
 
+#[skip_serializing_none]
 #[derive(Default, Debug, Serialize, Deserialize, Clone, PartialEq)]
 #[serde(rename_all = "PascalCase", default)]
 pub struct SubtitleProfile {
@@ -2355,6 +2413,7 @@ impl<'de> Deserialize<'de> for ProfileConditionProperty {
     }
 }
 
+#[skip_serializing_none]
 #[derive(Default, Debug, Serialize, Deserialize, Clone, PartialEq)]
 #[serde(rename_all = "PascalCase", default)]
 pub struct ProfileCondition {
@@ -2710,7 +2769,11 @@ pub struct MediaSourceInfo {
     pub is_remote: bool,
     //pub iso_type: Option<IsoType>,
     pub live_stream_id: Option<String>,
-    //pub media_attachments: Option<Vec<MediaAttachment>>,
+    /// Files attached to the container (MKV fonts for ASS/SSA subtitles).
+    /// jellyfin-web loads the font ones into its libass renderer. `None` in a
+    /// stored probe means they were never read (a RemuxDB record, or a probe
+    /// from before they were recorded); `Some([])` means the file has none.
+    pub media_attachments: Option<Vec<MediaAttachment>>,
     #[default(vec![])]
     pub media_streams: Vec<MediaStream>,
     pub name: Option<String>,
@@ -2753,6 +2816,48 @@ pub struct MediaSourceInfo {
     pub remux: Option<MediaSourceRemuxInfo>,
     #[serde(default, skip_serializing_if = "TranscodeReasons::is_empty")]
     pub transcoding_reasons: TranscodeReasons,
+}
+
+/// What the user last chose for subtitles: none at all, or a language.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RememberedSubtitle {
+    Off,
+    Language(String),
+}
+
+impl RememberedSubtitle {
+    const OFF: &'static str = "off";
+
+    /// The stored form: `off`, or a two-letter language code.
+    pub fn parse(stored: &str) -> Option<Self> {
+        let stored = stored.trim();
+        if stored.eq_ignore_ascii_case(Self::OFF) {
+            Some(Self::Off)
+        } else {
+            lang_to_two_letter(stored).map(Self::Language)
+        }
+    }
+
+    pub fn as_stored(&self) -> &str {
+        match self {
+            Self::Off => Self::OFF,
+            Self::Language(lang) => lang,
+        }
+    }
+}
+
+/// The languages a user last chose, as two-letter codes. Looked up per play
+/// rather than per file, so the choice follows the user across releases and
+/// titles.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RememberedLanguages {
+    pub audio: Option<String>,
+    pub subtitle: Option<RememberedSubtitle>,
+    /// The media source the remembered track *indexes* were saved on. An
+    /// index only means something in that file: another release of the same
+    /// title can carry a different language at the same position. `None`
+    /// puts no limit on the indexes.
+    pub indexes_source: Option<Uuid>,
 }
 
 /// Normalize a language tag (two-letter code, three-letter ISO 639-3 code, or
@@ -2806,10 +2911,7 @@ impl MediaSourceInfo {
     pub fn default_audio_stream(&self) -> Option<&MediaStream> {
         self.media_streams
             .iter()
-            .find(|s| {
-                matches!(s.type_, Some(MediaStreamType::Audio))
-                    && s.is_default == Some(true)
-            })
+            .find(|s| matches!(s.type_, MediaStreamType::Audio) && s.is_default)
     }
 
     /// The container's default subtitle stream: the first stream flagged
@@ -2817,16 +2919,13 @@ impl MediaSourceInfo {
     pub fn default_subtitle_stream(&self) -> Option<&MediaStream> {
         self.media_streams
             .iter()
-            .find(|s| {
-                matches!(s.type_, Some(MediaStreamType::Subtitle))
-                    && s.is_default == Some(true)
-            })
+            .find(|s| matches!(s.type_, MediaStreamType::Subtitle) && s.is_default)
     }
 
     fn stream_exists(&self, index: i64, kind: MediaStreamType) -> bool {
         self.media_streams
             .iter()
-            .any(|s| s.index == index && matches!(s.type_, Some(t) if t == kind))
+            .any(|s| s.index == index && s.type_ == kind)
     }
 
     /// Among subtitle streams matching `target`'s two-letter language, prefer
@@ -2834,9 +2933,22 @@ impl MediaSourceInfo {
     /// (PGS/VobSub/DVDSub) — text works almost everywhere with no burn-in or
     /// OCR needed, so a release with both an image and a text track in the
     /// same language should default to the text one.
+    fn audio_stream_for_language(&self, target: &str) -> Option<&MediaStream> {
+        self.media_streams
+            .iter()
+            .find(|s| {
+                matches!(s.type_, MediaStreamType::Audio)
+                    && s.language
+                        .as_deref()
+                        .and_then(lang_to_two_letter)
+                        .as_deref()
+                        == Some(target)
+            })
+    }
+
     fn best_subtitle_for_language(&self, target: &str) -> Option<&MediaStream> {
         let matches_lang = |s: &&MediaStream| {
-            matches!(s.type_, Some(MediaStreamType::Subtitle))
+            matches!(s.type_, MediaStreamType::Subtitle)
                 && s.language
                     .as_deref()
                     .and_then(lang_to_two_letter)
@@ -2880,6 +2992,43 @@ impl MediaSourceInfo {
         remembered_audio: Option<i64>,
         remembered_subtitle: Option<i64>,
     ) {
+        self.resolve_default_streams_remembering(
+            user,
+            server_metadata_language,
+            original_language,
+            requested_audio,
+            requested_subtitle,
+            remembered_audio,
+            remembered_subtitle,
+            &RememberedLanguages::default(),
+        );
+    }
+
+    /// [`Self::resolve_default_streams`] that also knows the languages the user
+    /// last chose. A remembered language beats a remembered index (an index
+    /// only means something in the file it was saved for) and is looked for in
+    /// this source's own tracks; one this source lacks is skipped. Remembered
+    /// indexes saved on another source (see
+    /// [`RememberedLanguages::indexes_source`]) are ignored.
+    pub fn resolve_default_streams_remembering(
+        &mut self,
+        user: &UserConfiguration,
+        server_metadata_language: Option<&str>,
+        original_language: Option<&str>,
+        requested_audio: Option<i64>,
+        requested_subtitle: Option<i64>,
+        remembered_audio: Option<i64>,
+        remembered_subtitle: Option<i64>,
+        languages: &RememberedLanguages,
+    ) {
+        // An index saved on another release of this title would pick whatever
+        // that position holds here, often another language.
+        let indexes_apply = languages
+            .indexes_source
+            .is_none_or(|source| source == self.id);
+        let remembered_audio = remembered_audio.filter(|_| indexes_apply);
+        let remembered_subtitle = remembered_subtitle.filter(|_| indexes_apply);
+
         // -1 is Jellyfin's sentinel for "not set"; treat it the same as None.
         let client_wants_audio = requested_audio
             .map(|x| x >= 0)
@@ -2893,6 +3042,9 @@ impl MediaSourceInfo {
         // fallback override it, matching Jellyfin's behaviour.
         let mut audio_decided = false;
         let mut subtitle_decided = false;
+        // The user last watched without subtitles: no subtitle mode turns them
+        // back on.
+        let mut subtitles_remembered_off = false;
 
         // --- client explicit selection wins ---
         if client_wants_audio {
@@ -2912,8 +3064,45 @@ impl MediaSourceInfo {
             }
         }
 
-        // --- remembered selections ---
+        // --- remembered languages ---
         if !client_wants_audio && user.remember_audio_selections {
+            if let Some(stream) = languages
+                .audio
+                .as_deref()
+                .and_then(|lang| self.audio_stream_for_language(lang))
+            {
+                self.default_audio_stream_index = Some(stream.index);
+                audio_decided = true;
+            }
+        }
+        if !client_wants_subtitle && user.remember_subtitle_selections {
+            match &languages.subtitle {
+                Some(RememberedSubtitle::Off) => {
+                    self.default_subtitle_stream_index = None;
+                    subtitle_decided = true;
+                    subtitles_remembered_off = true;
+                }
+                Some(RememberedSubtitle::Language(lang)) => {
+                    if let Some(stream) = self.best_subtitle_for_language(lang) {
+                        self.default_subtitle_stream_index = Some(stream.index);
+                        subtitle_decided = true;
+                    }
+                }
+                None => {}
+            }
+        }
+
+        // --- remembered selections ---
+        // A remembered language that this release lacks must not fall back to
+        // an index: the index belongs to another release and would pick an
+        // unrelated language. It only serves rows saved before languages were.
+        if !client_wants_audio
+            && !audio_decided
+            && languages
+                .audio
+                .is_none()
+            && user.remember_audio_selections
+        {
             if let Some(idx) = remembered_audio {
                 if self.stream_exists(idx, MediaStreamType::Audio) {
                     self.default_audio_stream_index = Some(idx);
@@ -2921,7 +3110,13 @@ impl MediaSourceInfo {
                 }
             }
         }
-        if !client_wants_subtitle && user.remember_subtitle_selections {
+        if !client_wants_subtitle
+            && !subtitle_decided
+            && languages
+                .subtitle
+                .is_none()
+            && user.remember_subtitle_selections
+        {
             if let Some(idx) = remembered_subtitle {
                 if self.stream_exists(idx, MediaStreamType::Subtitle) {
                     self.default_subtitle_stream_index = Some(idx);
@@ -2943,7 +3138,7 @@ impl MediaSourceInfo {
                             .media_streams
                             .iter()
                             .find(|s| {
-                                matches!(s.type_, Some(MediaStreamType::Audio))
+                                matches!(s.type_, MediaStreamType::Audio)
                                     && s.language
                                         .as_deref()
                                         .and_then(lang_to_two_letter)
@@ -2952,7 +3147,6 @@ impl MediaSourceInfo {
                             })
                         {
                             self.default_audio_stream_index = Some(stream.index);
-                            audio_decided = true;
                         }
                     }
                 }
@@ -2964,7 +3158,7 @@ impl MediaSourceInfo {
                             .media_streams
                             .iter()
                             .find(|s| {
-                                matches!(s.type_, Some(MediaStreamType::Audio))
+                                matches!(s.type_, MediaStreamType::Audio)
                                     && s.language
                                         .as_deref()
                                         .and_then(lang_to_two_letter)
@@ -2973,7 +3167,6 @@ impl MediaSourceInfo {
                             })
                         {
                             self.default_audio_stream_index = Some(stream.index);
-                            audio_decided = true;
                         }
                     }
                 }
@@ -3022,9 +3215,11 @@ impl MediaSourceInfo {
                 self.default_audio_stream_index = Some(s.index);
             }
         }
-        if self
-            .default_subtitle_stream_index
-            .is_none()
+        // A subtitle choice already made, "off" included, is not second-guessed.
+        if !subtitle_decided
+            && self
+                .default_subtitle_stream_index
+                .is_none()
         {
             if let Some(s) = self.default_subtitle_stream() {
                 self.default_subtitle_stream_index = Some(s.index);
@@ -3032,7 +3227,9 @@ impl MediaSourceInfo {
         }
 
         // --- subtitle_mode ---
-        self.apply_subtitle_mode(&user.subtitle_mode);
+        if !subtitles_remembered_off {
+            self.apply_subtitle_mode(&user.subtitle_mode);
+        }
     }
 
     /// Modes only decide the *selection* (`default_subtitle_stream_index`); the
@@ -3055,7 +3252,7 @@ impl MediaSourceInfo {
                         .media_streams
                         .iter()
                         .find_map(|s| {
-                            if matches!(s.type_, Some(MediaStreamType::Subtitle))
+                            if matches!(s.type_, MediaStreamType::Subtitle)
                                 && !s.is_forced
                             {
                                 Some(s.index)
@@ -3075,9 +3272,7 @@ impl MediaSourceInfo {
                     .media_streams
                     .iter()
                     .find_map(|s| {
-                        if matches!(s.type_, Some(MediaStreamType::Subtitle))
-                            && s.is_forced
-                        {
+                        if matches!(s.type_, MediaStreamType::Subtitle) && s.is_forced {
                             Some(s.index)
                         } else {
                             None
@@ -3093,7 +3288,7 @@ impl MediaSourceInfo {
                         .media_streams
                         .iter()
                         .find(|s| {
-                            matches!(s.type_, Some(MediaStreamType::Audio))
+                            matches!(s.type_, MediaStreamType::Audio)
                                 && Some(s.index) == self.default_audio_stream_index
                         })
                         .and_then(|s| {
@@ -3165,19 +3360,19 @@ impl MediaSourceInfo {
     pub fn video_stream(&self) -> Option<&MediaStream> {
         self.media_streams
             .iter()
-            .find(|s| matches!(s.type_, Some(MediaStreamType::Video)))
+            .find(|s| matches!(s.type_, MediaStreamType::Video))
     }
 
     pub fn audio_stream(&self) -> Option<&MediaStream> {
         self.media_streams
             .iter()
-            .find(|s| matches!(s.type_, Some(MediaStreamType::Audio)))
+            .find(|s| matches!(s.type_, MediaStreamType::Audio))
     }
 
     pub fn subtitle_stream(&self) -> Option<&MediaStream> {
         self.media_streams
             .iter()
-            .find(|s| matches!(s.type_, Some(MediaStreamType::Subtitle)))
+            .find(|s| matches!(s.type_, MediaStreamType::Subtitle))
     }
 
     /// Returns the video stream's bitrate, falling back to container total minus
@@ -3194,13 +3389,11 @@ impl MediaSourceInfo {
         let non_video: Vec<&MediaStream> = self
             .media_streams
             .iter()
-            .filter(|s| {
-                !matches!(s.type_, Some(MediaStreamType::Video)) && !s.is_external
-            })
+            .filter(|s| !matches!(s.type_, MediaStreamType::Video) && !s.is_external)
             .collect();
         let all_audio_known = non_video
             .iter()
-            .filter(|s| matches!(s.type_, Some(MediaStreamType::Audio)))
+            .filter(|s| matches!(s.type_, MediaStreamType::Audio))
             .all(|s| {
                 s.bit_rate
                     .is_some()
@@ -3424,6 +3617,14 @@ pub enum ImageType {
     Thumb,
 }
 
+/// Jellyfin renders user ids without dashes.
+fn serialize_uuid_simple<S: serde::Serializer>(
+    id: &Uuid,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    serializer.collect_str(&id.simple())
+}
+
 #[skip_serializing_none]
 #[derive(Deserialize, Serialize, Clone, Debug, PartialEq)]
 #[serde(rename_all = "PascalCase")]
@@ -3433,6 +3634,7 @@ pub struct UserDto {
     pub has_configured_easy_password: bool,
     pub has_configured_password: bool,
     pub has_password: bool,
+    #[serde(serialize_with = "serialize_uuid_simple")]
     pub id: Uuid,
     pub last_activity_date: Option<DateTime<Utc>>,
     pub last_login_date: Option<DateTime<Utc>>,
@@ -3644,6 +3846,19 @@ pub struct UpdateUserPassword {
     pub reset_password: Option<bool>,
 }
 
+/// An attachment stream of a media source (Jellyfin `MediaAttachment`).
+#[dto]
+pub struct MediaAttachment {
+    pub codec: Option<String>,
+    pub codec_tag: Option<String>,
+    pub comment: Option<String>,
+    /// Container stream index (ffmpeg's absolute stream index).
+    pub index: i64,
+    pub file_name: Option<String>,
+    pub mime_type: Option<String>,
+    pub delivery_url: Option<String>,
+}
+
 #[dto]
 pub struct MediaStream {
     pub aspect_ratio: Option<String>,
@@ -3676,7 +3891,9 @@ pub struct MediaStream {
     pub index: i64,
     pub is_anamorphic: Option<bool>,
     pub is_avc: Option<bool>,
-    pub is_default: Option<bool>,
+    /// Always sent: Jellyfin 12 clients' models require it.
+    #[serde(default)]
+    pub is_default: bool,
     #[serde(default)]
     pub is_external: bool,
     pub is_external_url: Option<bool>,
@@ -3686,6 +3903,10 @@ pub struct MediaStream {
     pub is_hearing_impaired: bool,
     #[serde(default)]
     pub is_interlaced: bool,
+    /// Jellyfin 12 marks the track in the title's original language. Its
+    /// clients' models require the field, so it is always sent.
+    #[serde(default)]
+    pub is_original: bool,
     #[serde(default, skip_deserializing)]
     pub is_text_subtitle_stream: bool,
     pub language: Option<String>,
@@ -3710,7 +3931,10 @@ pub struct MediaStream {
     pub supports_external_stream: bool,
     pub time_base: Option<String>,
     pub title: Option<String>,
-    pub type_: Option<MediaStreamType>,
+    /// Jellyfin 12 clients' models require it. A stored stream of a kind
+    /// RemuxDB didn't name was saved without one; it reads back as data.
+    #[serde(default = "MediaStreamType::data")]
+    pub type_: MediaStreamType,
     pub video_do_vi_title: Option<String>,
     pub video_range: Option<VideoRange>,
     pub video_range_type: Option<VideoRangeType>,
@@ -4030,6 +4254,10 @@ pub enum FilterRule {
     Favorite {
         value: bool,
     },
+    /// Matches items the requesting user has (or has not) put on their watchlist.
+    Watchlist {
+        value: bool,
+    },
     /// Matches items the requesting user has (or has not) played (play_count > 0).
     #[serde(alias = "watched")]
     Played {
@@ -4042,6 +4270,13 @@ pub enum FilterRule {
         op: SetOp,
         values: Vec<String>,
     },
+    /// Matches items that are coming but not out yet, with a meaning per kind:
+    /// a movie or series whose release date is still to come; an episode
+    /// that is the first not-yet-aired one of a series the requesting user has
+    /// started. Items without a release date never match.
+    Upcoming {
+        value: bool,
+    },
 }
 
 /// Whether all rules must match (AND) or any rule must match (OR).
@@ -4051,6 +4286,71 @@ pub enum FilterMatchMode {
     #[default]
     All,
     Any,
+}
+
+impl CollectionFilter {
+    /// Whether the result depends on who asks: a rule on the requesting user's
+    /// own favourites, watchlist or play state. Such a collection has no one
+    /// list of items, so anything shared by all users (its generated poster)
+    /// must not be built from it.
+    pub fn is_per_user(&self) -> bool {
+        self.groups
+            .iter()
+            .flat_map(|g| {
+                g.rules
+                    .iter()
+            })
+            .any(|r| {
+                matches!(
+                    r,
+                    FilterRule::Favorite { .. }
+                        | FilterRule::Watchlist { .. }
+                        | FilterRule::Played { .. }
+                )
+            })
+    }
+
+    /// Whether every item this filter returns is upcoming, which makes the
+    /// server-wide "hide unreleased" setting pointless for it. An AND needs one
+    /// operand that requires `Upcoming`; an OR needs all of its (non-empty)
+    /// operands to, as any other branch could return released items.
+    pub fn requires_upcoming(&self) -> bool {
+        let mut groups = self
+            .groups
+            .iter()
+            .filter(|g| {
+                !g.rules
+                    .is_empty()
+            })
+            .map(FilterGroup::requires_upcoming);
+        match self.match_mode {
+            FilterMatchMode::All => groups.any(|r| r),
+            FilterMatchMode::Any => {
+                let mut seen = false;
+                groups.all(|r| {
+                    seen = true;
+                    r
+                }) && seen
+            }
+        }
+    }
+}
+
+impl FilterGroup {
+    fn requires_upcoming(&self) -> bool {
+        let is_upcoming =
+            |r: &FilterRule| matches!(r, FilterRule::Upcoming { value: true });
+        match self.match_mode {
+            FilterMatchMode::All => self
+                .rules
+                .iter()
+                .any(is_upcoming),
+            FilterMatchMode::Any => self
+                .rules
+                .iter()
+                .all(is_upcoming),
+        }
+    }
 }
 
 /// A group of filter rules combined with their own AND/OR match mode.
@@ -4264,6 +4564,10 @@ pub struct RemuxInfo {
     pub watchlist: Option<bool>,
     /// Whether the requesting user ignores this item.
     pub ignored: Option<bool>,
+    /// The id Stremio addons know this item by, when it has its own: for an
+    /// episode, what stream addons are asked for first (the series' IMDb id
+    /// with the season and episode in TVDB's order, e.g. `tt3121722:2:9`).
+    pub stremio_id: Option<String>,
 }
 
 /// A user's remux-only marks on one item, as returned by the watchlist and
@@ -4925,16 +5229,24 @@ impl std::str::FromStr for ItemFields {
     Hash,
     strum_macros::Display,
     strum_macros::EnumString,
-    // Default,
+    Default,
 )]
 #[serde(rename_all = "PascalCase")]
 pub enum MediaStreamType {
+    /// Jellyfin's default too (the enum's zero value).
+    #[default]
     Audio,
     Video,
     Subtitle,
     EmbeddedImage,
     Data,
     Lyric,
+}
+
+impl MediaStreamType {
+    fn data() -> Self {
+        Self::Data
+    }
 }
 
 #[derive(
@@ -5158,6 +5470,10 @@ pub struct HlsVideoQuery {
     pub subtitle_stream_index: Option<i32>,
     pub subtitle_method: Option<SubtitleDeliveryMethod>,
     pub max_streaming_bitrate: Option<i64>,
+    /// Channel cap for re-encoded audio the client asked for at PlaybackInfo
+    /// time, carried on the transcoding URL like Jellyfin does.
+    pub transcoding_max_audio_channels: Option<i64>,
+    pub max_audio_channels: Option<i64>,
     pub transcode_reasons: Option<String>,
     /// Cumulative runtime ticks up to the start of this segment.
     #[serde(alias = "runtimeTicks")]
@@ -5630,6 +5946,40 @@ impl Endpoint for DeleteDevice {
     }
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PatchDeviceRequest {
+    pub four_k: FourKSupport,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct PatchDevice {
+    pub id: String,
+    #[serde(rename = "userId")]
+    pub user_id: Uuid,
+    #[serde(skip)]
+    pub patch: PatchDeviceRequest,
+}
+
+impl Endpoint for PatchDevice {
+    type Output = ();
+
+    fn path(&self) -> String {
+        "/remux/devices".into()
+    }
+
+    fn method(&self) -> Method {
+        Method::PATCH
+    }
+
+    fn query_params(&self) -> impl serde::Serialize + '_ {
+        self
+    }
+
+    fn body(&self) -> Body {
+        Body::Json(serde_json::to_value(&self.patch).unwrap_or_default())
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct DeleteUserDevices {
     #[serde(rename = "userId")]
@@ -5660,6 +6010,89 @@ pub struct GetActivityLog {
     pub limit: Option<i64>,
     #[serde(rename = "searchTerm")]
     pub search_term: Option<String>,
+}
+
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Default,
+    Serialize,
+    Deserialize,
+    strum_macros::EnumString,
+    strum_macros::Display,
+)]
+#[serde(rename_all = "lowercase")]
+#[strum(serialize_all = "lowercase")]
+pub enum LogLevel {
+    #[default]
+    All,
+    Trace,
+    Debug,
+    Info,
+    Warn,
+    Error,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct LogEntry {
+    pub timestamp: String,
+    pub level: String,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct LogsResult {
+    pub entries: Vec<LogEntry>,
+    pub has_more: bool,
+}
+
+#[skip_serializing_none]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct GetLogs {
+    pub limit: Option<usize>,
+    pub offset: Option<usize>,
+    #[serde(default)]
+    pub level: LogLevel,
+    pub search: Option<String>,
+}
+
+impl Endpoint for GetLogs {
+    type Output = LogsResult;
+
+    fn path(&self) -> String {
+        "/remux/logs".into()
+    }
+
+    fn query_params(&self) -> impl serde::Serialize + '_ {
+        self
+    }
+}
+
+#[cfg(test)]
+mod log_query_tests {
+    use super::{GetLogs, LogLevel};
+
+    #[test]
+    fn query_round_trips_typed_log_level_and_pagination() {
+        let query = GetLogs {
+            limit: Some(200),
+            offset: Some(200),
+            level: LogLevel::Warn,
+            search: None,
+        };
+        let encoded = serde_urlencoded::to_string(&query).unwrap();
+        assert_eq!(encoded, "limit=200&offset=200&level=warn");
+        let decoded: GetLogs = serde_urlencoded::from_str(&encoded).unwrap();
+        assert_eq!(decoded.limit, Some(200));
+        assert_eq!(decoded.offset, Some(200));
+        assert_eq!(decoded.level, LogLevel::Warn);
+        assert_eq!(decoded.search, None);
+    }
 }
 
 impl Endpoint for GetActivityLog {
@@ -8140,6 +8573,127 @@ impl Endpoint for RegenerateCollectionImage {
 mod tests {
     use super::*;
 
+    fn query_pairs(query: &GetItemsQuery) -> Vec<(String, String)> {
+        let encoded = serde_urlencoded::to_string(query).unwrap();
+        serde_urlencoded::from_str(&encoded).unwrap()
+    }
+
+    #[test]
+    fn items_query_is_written_with_pascal_case_names() {
+        let id = Uuid::new_v4();
+        let query = GetItemsQuery {
+            include_item_types: Some(vec![MediaType::Movie, MediaType::Series]),
+            parent_id: Some(id),
+            user_id: Some(id),
+            start_index: Some(5),
+            search_term: Some("matrix".into()),
+            is_watchlist: Some(true),
+            person_ids: Some(vec!["a".into(), "b".into()]),
+            sort_by: Some(vec![ItemSortBy::SortName]),
+            sort_order: Some(vec![SortOrder::Descending]),
+            ..Default::default()
+        };
+        let pairs = query_pairs(&query);
+        let get = |key: &str| {
+            pairs
+                .iter()
+                .find(|(k, _)| k == key)
+                .map(|(_, v)| v.as_str())
+        };
+
+        assert_eq!(get("IncludeItemTypes"), Some("Movie,Series"));
+        assert_eq!(
+            get("ParentId"),
+            Some(
+                id.to_string()
+                    .as_str()
+            )
+        );
+        assert_eq!(
+            get("UserId"),
+            Some(
+                id.to_string()
+                    .as_str()
+            )
+        );
+        assert_eq!(get("StartIndex"), Some("5"));
+        assert_eq!(get("SearchTerm"), Some("matrix"));
+        assert_eq!(get("IsWatchlist"), Some("true"));
+        assert_eq!(get("PersonIds"), Some("a,b"));
+        assert_eq!(get("SortBy"), Some("SortName"));
+        assert_eq!(get("SortOrder"), Some("Descending"));
+        assert!(
+            pairs
+                .iter()
+                .all(|(k, _)| k
+                    .chars()
+                    .next()
+                    .is_some_and(|c| c.is_ascii_uppercase())),
+            "all keys must be PascalCase: {pairs:?}"
+        );
+    }
+
+    #[test]
+    fn items_query_still_reads_every_spelling() {
+        let id = Uuid::new_v4();
+        let expect = |q: GetItemsQuery| {
+            assert_eq!(
+                q.include_item_types,
+                Some(vec![MediaType::Movie, MediaType::Series])
+            );
+            assert_eq!(q.parent_id, Some(id));
+            assert_eq!(q.start_index, Some(5));
+            assert_eq!(
+                q.search_term
+                    .as_deref(),
+                Some("matrix")
+            );
+            assert_eq!(q.is_watchlist, Some(true));
+        };
+        for (types, parent, start, term, watch) in [
+            (
+                "include_item_types",
+                "parent_id",
+                "start_index",
+                "search_term",
+                "is_watchlist",
+            ),
+            (
+                "includeItemTypes",
+                "parentId",
+                "startIndex",
+                "searchTerm",
+                "isWatchlist",
+            ),
+            (
+                "IncludeItemTypes",
+                "ParentId",
+                "StartIndex",
+                "SearchTerm",
+                "IsWatchlist",
+            ),
+        ] {
+            let qs = format!(
+                "{types}=Movie,Series&{parent}={id}&{start}=5&{term}=matrix&{watch}=true"
+            );
+            expect(serde_urlencoded::from_str(&qs).unwrap());
+        }
+
+        // What the SDK writes must be understood by the server's own reader.
+        let written = GetItemsQuery {
+            include_item_types: Some(vec![MediaType::Movie, MediaType::Series]),
+            parent_id: Some(id),
+            start_index: Some(5),
+            search_term: Some("matrix".into()),
+            is_watchlist: Some(true),
+            ..Default::default()
+        };
+        expect(
+            serde_urlencoded::from_str(&serde_urlencoded::to_string(&written).unwrap())
+                .unwrap(),
+        );
+    }
+
     #[test]
     fn items_query_limit_defaults_only_when_omitted() {
         let omitted: GetItemsQuery = serde_json::from_str("{}").unwrap();
@@ -8536,26 +9090,26 @@ mod tests {
             e_tag: uuid::Uuid::new_v4(),
             media_streams: vec![
                 MediaStream {
-                    type_: Some(MediaStreamType::Audio),
+                    type_: MediaStreamType::Audio,
                     index: 1,
                     language: Some("eng".to_string()),
                     ..Default::default()
                 },
                 MediaStream {
-                    type_: Some(MediaStreamType::Audio),
+                    type_: MediaStreamType::Audio,
                     index: 2,
                     language: Some("fra".to_string()),
                     ..Default::default()
                 },
                 MediaStream {
-                    type_: Some(MediaStreamType::Subtitle),
+                    type_: MediaStreamType::Subtitle,
                     index: 3,
                     language: Some("fra".to_string()),
                     is_text_subtitle_stream: true,
                     ..Default::default()
                 },
                 MediaStream {
-                    type_: Some(MediaStreamType::Subtitle),
+                    type_: MediaStreamType::Subtitle,
                     index: 4,
                     language: Some("eng".to_string()),
                     is_text_subtitle_stream: true,
@@ -8584,7 +9138,7 @@ mod tests {
     #[test]
     fn resolve_flagged_stream_is_container_default() {
         let mut src = source_with_subs();
-        src.media_streams[3].is_default = Some(true); // eng sub (index 4) flagged
+        src.media_streams[3].is_default = true; // eng sub (index 4) flagged
         src.resolve_default_streams(&user_cfg(), None, None, None, None, None, None);
         assert_eq!(src.default_audio_stream_index, None); // audio unflagged
         assert_eq!(src.default_subtitle_stream_index, Some(4));
@@ -8608,14 +9162,14 @@ mod tests {
     fn resolve_subtitle_prefers_text_over_image_in_same_language() {
         fn source(image_first: bool) -> MediaSourceInfo {
             let image = MediaStream {
-                type_: Some(MediaStreamType::Subtitle),
+                type_: MediaStreamType::Subtitle,
                 index: 0,
                 language: Some("eng".to_string()),
                 codec: Some("pgssub".to_string()),
                 ..Default::default()
             };
             let text = MediaStream {
-                type_: Some(MediaStreamType::Subtitle),
+                type_: MediaStreamType::Subtitle,
                 index: 1,
                 language: Some("eng".to_string()),
                 codec: Some("subrip".to_string()),
@@ -8721,6 +9275,214 @@ mod tests {
         assert_eq!(src.default_subtitle_stream_index, Some(4));
     }
 
+    fn languages(
+        audio: Option<&str>,
+        subtitle: Option<RememberedSubtitle>,
+    ) -> RememberedLanguages {
+        RememberedLanguages {
+            audio: audio.map(str::to_string),
+            subtitle,
+            ..Default::default()
+        }
+    }
+
+    fn resolve_with(
+        src: &mut MediaSourceInfo,
+        cfg: &UserConfiguration,
+        remembered_audio: Option<i64>,
+        languages: &RememberedLanguages,
+    ) {
+        src.resolve_default_streams_remembering(
+            cfg,
+            None,
+            None,
+            None,
+            None,
+            remembered_audio,
+            None,
+            languages,
+        );
+    }
+
+    /// The language the user last chose picks the matching track of *this*
+    /// release, even when the remembered index points at another language.
+    #[test]
+    fn remembered_language_beats_a_remembered_index() {
+        let mut src = source_with_subs();
+        // Index 1 is English here, but the user last chose French.
+        resolve_with(&mut src, &user_cfg(), Some(1), &languages(Some("fr"), None));
+        assert_eq!(src.default_audio_stream_index, Some(2));
+    }
+
+    /// A language the release has no track for is skipped: the index (or the
+    /// language preferences) decide instead of an unrelated track.
+    #[test]
+    fn remembered_language_missing_in_the_release_falls_through() {
+        // The index belongs to another release: it must not pick an
+        // unrelated language here.
+        let mut src = source_with_subs();
+        resolve_with(&mut src, &user_cfg(), Some(1), &languages(Some("de"), None));
+        assert_eq!(src.default_audio_stream_index, None);
+        let mut cfg = user_cfg();
+        cfg.play_default_audio_track = false;
+        cfg.audio_language_preference = Some("eng".to_string());
+        let mut src = source_with_subs();
+        resolve_with(&mut src, &cfg, Some(2), &languages(Some("de"), None));
+        assert_eq!(
+            src.default_audio_stream_index,
+            Some(1),
+            "the configured preference decides"
+        );
+        // Rows saved before languages existed still use their index.
+        let mut src = source_with_subs();
+        resolve_with(&mut src, &user_cfg(), Some(2), &languages(None, None));
+        assert_eq!(src.default_audio_stream_index, Some(2));
+    }
+
+    /// A remembered "off" is not undone by a subtitle mode that would pick a
+    /// track on its own.
+    #[test]
+    fn remembered_subtitles_off_beats_the_subtitle_mode() {
+        let mut cfg = user_cfg();
+        cfg.subtitle_mode = SubtitleMode::Always;
+        let mut src = source_with_subs();
+        resolve_with(
+            &mut src,
+            &cfg,
+            None,
+            &languages(None, Some(RememberedSubtitle::Off)),
+        );
+        assert_eq!(src.default_subtitle_stream_index, None);
+        let mut src = source_with_subs();
+        resolve_with(&mut src, &cfg, None, &languages(None, None));
+        assert!(
+            src.default_subtitle_stream_index
+                .is_some()
+        );
+    }
+
+    /// An explicit request from the client still wins over a remembered
+    /// language, and turning remembering off ignores it.
+    #[test]
+    fn remembered_language_yields_to_the_client_and_to_the_setting() {
+        let mut src = source_with_subs();
+        src.resolve_default_streams_remembering(
+            &user_cfg(),
+            None,
+            None,
+            Some(1),
+            None,
+            None,
+            None,
+            &languages(Some("fr"), None),
+        );
+        assert_eq!(src.default_audio_stream_index, Some(1));
+
+        let mut cfg = user_cfg();
+        cfg.remember_audio_selections = false;
+        cfg.remember_subtitle_selections = false;
+        let mut src = source_with_subs();
+        resolve_with(
+            &mut src,
+            &cfg,
+            None,
+            &languages(Some("fr"), Some(RememberedSubtitle::Language("fr".into()))),
+        );
+        assert_eq!(src.default_audio_stream_index, None);
+        assert_eq!(src.default_subtitle_stream_index, None);
+    }
+
+    /// A remembered index only counts on the source it was saved on. Another
+    /// release of the same title can hold a different language at the same
+    /// position, so it gets the original-language default instead.
+    #[test]
+    fn remembered_index_only_applies_to_its_own_source() {
+        let saved_on = source_with_subs(); // index 1 = English
+        let mut other = source_with_subs();
+        other.media_streams[0].language = Some("rus".to_string()); // index 1
+        other.media_streams[1].language = Some("eng".to_string()); // index 2
+        let mut cfg = user_cfg();
+        cfg.play_default_audio_track = true;
+        let remembered = RememberedLanguages {
+            indexes_source: Some(saved_on.id),
+            ..Default::default()
+        };
+        let resolve = |src: &mut MediaSourceInfo| {
+            src.resolve_default_streams_remembering(
+                &cfg,
+                None,
+                Some("en"),
+                None,
+                None,
+                Some(1),
+                Some(3),
+                &remembered,
+            )
+        };
+
+        let mut src = saved_on.clone();
+        resolve(&mut src);
+        assert_eq!(src.default_audio_stream_index, Some(1));
+        assert_eq!(src.default_subtitle_stream_index, Some(3));
+
+        let mut src = other.clone();
+        resolve(&mut src);
+        assert_eq!(
+            src.default_audio_stream_index,
+            Some(2),
+            "the original language decides, not index 1 (Russian here)"
+        );
+        assert_eq!(
+            src.default_subtitle_stream_index, None,
+            "the subtitle index belongs to the other release too"
+        );
+    }
+
+    /// Subtitles follow the remembered language, and "off" stays off even when
+    /// the container flags a subtitle as default.
+    #[test]
+    fn remembered_subtitle_language_and_off() {
+        let mut src = source_with_subs();
+        resolve_with(
+            &mut src,
+            &user_cfg(),
+            None,
+            &languages(None, Some(RememberedSubtitle::Language("fr".into()))),
+        );
+        assert_eq!(src.default_subtitle_stream_index, Some(3));
+
+        let mut src = source_with_subs();
+        src.media_streams[3].is_default = true;
+        resolve_with(
+            &mut src,
+            &user_cfg(),
+            None,
+            &languages(None, Some(RememberedSubtitle::Off)),
+        );
+        assert_eq!(src.default_subtitle_stream_index, None);
+    }
+
+    #[test]
+    fn remembered_subtitle_round_trips_through_its_stored_form() {
+        assert_eq!(
+            RememberedSubtitle::parse("off"),
+            Some(RememberedSubtitle::Off)
+        );
+        assert_eq!(
+            RememberedSubtitle::parse("fra"),
+            Some(RememberedSubtitle::Language("fr".into()))
+        );
+        assert_eq!(RememberedSubtitle::parse(""), None);
+        for stored in ["off", "fr"] {
+            assert_eq!(
+                RememberedSubtitle::parse(stored)
+                    .unwrap()
+                    .as_stored(),
+                stored
+            );
+        }
+    }
+
     /// PlayDefaultAudioTrack=true selects the track matching the title's
     /// original language from DB metadata (not the embedded default flag).
     #[test]
@@ -8737,7 +9499,7 @@ mod tests {
     #[test]
     fn resolve_play_default_audio_track_falls_back_to_container_default() {
         let mut src = source_with_subs();
-        src.media_streams[0].is_default = Some(true); // eng audio index 1 flagged
+        src.media_streams[0].is_default = true; // eng audio index 1 flagged
         let mut cfg = user_cfg();
         cfg.play_default_audio_track = true;
         // "deu" not present in the source → container default (index 1) wins
@@ -8750,7 +9512,7 @@ mod tests {
     #[test]
     fn resolve_play_default_audio_track_no_original_language_uses_container_default() {
         let mut src = source_with_subs();
-        src.media_streams[0].is_default = Some(true); // eng audio index 1 flagged
+        src.media_streams[0].is_default = true; // eng audio index 1 flagged
         let mut cfg = user_cfg();
         cfg.play_default_audio_track = true;
         src.resolve_default_streams(&cfg, None, None, None, None, None, None);
@@ -8805,8 +9567,8 @@ mod tests {
     #[test]
     fn resolve_leaves_stream_flags_untouched() {
         let mut src = source_with_subs();
-        src.media_streams[3].is_default = Some(true); // eng sub index 4
-        let flags_before: Vec<Option<bool>> = src
+        src.media_streams[3].is_default = true; // eng sub index 4
+        let flags_before: Vec<bool> = src
             .media_streams
             .iter()
             .map(|s| s.is_default)
@@ -8814,7 +9576,7 @@ mod tests {
         let mut cfg = user_cfg();
         cfg.subtitle_language_preference = Some("fra".to_string());
         src.resolve_default_streams(&cfg, Some("fr"), None, None, None, None, None);
-        let flags_after: Vec<Option<bool>> = src
+        let flags_after: Vec<bool> = src
             .media_streams
             .iter()
             .map(|s| s.is_default)
@@ -8953,6 +9715,33 @@ mod tests {
 
     fn id(n: u128) -> Uuid {
         Uuid::from_u128(n)
+    }
+
+    #[test]
+    fn a_collection_filter_on_user_marks_depends_on_who_asks() {
+        let with = |rule| CollectionFilter {
+            groups: vec![FilterGroup {
+                rules: vec![rule],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert!(with(FilterRule::Watchlist { value: true }).is_per_user());
+        assert!(with(FilterRule::Favorite { value: true }).is_per_user());
+        assert!(with(FilterRule::Played { value: false }).is_per_user());
+        assert!(!with(FilterRule::HasTrailer { value: true }).is_per_user());
+        assert!(!CollectionFilter::default().is_per_user());
+    }
+
+    #[test]
+    fn watchlist_rule_round_trips_as_a_snake_case_field() {
+        let rule: FilterRule =
+            serde_json::from_str(r#"{"field":"watchlist","value":true}"#).unwrap();
+        assert_eq!(rule, FilterRule::Watchlist { value: true });
+        assert_eq!(
+            serde_json::to_value(&rule).unwrap(),
+            serde_json::json!({"field": "watchlist", "value": true})
+        );
     }
 
     #[test]

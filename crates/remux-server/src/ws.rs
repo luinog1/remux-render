@@ -9,7 +9,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 use tokio::time::Instant;
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 use uuid::Uuid;
 
 use crate::{
@@ -63,6 +63,9 @@ struct LibraryUpdateInfo {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "PascalCase")]
 struct UserDataChangeInfo {
+    /// Jellyfin's dash-less form: jellyfin-web compares it to its current user
+    /// id as a string and ignores the message otherwise.
+    #[serde(with = "remux_utils::uuid_serde")]
     user_id: Uuid,
     user_data_list: Vec<api::UserItemDataDto>,
 }
@@ -172,13 +175,16 @@ async fn handle_socket(mut socket: WebSocket, state: AppState, session: AuthSess
                 match result {
                     Ok(WsEvent::UserUpdated(user_id)) => {
                         if let Ok(Some(user)) = db::User::get_by_id(&state.ctx.db, &user_id).await {
-                            if !send_msg(&mut socket, SessionMessageType::UserUpdated, Some(api::db_user_to_dto(&state.ctx.config.data_dir, user))).await {
+                            let Ok(dto) = crate::api::users::user_dto(&state.ctx.db, &state.ctx.config.data_dir, user).await else {
+                                continue;
+                            };
+                            if !send_msg(&mut socket, SessionMessageType::UserUpdated, Some(dto)).await {
                                 return;
                             }
                         }
                     }
                     Ok(WsEvent::UserDeleted(user_id)) => {
-                        if !send_msg(&mut socket, SessionMessageType::UserDeleted, Some(user_id.to_string())).await {
+                        if !send_msg(&mut socket, SessionMessageType::UserDeleted, Some(user_id.simple().to_string())).await {
                             return;
                         }
                     }
@@ -423,7 +429,12 @@ mod tests {
         })
         .unwrap();
 
-        assert_eq!(value["UserId"], user_id.to_string());
+        assert_eq!(
+            value["UserId"],
+            user_id
+                .simple()
+                .to_string()
+        );
         assert_eq!(
             value["UserDataList"][0]["ItemId"],
             item_id

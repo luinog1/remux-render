@@ -1,47 +1,23 @@
-#![allow(warnings)]
-
-use axum::response::Html;
-use reqwest;
-
-use anyhow::{Context, Result, anyhow};
-use async_trait::async_trait;
-use axum::{
-    Json, Router, ServiceExt,
-    body::Body,
-    extract::{FromRequestParts, Request},
-    http::{StatusCode, request::Parts},
-    middleware,
-    middleware::Next,
-    response::{IntoResponse, Redirect, Response},
-    routing::{get, post},
-};
-use axum_anyhow::{ApiError, ApiResult, on_error, set_expose_errors};
+use anyhow::Result;
+use axum::{Router, ServiceExt, routing::get};
+use axum_anyhow::on_error;
 pub mod result_ext;
-use chrono::{Duration, Utc, prelude::*};
+use chrono::Utc;
 use config;
-use futures::future::BoxFuture;
-use futures_util::StreamExt;
-use http::Uri;
-use itertools::Itertools;
 use remux_utils::Store;
-use reqwest::header::LOCATION;
 pub use result_ext::{IntoApiError, OptionExt, ResultExt};
-use serde::{Deserialize, Serialize, Serializer};
-use serde_json::json;
-use std::{self, collections::HashMap, env, fs, path::Path, sync::Arc};
-use timed;
+use serde::{Deserialize, Serialize};
+use std::{self, env, sync::Arc};
 use tower::{Layer, util::MapRequestLayer};
 use tower_http::{
     cors::{Any, CorsLayer},
     services::{ServeDir, ServeFile},
 };
-use tracing::{self, debug, error, info, instrument, warn};
+use tracing::{self, debug, error, info, warn};
 use tracing_subscriber::{
     EnvFilter, Layer as TracingLayer, fmt, layer::SubscriberExt,
     util::SubscriberInitExt,
 };
-use url::Url;
-use uuid::Uuid;
 
 mod conversions;
 pub mod device_profile;
@@ -58,16 +34,20 @@ pub use common::stable_media_uuid;
 pub mod db;
 #[cfg(feature = "desktop")]
 pub mod embedded_static;
+pub mod ids;
 pub mod intro;
 mod iptv;
 pub mod localization;
+pub mod logging;
 pub mod playback;
 pub mod playback_session;
 pub mod services;
 pub mod signals;
+pub mod store_keys;
 pub mod stream;
 mod subtitle_selection;
 pub mod tasks;
+pub mod tools;
 mod torrent;
 mod web_client;
 mod web_patches;
@@ -97,22 +77,6 @@ impl Default for FilesystemPaths {
     }
 }
 
-impl FilesystemPaths {
-    pub fn load_from_env() -> Self {
-        let mut paths = Self::default();
-        if let Ok(v) = std::env::var("WEB_PATH") {
-            paths.web_path = v;
-        }
-        if let Ok(v) = std::env::var("DASHBOARD_PATH") {
-            paths.dashboard_path = v;
-        }
-        if let Ok(v) = std::env::var("REMUX_WEB_PATH") {
-            paths.remux_web_path = v;
-        }
-        paths
-    }
-}
-
 /// Opaque service type for the `/admin` static file handler.
 pub type AdminService = tower::util::BoxCloneSyncService<
     axum::extract::Request,
@@ -130,7 +94,7 @@ pub fn admin_from_filesystem(dashboard_path: &str) -> AdminService {
     )
 }
 
-pub use web_client::WebClientService;
+pub use web_client::{RemuxWeb, WebClientService};
 
 /// Route auto-registration via `#[get("/path")]`, `#[post("/path")]`, etc.
 pub struct RouteRegistration(pub fn(axum::Router<AppState>) -> axum::Router<AppState>);
@@ -144,56 +108,61 @@ pub fn collect_routes() -> axum::Router<AppState> {
     router
 }
 
-pub async fn init_app_with_config(config: Config) -> Result<Router> {
-    let paths = FilesystemPaths::default();
-    let admin = admin_from_filesystem(
-        &paths
-            .dashboard_path
-            .clone(),
-    );
+/// [`init_app`] with the web assets read from the filesystem paths in
+/// `config.paths`.
+async fn init_app_from_filesystem(config: Config) -> Result<(Router, AppContext)> {
+    let paths = config
+        .paths
+        .clone();
+    let admin = admin_from_filesystem(&paths.dashboard_path);
     let web_path = paths
         .web_path
         .clone();
-    let (router, _ctx) = init_app(config, Some(paths), admin, move |pool| {
-        WebClientService::from_filesystem(&web_path, pool)
-    })
-    .await?;
-    Ok(router)
-}
-
-pub async fn init_app_with_ctx(config: Config) -> Result<(Router, AppContext)> {
-    let paths = FilesystemPaths::default();
-    let admin = admin_from_filesystem(
-        &paths
-            .dashboard_path
-            .clone(),
-    );
-    let web_path = paths
-        .web_path
-        .clone();
-    init_app(config, Some(paths), admin, move |pool| {
+    let remux_web = RemuxWeb::from_filesystem(&paths.remux_web_path);
+    init_app(config, Some(paths), admin, Some(remux_web), move |pool| {
         WebClientService::from_filesystem(&web_path, pool)
     })
     .await
 }
 
+pub async fn init_app_with_config(config: Config) -> Result<Router> {
+    Ok(init_app_from_filesystem(config)
+        .await?
+        .0)
+}
+
+pub async fn init_app_with_ctx(config: Config) -> Result<(Router, AppContext)> {
+    init_app_from_filesystem(config).await
+}
+
 /// Start the HTTP server with web assets served from the filesystem.
 /// Binds to `0.0.0.0:{port}` (default 3000, or `PORT` env var).
-pub async fn serve(config: Config, paths: FilesystemPaths) -> Result<()> {
-    let admin = admin_from_filesystem(
-        &paths
-            .dashboard_path
-            .clone(),
-    );
-    let web_path = paths
-        .web_path
-        .clone();
+pub async fn serve(config: Config) -> Result<()> {
     let addr = std::net::SocketAddr::new(config.host, config.port);
-    let (router, _) = init_app(config, Some(paths), admin, move |pool| {
-        WebClientService::from_filesystem(&web_path, pool)
-    })
-    .await?;
-    bind_and_serve(router, addr).await
+    let (router, ctx) = init_app_from_filesystem(config).await?;
+    tokio::select! {
+        result = bind_and_serve(router, addr) => result,
+        Ok(()) = shutdown_signal() => {
+            // HLS ffmpeg writes to files and never notices remux exiting.
+            info!("shutting down");
+            ctx.shutdown()
+                .await;
+            Ok(())
+        }
+    }
+}
+
+/// Resolves on Ctrl-C, SIGTERM on Unix, or console close on Windows.
+async fn shutdown_signal() -> std::io::Result<()> {
+    #[cfg(unix)]
+    let mut terminate =
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    #[cfg(windows)]
+    let mut terminate = tokio::signal::windows::ctrl_close()?;
+    tokio::select! {
+        result = tokio::signal::ctrl_c() => result,
+        _ = terminate.recv() => Ok(()),
+    }
 }
 
 pub async fn bind_and_serve(router: Router, addr: std::net::SocketAddr) -> Result<()> {
@@ -277,6 +246,7 @@ pub async fn init_app(
     config: Config,
     web_paths: Option<FilesystemPaths>,
     admin: AdminService,
+    remux_web: Option<RemuxWeb>,
     make_web_client: impl FnOnce(sqlx::SqlitePool) -> WebClientService,
 ) -> Result<(Router, AppContext)> {
     raise_open_file_limit();
@@ -355,9 +325,10 @@ pub async fn init_app(
 
     let web_client = make_web_client(conn.clone());
     // The Remux client has its own UI, so no branding scripts are injected.
-    let remux_web = web_paths
+    let remux_web_installed = remux_web
         .as_ref()
-        .map(|p| WebClientService::from_filesystem_plain(&p.remux_web_path));
+        .is_some_and(|r| r.installed);
+    let remux_web = remux_web.map(|r| r.service);
 
     let addons = addons::AddonService::from_db(&conn, &config).await?;
     let transcode_sessions_dir = resolve_transcode_dir(&config.data_dir);
@@ -380,6 +351,7 @@ pub async fn init_app(
                 .to_string(),
         )),
         web_paths,
+        remux_web_installed,
         addons,
         signals,
         started_at: Utc::now(),
@@ -464,12 +436,7 @@ pub async fn init_app(
                     tracing::info_span!("request", user = tracing::field::Empty)
                 })
                 .on_request(|request: &axum::http::Request<axum::body::Body>, _span: &tracing::Span| {
-                    let uri = request.uri();
-                    let path = uri.path();
-                    let full = match uri.query() {
-                        Some(q) => format!("{path}?{q}"),
-                        None => path.to_string(),
-                    };
+                    let full = logging::loggable_uri(request.uri());
                     debug!(target: "remux_server::request", method = %request.method(), uri = %full, "→");
                 })
                 .on_response(|response: &axum::http::Response<axum::body::Body>, latency: std::time::Duration, _span: &tracing::Span| {
@@ -493,6 +460,8 @@ pub struct AppContext {
     pub default_web_client: Arc<tokio::sync::RwLock<String>>,
     /// Present in filesystem builds; `None` in desktop (assets are embedded).
     pub web_paths: Option<FilesystemPaths>,
+    /// Whether Remux Web is served at `/remux` with an `index.html` to open.
+    pub remux_web_installed: bool,
     pub addons: addons::AddonService,
     pub signals: signals::Signals,
     /// When this server process started.
@@ -500,9 +469,14 @@ pub struct AppContext {
 }
 
 impl AppContext {
-    /// Gracefully shut down background services (torrent DHT, etc.).
-    /// Call this when the server is stopping to release sockets immediately.
+    /// Stop every playback session (exiting runs no destructors, so ffmpeg
+    /// would outlive remux) and refuse new transcodes, then shut down
+    /// background services (torrent DHT, etc.) to release sockets immediately.
+    /// Call this when the server is stopping.
     pub async fn shutdown(&self) {
+        self.sessions
+            .stop_all()
+            .await;
         let old = self
             .torrent
             .write()
@@ -594,6 +568,18 @@ fn default_torrent_http_port() -> u16 {
     9876
 }
 
+/// Serializes a set secret as `"<redacted>"`, so the logged config doesn't
+/// carry it.
+fn serialize_redacted<S: serde::Serializer>(
+    value: &Option<String>,
+    serializer: S,
+) -> std::result::Result<S::Ok, S::Error> {
+    match value {
+        Some(_) => serializer.serialize_some("<redacted>"),
+        None => serializer.serialize_none(),
+    }
+}
+
 #[derive(Deserialize, Serialize, Debug, Clone)]
 pub struct Config {
     #[serde(default = "default_data_dir")]
@@ -636,9 +622,21 @@ pub struct Config {
     /// Path to the bgutil-pot binary used by yt-dlp for YouTube POT token generation.
     #[serde(default = "default_bgutil_script_path")]
     pub bgutil_script_path: std::path::PathBuf,
+    /// Extra arguments passed to every yt-dlp call (`YTDLP_EXTRA_ARGS`), split
+    /// on whitespace. Can carry credentials (`--password`, proxy URLs), so
+    /// the config log shows only whether it is set.
+    #[serde(default, serialize_with = "serialize_redacted")]
+    pub ytdlp_extra_args: Option<String>,
+    /// Web asset locations (`WEB_PATH`, `DASHBOARD_PATH`, `REMUX_WEB_PATH`).
+    #[serde(flatten, default)]
+    pub paths: FilesystemPaths,
     /// Base URL for the TMDB API. Overridable for testing.
     #[serde(default = "default_tmdb_base_url")]
     pub tmdb_base_url: String,
+    /// Base URL for Cinemeta, the source of TVDB episode numbering for
+    /// stream ids. Overridable for testing.
+    #[serde(default = "default_cinemeta_base_url")]
+    pub cinemeta_base_url: String,
     /// Base URL for remuxdb. When set, probe results are submitted after each live probe.
     #[serde(default = "default_remuxdb_url")]
     pub remuxdb_url: Option<String>,
@@ -646,6 +644,18 @@ pub struct Config {
     pub activity_log_retention_days: u32,
     #[serde(default = "default_jellyfin_version")]
     pub jellyfin_version: String,
+    /// Log file output is best-effort; stdout logging remains enabled when false.
+    #[serde(default = "default_log_file_enabled")]
+    pub log_file_enabled: bool,
+    /// Optional log directory; defaults to `<data_dir>/logs` after `resolve()`.
+    #[serde(default)]
+    pub log_dir: Option<std::path::PathBuf>,
+    /// Maximum number of rolling log files retained. Zero disables the count cap.
+    #[serde(default = "default_log_file_max_files")]
+    pub log_file_max_files: usize,
+    /// Age-based log retention in days; zero disables age-based cleanup.
+    #[serde(default = "default_log_file_retention_days")]
+    pub log_file_retention_days: u32,
     /// OTLP gRPC endpoint (e.g. `http://jaeger-collector:4317`) to export
     /// tracing spans to. `None` (the default) disables tracing export
     /// entirely — normal log output is unaffected either way.
@@ -653,7 +663,7 @@ pub struct Config {
 }
 
 fn default_jellyfin_version() -> String {
-    "10.11.8".to_string()
+    "12.4.0".to_string()
 }
 
 fn default_remuxdb_url() -> Option<String> {
@@ -664,8 +674,24 @@ fn default_activity_log_retention_days() -> u32 {
     90
 }
 
+fn default_log_file_enabled() -> bool {
+    true
+}
+
+fn default_log_file_max_files() -> usize {
+    5
+}
+
+fn default_log_file_retention_days() -> u32 {
+    5
+}
+
 fn default_tmdb_base_url() -> String {
     "https://api.themoviedb.org/3/".to_string()
+}
+
+fn default_cinemeta_base_url() -> String {
+    sdks::cinemeta::DEFAULT_BASE_URL.to_string()
 }
 
 fn default_bgutil_script_path() -> std::path::PathBuf {
@@ -754,6 +780,15 @@ impl Config {
                     .into_owned(),
             );
         }
+        if self
+            .log_dir
+            .is_none()
+        {
+            self.log_dir = Some(
+                self.data_dir
+                    .join("logs"),
+            );
+        }
         self
     }
 }
@@ -761,6 +796,8 @@ impl Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
+            ytdlp_extra_args: None,
+            paths: FilesystemPaths::default(),
             data_dir: default_data_dir(),
             database_url: None,
             torrent_data_dir: None,
@@ -773,9 +810,14 @@ impl Default for Config {
             torrent_peer_port: default_torrent_peer_port(),
             bgutil_script_path: default_bgutil_script_path(),
             tmdb_base_url: default_tmdb_base_url(),
+            cinemeta_base_url: default_cinemeta_base_url(),
             remuxdb_url: Some("https://remuxdb.1632022.xyz".to_string()),
             activity_log_retention_days: default_activity_log_retention_days(),
             jellyfin_version: default_jellyfin_version(),
+            log_file_enabled: default_log_file_enabled(),
+            log_dir: None,
+            log_file_max_files: default_log_file_max_files(),
+            log_file_retention_days: default_log_file_retention_days(),
             otlp_endpoint: None,
         }
         .resolve()
@@ -915,11 +957,16 @@ where
     Some(tracing_opentelemetry::layer().with_tracer(tracer))
 }
 
-/// `otlp_endpoint`: when set (e.g. `http://jaeger:4317`), tracing spans are
+/// `otlp_endpoint`: when set (e.g. `http://jaeger-collector:4317`), tracing spans are
 /// also exported via OTLP — see `Config::otlp_endpoint`. Gated by the same
 /// `RUST_LOG`/`EnvFilter` as normal log output, so raising the level to see
-/// more logs also sends more spans.
-pub fn setup_logging(log_dir: Option<&std::path::Path>, otlp_endpoint: Option<&str>) {
+/// more logs also sends more spans. File logging is best-effort: an unavailable
+/// directory or rolling appender leaves stdout logging active.
+pub fn setup_logging(
+    log_dir: Option<&std::path::Path>,
+    max_log_files: usize,
+    otlp_endpoint: Option<&str>,
+) {
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new("warn,remux=info"));
 
@@ -930,21 +977,31 @@ pub fn setup_logging(log_dir: Option<&std::path::Path>, otlp_endpoint: Option<&s
         .with_file(false)
         .compact();
 
-    let file_layer = log_dir.map(|dir| {
+    let file_layer = log_dir.and_then(|dir| {
         let appender = tracing_appender::rolling::Builder::new()
             .rotation(tracing_appender::rolling::Rotation::DAILY)
             .filename_prefix("remux")
             .filename_suffix("log")
-            .build(dir)
-            .expect("failed to create log appender");
-        fmt::layer()
-            .with_ansi(false)
-            .with_timer(fmt::time::ChronoLocal::new("%H:%M:%S".to_string()))
-            .with_target(true)
-            .with_line_number(true)
-            .with_file(false)
-            .compact()
-            .with_writer(appender)
+            .max_log_files(max_log_files)
+            .build(dir);
+        match appender {
+            Ok(appender) => Some(
+                fmt::layer()
+                    .with_ansi(false)
+                    // Daily rolling filenames are UTC; explicit UTC timestamps keep
+                    // entries immediately after midnight on the matching date.
+                    .with_timer(fmt::time::ChronoUtc::new("%+".to_string()))
+                    .with_target(true)
+                    .with_line_number(true)
+                    .with_file(false)
+                    .compact()
+                    .with_writer(appender),
+            ),
+            Err(error) => {
+                eprintln!("Remux file logging unavailable; continuing with stdout only: {error}");
+                None
+            }
+        }
     });
 
     // FmtSpan::CLOSE makes every span passing through a layer log its own
@@ -977,11 +1034,6 @@ pub fn setup_logging(log_dir: Option<&std::path::Path>, otlp_endpoint: Option<&s
         .with(otel_layer)
         .try_init()
         .ok(); // try_init + ok() so tests don't panic on repeated calls
-}
-
-async fn handle_404(uri: axum::http::Uri) -> impl IntoResponse {
-    debug!("404 - Not Found: {}", uri);
-    (StatusCode::NOT_FOUND, "Not Found")
 }
 
 fn log_api_error(err: &axum_anyhow::ApiError) {
@@ -1020,16 +1072,6 @@ fn log_api_error(err: &axum_anyhow::ApiError) {
             "api error"
         );
     }
-}
-
-async fn handle_static_404(req: Request<Body>) -> ApiResult<impl IntoResponse> {
-    debug!(
-        "Static 404 Not Found: {} {}",
-        req.method(),
-        req.uri()
-            .path()
-    );
-    Ok((StatusCode::NOT_FOUND, "404 - File not found"))
 }
 
 #[cfg(test)]
@@ -1222,5 +1264,24 @@ mod open_file_limit_tests {
     fn clamps_soft_limit_to_the_existing_hard_limit() {
         assert_eq!(desired_open_file_limit(256, 4096), Some(4096));
         assert_eq!(desired_open_file_limit(4096, 4096), None);
+    }
+}
+
+#[cfg(test)]
+mod config_log_tests {
+    use super::Config;
+
+    #[test]
+    fn the_logged_config_hides_ytdlp_extra_args() {
+        let config = Config {
+            ytdlp_extra_args: Some("--password hunter2".into()),
+            ..Default::default()
+        };
+        let logged = serde_json::to_string(&config).unwrap();
+        assert!(!logged.contains("hunter2"), "{logged}");
+        assert!(
+            logged.contains(r#""ytdlp_extra_args":"<redacted>""#),
+            "{logged}"
+        );
     }
 }

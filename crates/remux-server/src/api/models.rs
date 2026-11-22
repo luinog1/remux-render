@@ -32,7 +32,7 @@ pub fn inject_lyric_stream(source: &mut MediaSourceInfo) {
     source
         .media_streams
         .push(MediaStream {
-            type_: Some(MediaStreamType::Lyric),
+            type_: MediaStreamType::Lyric,
             index: next_idx,
             is_external: true,
             ..Default::default()
@@ -128,6 +128,7 @@ pub fn device_info_from(
                     .expose()
                     == caller_token,
             ),
+            four_k: Some(device.four_k_support()),
         }),
     }
 }
@@ -189,6 +190,7 @@ impl Into<MediaType> for db::MediaKind {
             db::MediaKind::Stream | db::MediaKind::StreamGroup => MediaType::Video,
             db::MediaKind::Subtitle => MediaType::Video,
             db::MediaKind::Intro => MediaType::Video,
+            db::MediaKind::Trailer => MediaType::Trailer,
         }
     }
 }
@@ -199,7 +201,11 @@ pub fn db_media_kind_to_collection_type(
     match kind {
         db::CollectionMediaKind::Movie => Some(CollectionType::Movies),
         db::CollectionMediaKind::Series => Some(CollectionType::Tvshows),
-        db::CollectionMediaKind::Mixed => Some(CollectionType::Mixed),
+        // Jellyfin has no type for episodes; a tvshows library is expected to
+        // hold series, so clients get the neutral mixed type instead.
+        db::CollectionMediaKind::Episode | db::CollectionMediaKind::Mixed => {
+            Some(CollectionType::Mixed)
+        }
         db::CollectionMediaKind::Music => Some(CollectionType::Music),
         db::CollectionMediaKind::Collection => Some(CollectionType::Boxsets),
         db::CollectionMediaKind::Playlist => Some(CollectionType::Playlists),
@@ -256,10 +262,6 @@ pub fn db_user_to_dto(data_dir: &std::path::Path, user: db::User) -> UserDto {
     }
 }
 
-fn image_tag(url: Option<&str>) -> Option<String> {
-    url.map(|u| u.to_string())
-}
-
 fn media_image_tag(media: &db::Media, kind: db::ImageKind) -> Option<String> {
     media
         .images
@@ -278,15 +280,34 @@ fn parent_image_tag(parent: Option<&db::Media>, kind: db::ImageKind) -> Option<S
         })
 }
 
+/// A series' or season's `PlayedPercentage`: Jellyfin reports it from the
+/// episode counts, 0 included, rather than from a playback position.
+fn folder_played_percentage(media: &db::Media) -> Option<f32> {
+    matches!(media.kind, db::MediaKind::Series | db::MediaKind::Season)
+        .then_some(media.played_percentage)
+        .flatten()
+        .map(|p| p as f32)
+}
+
 pub fn db_state_to_dto(
     state: db::UserMediaState,
     media: &db::Media,
 ) -> UserItemDataDto {
     use crate::common::ToRunTimeTicks;
+    // Live TV has no position to resume from; clients would open the channel
+    // at that offset.
+    let position = if media
+        .kind
+        .supports_position_resume()
+    {
+        state.playback_position
+    } else {
+        0
+    };
     let played_percentage = media
         .runtime
         .filter(|&r| r > 0)
-        .map(|r| (state.playback_position as f32 / r as f32 * 100.0).clamp(0.0, 100.0));
+        .map(|r| (position as f32 / r as f32 * 100.0).clamp(0.0, 100.0));
     UserItemDataDto {
         played: state.play_count > 0
             || state
@@ -296,16 +317,17 @@ pub fn db_state_to_dto(
             .last_played_at
             .or(state.played_at)
             .map(|x| x.and_utc()),
-        playback_position_ticks: state
-            .playback_position
+        playback_position_ticks: position
             .to_ticks(common::TickUnit::Seconds)
             .unwrap_or(0),
         play_count: state.play_count as i32,
         is_favorite: state.favorite,
         rating: state.rating,
         likes: state.likes(),
-        // Jellyfin omits PlayedPercentage when it is 0
-        played_percentage: played_percentage.filter(|&p| p > 0.0),
+        played_percentage: folder_played_percentage(media).or(
+            // Jellyfin omits a video's PlayedPercentage when it is 0
+            played_percentage.filter(|&p| p > 0.0),
+        ),
         unplayed_item_count: media.unplayed_item_count,
         key: media
             .id
@@ -375,7 +397,7 @@ fn db_media_to_item_inner(
     hide_sources: bool,
     include_sources: bool,
 ) -> BaseItemDto {
-    use crate::common::{IntoVec, ToRunTimeTicks};
+    use crate::common::ToRunTimeTicks;
 
     let type_ = media
         .kind
@@ -425,7 +447,8 @@ fn db_media_to_item_inner(
         ),
         overview: media
             .description
-            .clone(),
+            .clone()
+            .map(Into::into),
         play_access: Some("Full".to_string()),
         can_delete: Some(false),
         can_download: Some(false),
@@ -440,18 +463,35 @@ fn db_media_to_item_inner(
         parent_id: media
             .parent_id
             .clone(),
+        // YouTube trailers only: clients hand a remote trailer to YouTube and
+        // can't play any other URL. Direct ones are local trailers.
         remote_trailers: media
             .trailers
-            .clone()
-            .map(|j| {
-                j.into_iter()
-                    .map(|id| ExternalUrl {
-                        name: Some("YouTube".to_string()),
-                        url: Some(format!("https://www.youtube.com/watch?v={id}")),
-                    })
-                    .collect()
+            .iter()
+            .flatten()
+            .filter_map(|t| {
+                Some(ExternalUrl {
+                    name: t
+                        .name
+                        .clone(),
+                    url: Some(t.youtube_url()?),
+                })
             })
-            .unwrap_or_default(),
+            .collect(),
+        local_trailer_count: media
+            .trailers
+            .as_ref()
+            .map(|trailers| {
+                trailers
+                    .iter()
+                    .filter(|t| {
+                        t.direct_url()
+                            .is_some()
+                    })
+                    .count() as i64
+            }),
+        extra_type: (media.kind == db::MediaKind::Trailer)
+            .then(|| "Trailer".to_string()),
         series_id: matches!(media.kind, db::MediaKind::Episode | db::MediaKind::Season)
             .then(|| {
                 media
@@ -475,6 +515,7 @@ fn db_media_to_item_inner(
                         .id
                         .to_string(),
                     unplayed_item_count: media.unplayed_item_count,
+                    played_percentage: folder_played_percentage(&media),
                     ..Default::default()
                 }),
         ),
@@ -483,7 +524,8 @@ fn db_media_to_item_inner(
             | db::MediaKind::Episode
             | db::MediaKind::TvChannel
             | db::MediaKind::TvProgram
-            | db::MediaKind::Intro => MediaType::Video,
+            | db::MediaKind::Intro
+            | db::MediaKind::Trailer => MediaType::Video,
             db::MediaKind::Track => MediaType::Audio,
             db::MediaKind::Playlist => match media.collection_media_kind {
                 Some(db::CollectionMediaKind::Music) => MediaType::Audio,
@@ -984,6 +1026,10 @@ fn db_media_to_item_inner(
                 .collection_image_config
                 .clone(),
             sort_order: media.sort_order,
+            stremio_id: media
+                .external_ids
+                .custom_stremio_id
+                .clone(),
         }),
         enable_media_source_display: Some(true),
         date_created: Some(
@@ -1117,11 +1163,16 @@ fn db_media_to_item_inner(
     }
     item.external_urls = external_urls;
 
-    // several dlients require at least one stream
+    // several dlients require at least one stream. `Stream` is here because
+    // Android TV refetches an item by MediaSource id when a version is picked
+    // and reads `MediaSources` off that response without a PlaybackInfo call.
+    // A trailer plays its own URL, like a stream.
     if !hide_sources
         && (media.kind == db::MediaKind::Movie
             || media.kind == db::MediaKind::Episode
-            || media.kind == db::MediaKind::Track)
+            || media.kind == db::MediaKind::Track
+            || media.kind == db::MediaKind::Stream
+            || media.kind == db::MediaKind::Trailer)
     {
         item.can_download = Some(true);
         if media.kind != db::MediaKind::Track {
@@ -1346,5 +1397,50 @@ mod community_rating_tests {
     fn unvoted_episodes_have_no_rating() {
         let episode = media(db::MediaKind::Episode, 6.5, Some((0.0, 0)));
         assert_eq!(community_rating(&episode), None);
+    }
+}
+
+#[cfg(test)]
+mod stream_row_tests {
+    use super::*;
+
+    /// Android TV fetches `GET /Items/{mediaSourceId}` when a version is
+    /// picked and plays the source whose id equals the item's id. Without
+    /// `MediaSources` on that response the external player shows "No playable
+    /// items" and the built-in one has nothing to read.
+    #[test]
+    fn a_stream_row_carries_itself_as_its_only_media_source() {
+        let row = db::Media {
+            id: uuid::Uuid::new_v4(),
+            kind: db::MediaKind::Stream,
+            title: "1080p WEB-DL".into(),
+            ..Default::default()
+        };
+        let mut media = row.clone();
+        media.sources = Some(vec![row.clone()]);
+
+        let item = db_media_to_item(media, false);
+
+        let sources = item
+            .media_sources
+            .expect("a Stream row must carry MediaSources");
+        assert_eq!(sources.len(), 1);
+        assert_eq!(sources[0].id, row.id);
+    }
+
+    #[test]
+    fn hidden_sources_stay_hidden_for_a_stream_row() {
+        let row = db::Media {
+            kind: db::MediaKind::Stream,
+            ..Default::default()
+        };
+        let mut media = row.clone();
+        media.sources = Some(vec![row]);
+
+        assert!(
+            db_media_to_item(media, true)
+                .media_sources
+                .is_none()
+        );
     }
 }

@@ -4,12 +4,10 @@ use crate::{
     db,
     db::PreProbeQualityExt,
     device_profile::SourceRankingContext,
+    ids::{ItemId, StreamGroupId, UserId},
     playback::probe::{ProbeOutcome, probe_stream, resolve_stream_root},
 };
-use remux_sdks::{
-    remux::{MediaStreamType, StreamFilter, VideoRangeType},
-    remuxdb,
-};
+use remux_sdks::{remux::StreamFilter, remuxdb};
 use tracing::{debug, warn};
 use uuid::Uuid;
 
@@ -84,6 +82,7 @@ pub(crate) struct DefaultStreamPrefs<'a> {
     pub requested_subtitle: Option<i64>,
     pub remembered_audio: Option<i64>,
     pub remembered_subtitle: Option<i64>,
+    pub remembered_languages: &'a remux_sdks::remux::RememberedLanguages,
 }
 
 pub(crate) struct StreamServiceConfig {
@@ -107,6 +106,8 @@ pub(crate) struct StreamService {
     show_ungrouped: bool,
     stream_filter: Option<StreamFilter>,
     user_id: Option<Uuid>,
+    /// Rank group representatives too (`stream_groups_auto_sort`); read in `load`.
+    sort_groups: bool,
     // Populated by resolve()
     group: Option<(Uuid, String, Vec<db::Media>)>,
     stream: Option<db::Media>,
@@ -118,6 +119,18 @@ fn quality_ordered_probe_pool(streams: &[db::Media]) -> Vec<db::Media> {
     pool.sort_by_cached_key(|stream| std::cmp::Reverse(stream.quality_weight()));
     pool
 }
+
+/// A track PlaybackInfo listed for a session.
+#[derive(Clone)]
+struct AdvertisedTrack {
+    index: i64,
+    kind: api::MediaStreamType,
+    language: Option<String>,
+}
+
+/// How long a playback session may go without a report and still count as the
+/// one a PlaybackInfo continues.
+const RUNNING_RELEASE_WINDOW: chrono::Duration = chrono::Duration::minutes(5);
 
 impl StreamService {
     /// Capability-ranks `items` best-first. `describe` yields each item's
@@ -165,7 +178,8 @@ impl StreamService {
     /// dropping embedded subtitles it cannot deliver and resolving its default
     /// streams — the same steps PlaybackInfo applies before its transcode
     /// decision. Leaves the order alone with sorting disabled, fewer than two
-    /// sources, or stream-group representatives (admin-authored order).
+    /// sources, or stream-group representatives (admin-authored order) unless
+    /// `include_groups`.
     ///
     /// Returns the subtitle-extraction flags it looked up (empty when it did
     /// not rank), so callers need not query them again.
@@ -175,15 +189,31 @@ impl StreamService {
         ranking: SourceRankingContext<'_>,
         prefs: DefaultStreamPrefs<'_>,
     ) -> std::collections::HashMap<Uuid, bool> {
+        Self::rank_media_sources_with_groups(db, sources, ranking, prefs, false).await
+    }
+
+    /// [`Self::rank_media_sources`], optionally ranking stream-group
+    /// representatives too (`include_groups`, the `stream_groups_auto_sort`
+    /// setting). Each representative is its group's best stream, so it is
+    /// judged like any other source. Without it a list holding a group keeps
+    /// the admin-set group order.
+    pub async fn rank_media_sources_with_groups(
+        db: &sqlx::SqlitePool,
+        sources: &mut [db::Media],
+        ranking: SourceRankingContext<'_>,
+        prefs: DefaultStreamPrefs<'_>,
+        include_groups: bool,
+    ) -> std::collections::HashMap<Uuid, bool> {
         if ranking.mode == remux_sdks::remux::SortMediaSourcesMode::Disabled
             || sources.len() < 2
-            || sources
-                .iter()
-                .any(|source| {
-                    source
-                        .group_id
-                        .is_some()
-                })
+            || (!include_groups
+                && sources
+                    .iter()
+                    .any(|source| {
+                        source
+                            .group_id
+                            .is_some()
+                    }))
         {
             return Default::default();
         }
@@ -204,7 +234,7 @@ impl StreamService {
                         ranking.subtitle_mode,
                     )
                 });
-            info.resolve_default_streams(
+            info.resolve_default_streams_remembering(
                 prefs.user_cfg,
                 prefs.server_metadata_language,
                 prefs.original_language,
@@ -212,6 +242,7 @@ impl StreamService {
                 prefs.requested_subtitle,
                 prefs.remembered_audio,
                 prefs.remembered_subtitle,
+                prefs.remembered_languages,
             );
             (info, allow_subtitle_extraction)
         });
@@ -226,6 +257,7 @@ impl StreamService {
             show_ungrouped: cfg.show_ungrouped,
             stream_filter: cfg.stream_filter,
             user_id: cfg.user_id,
+            sort_groups: false,
             group: None,
             stream: None,
             streams: vec![],
@@ -236,7 +268,20 @@ impl StreamService {
     ///
     /// Populates `self.group`, `self.stream`, and `self.streams`. Must be called
     /// before any of the selection or ID-mapping methods.
-    pub async fn load(&mut self, media: db::Media) -> anyhow::Result<()> {
+    pub async fn load(
+        &mut self,
+        media: db::Media,
+        ranking: Option<SourceRankingContext<'_>>,
+        prefs: DefaultStreamPrefs<'_>,
+    ) -> anyhow::Result<()> {
+        self.sort_groups = db::Settings::get_config_or_default(
+            &self
+                .ctx
+                .db,
+        )
+        .await
+        .stream_groups_auto_sort
+        .unwrap_or(false);
         if media.kind == db::MediaKind::StreamGroup {
             if let Ok(Some(mut parent)) = db::Media::get_by_id(
                 &self
@@ -246,13 +291,14 @@ impl StreamService {
             )
             .await
             {
-                self.ctx
+                let _ = self
+                    .ctx
                     .addons
                     .refresh_streams(&mut parent, &self.ctx, self.user_id)
                     .await
                     .inspect_err(|e| tracing::error!("refresh_streams failed: {e:#}"));
             }
-            self.resolve_stream_group(media)
+            self.resolve_stream_group(media, ranking, prefs)
                 .await?;
             return Ok(());
         }
@@ -266,7 +312,8 @@ impl StreamService {
         )
         .await;
 
-        self.ctx
+        let _ = self
+            .ctx
             .addons
             .refresh_streams(&mut root, &self.ctx, self.user_id)
             .await
@@ -299,6 +346,11 @@ impl StreamService {
             db_streams
         };
 
+        // Best first before grouping, so a group's representative (its first
+        // match) is its best stream for this device.
+        let raw = self
+            .ranked(raw, ranking, prefs)
+            .await;
         let streams = db::StreamGroup::filter_sources(
             &self
                 .ctx
@@ -348,6 +400,69 @@ impl StreamService {
         Ok(())
     }
 
+    /// A client that picked a version holds that version's id as the item id
+    /// (see `MediaResolveService::playable_item_id`). Playback is keyed by the
+    /// item the version belongs to plus the version as the requested source, so
+    /// swap them back: `(owner, Some(version))`. A group's [`VersionId`] comes
+    /// back as its title and the plain group id, also when it is sent as the
+    /// source. Any other id is returned as is.
+    ///
+    /// [`VersionId`]: crate::services::VersionId
+    pub(crate) async fn version_target(
+        ctx: &AppContext,
+        user_id: Option<UserId>,
+        item_id: Uuid,
+        requested_id: Option<Uuid>,
+    ) -> (Uuid, Option<Uuid>) {
+        let requested_id = match requested_id {
+            Some(requested) if requested != item_id => Some(
+                match db::Media::get_by_id(&ctx.db, &requested)
+                    .await
+                    .ok()
+                    .flatten()
+                {
+                    Some(_) => requested,
+                    None => crate::services::VersionId::decode(&ctx.db, requested)
+                        .await
+                        .map_or(requested, |v| v.group),
+                },
+            ),
+            requested => requested,
+        };
+        let owner = match db::Media::get_by_id(&ctx.db, &item_id)
+            .await
+            .ok()
+            .flatten()
+        {
+            Some(row) => match row.kind {
+                db::MediaKind::Stream => row
+                    .parent_id
+                    .map(|owner| (owner, item_id)),
+                db::MediaKind::StreamGroup => user_id
+                    .and_then(|user_id| {
+                        Self::get_group_item(&ctx.store, user_id, StreamGroupId(row.id))
+                    })
+                    .map(ItemId::uuid)
+                    .map(|owner| (owner, item_id)),
+                _ => None,
+            },
+            None => crate::services::VersionId::decode(&ctx.db, item_id)
+                .await
+                .map(|v| (v.owner, v.group)),
+        };
+        match owner {
+            Some((owner, version)) => (
+                owner,
+                Some(
+                    requested_id
+                        .filter(|r| *r != item_id)
+                        .unwrap_or(version),
+                ),
+            ),
+            None => (item_id, requested_id),
+        }
+    }
+
     /// One-shot lookup for handlers that only need a single resolved stream (subtitles, video).
     ///
     /// Handles StreamGroup → best candidate, device preference, and explicit stream UUID.
@@ -359,6 +474,8 @@ impl StreamService {
         device_key: Option<&str>,
         user_id: Option<Uuid>,
     ) -> anyhow::Result<db::Media> {
+        let (item_id, requested_id) =
+            Self::version_target(ctx, user_id.map(UserId), item_id, requested_id).await;
         let lookup_id = requested_id.unwrap_or(item_id);
         // Resolve the id the way PlaybackInfo does: `resolve_item` is
         // `get_by_id` plus the synthetic-id path (search/catalog ids that have
@@ -408,7 +525,7 @@ impl StreamService {
                     .refresh_streams(&mut media, ctx, user_id)
                     .await
                     .inspect_err(|e| tracing::error!("refresh_streams failed: {e:#}"));
-                let sources = media
+                let mut sources = media
                     .streams(&ctx.db)
                     .await?;
                 // Here `requested_id` resolved to a Movie/Episode/Track, so it
@@ -424,29 +541,78 @@ impl StreamService {
                         .into_iter()
                         .find(|s| s.id == sid)
                         .ok_or_else(|| anyhow::anyhow!("stream not found: {}", sid))
-                } else if let Some(key) = device_key {
-                    let saved = ctx
-                        .store
-                        .get::<Uuid>(&format!("pstream:{}:{}", item_id, key));
-                    let by_pref = saved.and_then(|sid| {
+                } else {
+                    // The device's PlaybackInfo pick first, then stored order.
+                    let saved = device_key.and_then(|key| {
+                        ctx.store
+                            .get::<Uuid>(crate::store_keys::device_stream(item_id, key))
+                    });
+                    if let Some(pos) = saved.and_then(|sid| {
                         sources
                             .iter()
-                            .find(|s| s.id == *sid)
-                            .cloned()
-                    });
-                    by_pref
-                        .or_else(|| {
-                            sources
-                                .into_iter()
-                                .next()
-                        })
-                        .ok_or_else(|| {
-                            anyhow::anyhow!("no playable sources for {}", item_id)
-                        })
-                } else {
+                            .position(|s| s.id == *sid)
+                    }) {
+                        sources[..=pos].rotate_right(1);
+                    }
+                    // No PlaybackInfo checked this source (Download,
+                    // `/Videos/{id}/stream` without PlaybackInfo): take the
+                    // first of a few that doesn't answer as gone, else the
+                    // first, and keep the pick so Range requests get the same
+                    // file. Not for live TV: the check can take the only IPTV
+                    // slot.
+                    let mut pick = 0;
+                    if !matches!(
+                        media.kind,
+                        db::MediaKind::TvChannel | db::MediaKind::TvProgram
+                    ) && let Some(head) = sources.first()
+                    {
+                        // Keyed by the head, so a changed device preference
+                        // walks again.
+                        let key = crate::store_keys::walked_stream(item_id, head.id);
+                        let remembered = ctx
+                            .store
+                            .get::<Uuid>(&key)
+                            .and_then(|sid| {
+                                sources
+                                    .iter()
+                                    .position(|s| s.id == *sid)
+                            });
+                        if let Some(pos) = remembered {
+                            pick = pos;
+                        } else {
+                            for (i, source) in sources
+                                .iter()
+                                .take(4)
+                                .enumerate()
+                            {
+                                // A slow resolve keeps its place.
+                                let gone = match &source.stream_info {
+                                    Some(si) => {
+                                        si.descriptor
+                                            .availability()
+                                            .await
+                                            == Some(false)
+                                    }
+                                    None => false,
+                                };
+                                if !gone {
+                                    pick = i;
+                                    break;
+                                }
+                            }
+                            // Every read restarts the TTL, so a long playback
+                            // keeps its file.
+                            ctx.store
+                                .save_sliding(
+                                    key,
+                                    sources[pick].id,
+                                    std::time::Duration::from_secs(10 * 60),
+                                );
+                        }
+                    }
                     sources
                         .into_iter()
-                        .next()
+                        .nth(pick)
                         .ok_or_else(|| {
                             anyhow::anyhow!("no playable sources for {}", item_id)
                         })
@@ -456,12 +622,39 @@ impl StreamService {
         }
     }
 
-    async fn resolve_stream_group(&mut self, media: db::Media) -> anyhow::Result<()> {
+    /// `streams` best first by the media source sort mode, or as given when
+    /// there is no ranking context (or sorting is disabled).
+    async fn ranked(
+        &self,
+        mut streams: Vec<db::Media>,
+        ranking: Option<SourceRankingContext<'_>>,
+        prefs: DefaultStreamPrefs<'_>,
+    ) -> Vec<db::Media> {
+        if let Some(ranking) = ranking {
+            Self::rank_media_sources(
+                &self
+                    .ctx
+                    .db,
+                &mut streams,
+                ranking,
+                prefs,
+            )
+            .await;
+        }
+        streams
+    }
+
+    async fn resolve_stream_group(
+        &mut self,
+        media: db::Media,
+        ranking: Option<SourceRankingContext<'_>>,
+        prefs: DefaultStreamPrefs<'_>,
+    ) -> anyhow::Result<()> {
         let gid = media.id;
         let gtitle = media
             .title
             .clone();
-        let mut candidates = db::StreamGroup::streams_for(
+        let candidates = db::StreamGroup::streams_for(
             &self
                 .ctx
                 .db,
@@ -472,7 +665,7 @@ impl StreamService {
         if candidates.is_empty() {
             return Err(anyhow::anyhow!("no streams available for group {}", gid));
         }
-        let cascade = db::StreamGroup::streams_for_groups_after(
+        let cascade = db::StreamGroup::streams_per_group_after(
             &self
                 .ctx
                 .db,
@@ -481,7 +674,18 @@ impl StreamService {
         )
         .await
         .unwrap_or_default();
-        candidates.extend(cascade);
+        // The group's own streams best first, then those of each later group,
+        // ranked within their own group so the fallback still goes group by
+        // group, in the admin's order.
+        let mut candidates = self
+            .ranked(candidates, ranking, prefs)
+            .await;
+        for later in cascade {
+            candidates.extend(
+                self.ranked(later, ranking, prefs)
+                    .await,
+            );
+        }
         self.stream = Some(candidates[0].clone());
         self.group = Some((gid, gtitle, candidates));
         Ok(())
@@ -492,23 +696,6 @@ impl StreamService {
         self.stream
             .as_ref()
             .expect("StreamService::load() must be called first")
-    }
-
-    /// The StreamGroup context, if the request was for a group.
-    pub fn group(&self) -> Option<&(Uuid, String, Vec<db::Media>)> {
-        self.group
-            .as_ref()
-    }
-
-    /// UUID the client should see in `MediaSources[0].Id` and `TranscodingUrl MediaSourceId`.
-    pub fn client_facing_id(&self) -> Uuid {
-        self.group
-            .as_ref()
-            .map(|(gid, _, _)| *gid)
-            .unwrap_or_else(|| {
-                self.candidate()
-                    .id
-            })
     }
 
     /// UUID for `MediaSources[idx].Id`, using the probe-fallback effective stream.
@@ -622,13 +809,14 @@ impl StreamService {
     ) -> (Vec<db::Media>, std::collections::HashMap<Uuid, bool>) {
         let extraction = match ranking {
             Some(ranking) => {
-                Self::rank_media_sources(
+                Self::rank_media_sources_with_groups(
                     &self
                         .ctx
                         .db,
                     &mut candidates,
                     ranking,
                     prefs,
+                    self.sort_groups,
                 )
                 .await
             }
@@ -918,7 +1106,7 @@ impl StreamService {
             {
                 match media_info_from_probe(&source, &effective_stream, item.as_ref()) {
                     Ok(mi) => {
-                        debug!(id = %effective_stream.id, url, "remuxdb: submitting mediainfo");
+                        debug!(id = %effective_stream.id, url = %crate::playback::probe::redact_url(&url), "remuxdb: submitting mediainfo");
                         let token = probe_cfg
                             .remuxdb_token
                             .clone();
@@ -985,10 +1173,29 @@ impl StreamService {
         self.ctx
             .store
             .save(
-                Self::selected_stream_key(play_session_id, source_id),
+                crate::store_keys::session_selected_stream(play_session_id, source_id),
                 effective_stream_id,
                 std::time::Duration::from_secs(24 * 3600),
             );
+        // A client continuing playback (audio switch) asks again by item id,
+        // so the release must be findable under it as well as under the
+        // release id the answer carried.
+        if self
+            .group
+            .is_none()
+            && source_id != self.item_id
+        {
+            self.ctx
+                .store
+                .save(
+                    crate::store_keys::session_selected_stream(
+                        play_session_id,
+                        self.item_id,
+                    ),
+                    effective_stream_id,
+                    std::time::Duration::from_secs(24 * 3600),
+                );
+        }
         // Infuse's direct stream URL has MediaSourceId but no PlaySessionId or
         // DeviceId query parameter, and subtitle downloads carry no
         // PlaySessionId either. Keep a mapping for those requests too, keyed
@@ -1022,7 +1229,9 @@ impl StreamService {
     ) {
         ctx.store
             .save(
-                Self::device_selected_stream_key(device_id, item_id, source_id),
+                crate::store_keys::device_selected_stream(
+                    device_id, item_id, source_id,
+                ),
                 effective_stream_id,
                 std::time::Duration::from_secs(24 * 3600),
             );
@@ -1036,7 +1245,10 @@ impl StreamService {
         source_id: Uuid,
     ) -> Option<Uuid> {
         ctx.store
-            .get::<Uuid>(Self::selected_stream_key(play_session_id, source_id))
+            .get::<Uuid>(crate::store_keys::session_selected_stream(
+                play_session_id,
+                source_id,
+            ))
             .map(|id| *id)
     }
 
@@ -1052,7 +1264,7 @@ impl StreamService {
         source_id: Uuid,
     ) -> Option<Uuid> {
         ctx.store
-            .get::<Uuid>(Self::device_selected_stream_key(
+            .get::<Uuid>(crate::store_keys::device_selected_stream(
                 device_id, item_id, source_id,
             ))
             .map(|id| *id)
@@ -1080,16 +1292,212 @@ impl StreamService {
         }
     }
 
-    fn device_selected_stream_key(
-        device_id: &str,
-        item_id: Uuid,
-        source_id: Uuid,
-    ) -> String {
-        format!("pstream:device:{device_id}:{item_id}:{source_id}")
+    /// Remember the audio/subtitle language the user just switched to, so the
+    /// next play (of any release or title) starts with it. Only an explicit
+    /// change counts: a report that merely repeats the track the session
+    /// started on, or names one for the first time, may be the server's own
+    /// default echoed back and must not turn into the user's choice.
+    pub async fn remember_track_choice(
+        ctx: &AppContext,
+        user: &db::User,
+        before: &crate::playback_session::PlaybackSession,
+        report: &api::PlaybackInfo,
+    ) {
+        let cfg = user
+            .configuration
+            .as_ref()
+            .map(|c| {
+                c.0.clone()
+            })
+            .unwrap_or_default();
+        let changed =
+            |before: Option<i32>, reported: Option<i32>| match (before, reported) {
+                (Some(before), Some(reported)) if before != reported => Some(reported),
+                _ => None,
+            };
+        let audio = changed(before.audio_stream_index, report.audio_stream_index)
+            .filter(|_| cfg.remember_audio_selections)
+            .filter(|index| *index >= 0);
+        let subtitle =
+            changed(before.subtitle_stream_index, report.subtitle_stream_index)
+                .filter(|_| cfg.remember_subtitle_selections);
+        if audio.is_none() && subtitle.is_none() {
+            return;
+        }
+        let item_id = if report
+            .item_id
+            .is_nil()
+        {
+            before.item_id
+        } else {
+            report.item_id
+        };
+        let psid = &before.play_session_id;
+        let audio_lang = match audio {
+            Some(index) => {
+                Self::track_language(
+                    ctx,
+                    psid,
+                    item_id,
+                    before
+                        .media_source_id
+                        .as_deref(),
+                    index,
+                    api::MediaStreamType::Audio,
+                )
+                .await
+            }
+            None => None,
+        };
+        let subtitle_choice = match subtitle {
+            Some(index) if index < 0 => {
+                Some(remux_sdks::remux::RememberedSubtitle::Off)
+            }
+            Some(index) => Self::track_language(
+                ctx,
+                psid,
+                item_id,
+                before
+                    .media_source_id
+                    .as_deref(),
+                index,
+                api::MediaStreamType::Subtitle,
+            )
+            .await
+            .map(remux_sdks::remux::RememberedSubtitle::Language),
+            None => None,
+        };
+        let Ok(Some(media)) = db::Media::get_by_id(&ctx.db, &item_id).await else {
+            return;
+        };
+        if let Err(err) = db::UserMediaState::remember_languages(
+            &ctx.db,
+            user,
+            &media,
+            audio_lang.as_deref(),
+            subtitle_choice.as_ref(),
+        )
+        .await
+        {
+            tracing::warn!(%err, "failed to remember the chosen track language");
+        }
     }
 
-    fn selected_stream_key(play_session_id: &str, source_id: Uuid) -> String {
-        format!("pstream:psid:{play_session_id}:{source_id}")
+    /// Remember the tracks PlaybackInfo advertised for `play_session_id`, with
+    /// the language of each. Addon and sidecar subtitles are added after the
+    /// probe, so their indexes exist nowhere else.
+    pub fn save_advertised_tracks(
+        ctx: &AppContext,
+        play_session_id: &str,
+        streams: &[api::MediaStream],
+    ) {
+        let tracks: Vec<AdvertisedTrack> = streams
+            .iter()
+            .filter_map(|s| {
+                Some(AdvertisedTrack {
+                    index: s.index,
+                    kind: s
+                        .type_
+                        .clone(),
+                    language: s
+                        .language
+                        .clone(),
+                })
+            })
+            .collect();
+        ctx.store
+            .save(
+                crate::store_keys::play_session_tracks(play_session_id),
+                tracks,
+                std::time::Duration::from_secs(24 * 3600),
+            );
+    }
+
+    /// Two-letter language of track `index` in what `play_session_id` was
+    /// told, if it has one.
+    async fn track_language(
+        ctx: &AppContext,
+        play_session_id: &str,
+        item_id: Uuid,
+        media_source_id: Option<&str>,
+        index: i32,
+        kind: api::MediaStreamType,
+    ) -> Option<String> {
+        let index = i64::from(index);
+        if let Some(tracks) = ctx
+            .store
+            .get::<Vec<AdvertisedTrack>>(crate::store_keys::play_session_tracks(
+                play_session_id,
+            ))
+        {
+            return tracks
+                .iter()
+                .find(|t| t.index == index && t.kind == kind)?
+                .language
+                .as_deref()
+                .and_then(remux_sdks::remux::lang_to_two_letter);
+        }
+        // No PlaybackInfo answered this session (a client that skipped it):
+        // the probed release is the best there is.
+        let release =
+            Self::played_release(ctx, play_session_id, item_id, media_source_id)?;
+        let release = db::Media::get_by_id(&ctx.db, &release)
+            .await
+            .ok()??;
+        let language = release
+            .probe_data?
+            .media_streams
+            .into_iter()
+            .find(|s| s.type_ == kind && s.index == index)?
+            .language?;
+        remux_sdks::remux::lang_to_two_letter(&language)
+    }
+
+    /// The release (stream) `play_session_id` plays for `item_id`: the one its
+    /// PlaybackInfo answer selected, else the source the client named. The
+    /// reported `MediaSourceId` alone is not enough, as auto-play answers
+    /// stamp the first source with the item id.
+    pub fn played_release(
+        ctx: &AppContext,
+        play_session_id: &str,
+        item_id: Uuid,
+        media_source_id: Option<&str>,
+    ) -> Option<Uuid> {
+        Self::selected_stream_for(ctx, play_session_id, item_id).or_else(|| {
+            let source = media_source_id.and_then(|id| Uuid::parse_str(id).ok())?;
+            Self::selected_stream_for(ctx, play_session_id, source).or(Some(source))
+        })
+    }
+
+    /// The release `device_id` is playing for `item_id` right now, when a
+    /// PlaybackInfo for that item should stay on it.
+    ///
+    /// Auto-play answers stamp the first source's id with the item id, so a
+    /// client that changes audio track or restarts mid-playback asks again with
+    /// `MediaSourceId == item_id`. Ranking the releases anew would pick another
+    /// release whenever the requested track index favours it, and the index
+    /// (valid for the old release only) would then land on the wrong language.
+    /// A request that names a specific source is never overridden, and neither
+    /// is one for an item the device is not playing, or whose session went
+    /// quiet (a client that died without reporting a stop): a fresh play ranks
+    /// anew.
+    pub fn running_release(
+        ctx: &AppContext,
+        device_id: &str,
+        item_id: Uuid,
+        requested: Option<Uuid>,
+    ) -> Option<Uuid> {
+        if requested.is_some_and(|id| id != item_id) {
+            return None;
+        }
+        let running = ctx
+            .sessions
+            .get_by_device(device_id)
+            .filter(|session| session.item_id == item_id)
+            .filter(|session| {
+                chrono::Utc::now() - session.last_activity < RUNNING_RELEASE_WINDOW
+            })?;
+        Self::selected_stream_for(ctx, &running.play_session_id, item_id)
     }
 
     /// Persist the resolved stream UUID in the device-preference store (24 h TTL).
@@ -1103,7 +1511,7 @@ impl StreamService {
         self.ctx
             .store
             .save(
-                format!("pstream:{}:{}", self.item_id, device_key),
+                crate::store_keys::device_stream(self.item_id, device_key),
                 self.candidate()
                     .id,
                 std::time::Duration::from_secs(24 * 3600),
@@ -1113,9 +1521,9 @@ impl StreamService {
                 &self
                     .ctx
                     .store,
-                uid,
-                *gid,
-                self.item_id,
+                UserId(uid),
+                StreamGroupId(*gid),
+                ItemId(self.item_id),
             );
         }
     }
@@ -1127,12 +1535,12 @@ impl StreamService {
     /// TTL is 7 days — long enough to survive normal browsing sessions.
     pub fn save_group_item(
         store: &remux_utils::Store,
-        user_id: Uuid,
-        group_id: Uuid,
-        item_id: Uuid,
+        user_id: UserId,
+        group_id: StreamGroupId,
+        item_id: ItemId,
     ) {
         store.save(
-            format!("gitem:{}:{}", user_id, group_id),
+            crate::store_keys::group_item(user_id, group_id),
             item_id,
             std::time::Duration::from_secs(7 * 24 * 3600),
         );
@@ -1144,11 +1552,11 @@ impl StreamService {
     /// or the mapping has expired. Callers should surface a 404 in that case.
     pub fn get_group_item(
         store: &remux_utils::Store,
-        user_id: Uuid,
-        group_id: Uuid,
-    ) -> Option<Uuid> {
+        user_id: UserId,
+        group_id: StreamGroupId,
+    ) -> Option<ItemId> {
         store
-            .get::<Uuid>(format!("gitem:{}:{}", user_id, group_id))
+            .get::<ItemId>(crate::store_keys::group_item(user_id, group_id))
             .map(|id| *id)
     }
 }
@@ -1171,7 +1579,10 @@ pub(crate) struct StreamSelection {
 const MIN_RUNTIME_RATIO: f64 = 2.0 / 3.0;
 const MAX_RUNTIME_RATIO: f64 = 2.0;
 
-fn implausible_runtime(runtime_secs: Option<i64>, probed_ticks: Option<i64>) -> bool {
+pub(crate) fn implausible_runtime(
+    runtime_secs: Option<i64>,
+    probed_ticks: Option<i64>,
+) -> bool {
     let (Some(runtime), Some(probed)) = (
         runtime_secs
             .filter(|&s| s > 0)
@@ -1364,6 +1775,115 @@ fn media_info_from_probe(
 mod tests {
     use super::*;
     use crate::stream::{StreamDescriptor, StreamInfo};
+    use remux_sdks::remux::MediaStreamType;
+
+    /// A client holding a picked version as its item id (Android TV, after
+    /// `GET /Items/{version}`) must play the owning item with that version as
+    /// the requested source, whether the version is a stream or a stream group.
+    #[tokio::test]
+    async fn a_version_held_as_the_item_plays_its_owner_with_that_source() {
+        let (_server, guard, _token) =
+            crate::integration_test::authenticated_server().await;
+        let ctx = &guard.0;
+        let user = Uuid::new_v4();
+        let mut movie = db::Media {
+            kind: db::MediaKind::Movie,
+            title: "Movie".into(),
+            external_ids: db::ExternalIds {
+                imdb: Some(
+                    db::NonEmptyString::try_new("tt1234567".to_string()).unwrap(),
+                ),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        movie
+            .save(&ctx.db)
+            .await
+            .unwrap();
+        let mut stream = db::Media {
+            kind: db::MediaKind::Stream,
+            parent_id: Some(movie.id),
+            ..Default::default()
+        };
+        stream
+            .save(&ctx.db)
+            .await
+            .unwrap();
+        let mut group = db::Media {
+            kind: db::MediaKind::StreamGroup,
+            ..Default::default()
+        };
+        group
+            .save(&ctx.db)
+            .await
+            .unwrap();
+        StreamService::save_group_item(
+            &ctx.store,
+            UserId(user),
+            StreamGroupId(group.id),
+            ItemId(movie.id),
+        );
+
+        let target = |item, requested| {
+            StreamService::version_target(ctx, Some(UserId(user)), item, requested)
+        };
+        assert_eq!(
+            target(stream.id, Some(stream.id)).await,
+            (movie.id, Some(stream.id))
+        );
+        assert_eq!(target(stream.id, None).await, (movie.id, Some(stream.id)));
+        assert_eq!(
+            target(group.id, Some(group.id)).await,
+            (movie.id, Some(group.id))
+        );
+        // A group's version id names its title, whatever the shared group id
+        // was last browsed under, also when sent as the source of the title.
+        let version = crate::services::VersionId::new(movie.id, group.id).id();
+        StreamService::save_group_item(
+            &ctx.store,
+            UserId(user),
+            StreamGroupId(group.id),
+            ItemId(Uuid::new_v4()),
+        );
+        assert_eq!(
+            target(version, Some(version)).await,
+            (movie.id, Some(group.id))
+        );
+        assert_eq!(target(version, None).await, (movie.id, Some(group.id)));
+        assert_eq!(
+            StreamService::version_target(ctx, None, version, None).await,
+            (movie.id, Some(group.id)),
+            "no user is needed"
+        );
+        assert_eq!(
+            target(movie.id, Some(version)).await,
+            (movie.id, Some(group.id))
+        );
+        StreamService::save_group_item(
+            &ctx.store,
+            UserId(user),
+            StreamGroupId(group.id),
+            ItemId(movie.id),
+        );
+        // Anything else is left alone, including an item with a source named.
+        assert_eq!(target(movie.id, None).await, (movie.id, None));
+        assert_eq!(
+            target(movie.id, Some(stream.id)).await,
+            (movie.id, Some(stream.id))
+        );
+        // A group this user never browsed has no owner to go back to.
+        assert_eq!(
+            StreamService::version_target(
+                ctx,
+                Some(UserId(Uuid::new_v4())),
+                group.id,
+                None
+            )
+            .await,
+            (group.id, None)
+        );
+    }
 
     #[test]
     fn subtitle_query_comes_from_the_streams_filename_and_size() {
@@ -1406,7 +1926,7 @@ mod tests {
             .media_streams
             .push(api::MediaStream {
                 codec: Some("pgssub".to_string()),
-                type_: Some(MediaStreamType::Subtitle),
+                type_: MediaStreamType::Subtitle,
                 index: 2,
                 language: Some("eng".to_string()),
                 ..Default::default()
@@ -1425,6 +1945,7 @@ mod tests {
             requested_subtitle: None,
             remembered_audio: None,
             remembered_subtitle: None,
+            remembered_languages: &Default::default(),
         };
         let ranking = SourceRankingContext {
             mode: remux_sdks::remux::SortMediaSourcesMode::Compatibility,
@@ -1451,6 +1972,77 @@ mod tests {
             2,
             "extraction flags are returned for reuse"
         );
+    }
+
+    /// Stream-group representatives keep the admin-set order unless group
+    /// sorting is on, which ranks them like any other source.
+    #[tokio::test]
+    async fn group_representatives_are_ranked_only_when_group_sorting_is_on() {
+        use crate::integration_test::{authenticated_server, insert_test_source};
+
+        let (_server, guard, _token) = authenticated_server().await;
+        let ctx = &guard.0;
+        let mut with_pgs = insert_test_source(ctx).await;
+        with_pgs
+            .probe_data
+            .as_mut()
+            .unwrap()
+            .media_streams
+            .push(api::MediaStream {
+                codec: Some("pgssub".to_string()),
+                type_: MediaStreamType::Subtitle,
+                index: 2,
+                language: Some("eng".to_string()),
+                ..Default::default()
+            });
+        let plain = insert_test_source(ctx).await;
+        with_pgs.group_id = Some(Uuid::new_v4());
+        let mut plain = plain;
+        plain.group_id = Some(Uuid::new_v4());
+
+        let user_cfg = api::UserConfiguration {
+            subtitle_language_preference: Some("eng".to_string()),
+            subtitle_mode: remux_sdks::remux::SubtitleMode::Always,
+            ..Default::default()
+        };
+        let prefs = DefaultStreamPrefs {
+            user_cfg: &user_cfg,
+            server_metadata_language: None,
+            original_language: None,
+            requested_audio: None,
+            requested_subtitle: None,
+            remembered_audio: None,
+            remembered_subtitle: None,
+            remembered_languages: &Default::default(),
+        };
+        let ranking = SourceRankingContext {
+            mode: remux_sdks::remux::SortMediaSourcesMode::Compatibility,
+            device_profile: None,
+            is_4k_capable: true,
+            subtitle_mode: remux_sdks::remux::EmbeddedSubtitleHandling::Burn,
+            explicit_subtitle_index: None,
+            max_bitrate: None,
+        };
+        let ids = |sources: &[db::Media]| {
+            sources
+                .iter()
+                .map(|s| s.id)
+                .collect::<Vec<_>>()
+        };
+
+        let mut off = vec![with_pgs.clone(), plain.clone()];
+        StreamService::rank_media_sources_with_groups(
+            &ctx.db, &mut off, ranking, prefs, false,
+        )
+        .await;
+        assert_eq!(ids(&off), vec![with_pgs.id, plain.id], "admin order kept");
+
+        let mut on = vec![with_pgs.clone(), plain.clone()];
+        StreamService::rank_media_sources_with_groups(
+            &ctx.db, &mut on, ranking, prefs, true,
+        )
+        .await;
+        assert_eq!(ids(&on), vec![plain.id, with_pgs.id], "ranked like sources");
     }
 
     /// Candidates come out in the order PlaybackInfo lists them, and the
@@ -1504,6 +2096,7 @@ mod tests {
             requested_subtitle: None,
             remembered_audio: None,
             remembered_subtitle: None,
+            remembered_languages: &Default::default(),
         };
         let candidates = vec![low.clone(), high.clone()];
         let order = async |candidates: Vec<db::Media>, ranking| {

@@ -139,7 +139,7 @@ pub(crate) fn keeps_embedded_subtitle(
     allow_extraction: bool,
     subtitle_mode: EmbeddedSubtitleHandling,
 ) -> bool {
-    if !matches!(stream.type_, Some(MediaStreamType::Subtitle)) || stream.is_external {
+    if !matches!(stream.type_, MediaStreamType::Subtitle) || stream.is_external {
         return true;
     }
     let codec = SubtitleCodec::from_codec_name(
@@ -725,7 +725,7 @@ fn condition_property_value(
             media_source
                 .media_streams
                 .iter()
-                .filter(|stream| matches!(stream.type_, Some(MediaStreamType::Audio)))
+                .filter(|stream| matches!(stream.type_, MediaStreamType::Audio))
                 .count()
                 .to_string(),
         ),
@@ -733,7 +733,7 @@ fn condition_property_value(
             media_source
                 .media_streams
                 .iter()
-                .filter(|stream| matches!(stream.type_, Some(MediaStreamType::Video)))
+                .filter(|stream| matches!(stream.type_, MediaStreamType::Video))
                 .count()
                 .to_string(),
         ),
@@ -850,7 +850,7 @@ fn failed_condition_reason(
             Some(TranscodeReason::StreamCountExceedsLimit(detail))
         }
         ProfileConditionProperty::Bitrate => {
-            if matches!(stream.type_, Some(MediaStreamType::Audio)) {
+            if matches!(stream.type_, MediaStreamType::Audio) {
                 Some(TranscodeReason::AudioBitrateNotSupported(detail))
             } else {
                 Some(TranscodeReason::VideoBitrateNotSupported(detail))
@@ -875,7 +875,7 @@ fn selected_audio_stream(source: &MediaSourceInfo) -> Option<&MediaStream> {
                 .iter()
                 .find(|stream| {
                     stream.index == index
-                        && matches!(stream.type_, Some(MediaStreamType::Audio))
+                        && matches!(stream.type_, MediaStreamType::Audio)
                 })
         })
         .or_else(|| source.audio_stream())
@@ -889,8 +889,7 @@ fn is_secondary_audio(source: &MediaSourceInfo, stream: &MediaStream) -> Option<
         .media_streams
         .iter()
         .find(|candidate| {
-            matches!(candidate.type_, Some(MediaStreamType::Audio))
-                && !candidate.is_external
+            matches!(candidate.type_, MediaStreamType::Audio) && !candidate.is_external
         })
         .map(|primary| primary.index != stream.index)
 }
@@ -953,7 +952,7 @@ impl ProfileConditionExt for ProfileCondition {
 /// Every field is "higher is better".
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MediaSourceRank {
-    resolution_fit_tier: u8,
+    four_k_fit: FourKFit,
     cached: bool,
     bitrate_plausibility_tier: u8,
     transcode_cost_tier: u8,
@@ -977,6 +976,8 @@ pub struct MediaSourceSortKey {
     cost: u8,
     plausibility_after_cost: u8,
     resolution: u8,
+    /// Ties on resolution go to the source the screen can show as is.
+    native: bool,
     hdr_class: u8,
     release_quality: u8,
     bitrate: i64,
@@ -1048,8 +1049,7 @@ impl SourceRankingContext<'_> {
             allow_subtitle_extraction,
         );
         let mut rank = source.capability_rank(self.device_profile, &reasons);
-        rank.resolution_fit_tier =
-            resolution_fit_tier(source, self.device_profile, self.is_4k_capable);
+        rank.four_k_fit = four_k_fit(source, self.device_profile, self.is_4k_capable);
         SourceAssessment { reasons, rank }
     }
 
@@ -1134,10 +1134,18 @@ impl MediaSourceRank {
             SortMediaSourcesMode::Compatibility => (1, self.bitrate_plausibility_tier),
             _ => (self.bitrate_plausibility_tier, 0),
         };
+        // A screen below 4K scales a 4K source down itself, so it is worth
+        // what a 1080p source is — not less than SD, but no more than 1080p.
+        // Quality mode ranks the pure source quality and ignores the screen.
+        let downscaled = self.four_k_fit == FourKFit::Downscaled
+            && matches!(
+                mode,
+                SortMediaSourcesMode::Best | SortMediaSourcesMode::Compatibility
+            );
         MediaSourceSortKey {
             resolution_fit: match mode {
                 SortMediaSourcesMode::Best | SortMediaSourcesMode::Compatibility => {
-                    self.resolution_fit_tier
+                    u8::from(self.four_k_fit != FourKFit::Unsupported)
                 }
                 _ => 0,
             },
@@ -1145,7 +1153,13 @@ impl MediaSourceRank {
             plausibility_before_cost,
             cost,
             plausibility_after_cost,
-            resolution: self.resolution_tier,
+            resolution: if downscaled {
+                self.resolution_tier
+                    .min(RESOLUTION_TIER_1080P)
+            } else {
+                self.resolution_tier
+            },
+            native: !downscaled,
             hdr_class: self.hdr_class,
             release_quality: self.quality_source_tier,
             bitrate: self.bitrate,
@@ -1228,9 +1242,7 @@ pub fn subtitle_burn_reason(
     let stream = source
         .media_streams
         .iter()
-        .find(|s| {
-            s.index == idx && matches!(s.type_, Some(MediaStreamType::Subtitle))
-        })?;
+        .find(|s| s.index == idx && matches!(s.type_, MediaStreamType::Subtitle))?;
     if stream.is_external || stream.is_text_subtitle_stream() {
         return None;
     }
@@ -1399,13 +1411,31 @@ fn explicit_4k_resolution_support(
     }
 }
 
-fn resolution_fit_tier(
+/// `resolution_tier` of a 1080p source.
+const RESOLUTION_TIER_1080P: u8 = 3;
+
+/// How a 4K source relates to what the device can show.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FourKFit {
+    /// Not a 4K source (or no video stream).
+    NotFourK,
+    /// The device is known to handle 4K.
+    Native,
+    /// Nothing rules 4K out, so the device decodes it and scales it down to
+    /// its screen. Direct play still works; codec and bitrate limits are
+    /// handled by the transcode reasons and the bitrate ceiling.
+    Downscaled,
+    /// The profile's own width/height ceiling is below this source.
+    Unsupported,
+}
+
+fn four_k_fit(
     source: &MediaSourceInfo,
     profile: Option<&DeviceProfile>,
     is_4k_capable: bool,
-) -> u8 {
+) -> FourKFit {
     let Some(video) = primary_video_stream(source) else {
-        return 1;
+        return FourKFit::NotFourK;
     };
     let long_side = video
         .width
@@ -1416,21 +1446,23 @@ fn resolution_fit_tier(
                 .unwrap_or(0),
         );
     if long_side < 3200 {
-        return 1;
+        return FourKFit::NotFourK;
     }
-    // Until 4K is supported by explicit dimensions or observed playback,
-    // prefer a known smaller source even if the 4K source is cached.
-    let capable = profile
+    match profile
         .and_then(|profile| explicit_4k_resolution_support(profile, source, video))
-        .unwrap_or(is_4k_capable);
-    u8::from(capable)
+    {
+        Some(false) => FourKFit::Unsupported,
+        Some(true) => FourKFit::Native,
+        None if is_4k_capable => FourKFit::Native,
+        None => FourKFit::Downscaled,
+    }
 }
 
 fn primary_video_stream(source: &MediaSourceInfo) -> Option<&MediaStream> {
     source
         .media_streams
         .iter()
-        .find(|s| matches!(s.type_, Some(MediaStreamType::Video)))
+        .find(|s| matches!(s.type_, MediaStreamType::Video))
 }
 
 fn hdr_tier(stream: Option<&MediaStream>) -> u8 {
@@ -1501,6 +1533,20 @@ fn source_stream_info(source: &MediaSourceInfo) -> Option<crate::stream::StreamI
         .and_then(|v| serde_json::from_value(v.clone()).ok())
 }
 
+/// Below this a stream tagged HDR is squeezed too hard for the tag to be worth
+/// anything: the typical SDR 1080p release already has more (about 8 Mbps), and
+/// a 4 Mbps "HDR10" downscale of a 4K master looks worse than it. Such a stream
+/// gets no head start on `hdr_class`; it still plays and still ranks by the
+/// rest. 10 Mbps leaves out about a third of HDR 1080p and one in twelve HDR 4K
+/// releases in a real library. An unknown bitrate stays neutral.
+const MIN_HDR_BITRATE: i64 = 10_000_000;
+
+fn hdr_is_fed(bitrate: Option<i64>) -> bool {
+    bitrate
+        .filter(|bps| *bps > 0)
+        .is_none_or(|bps| bps >= MIN_HDR_BITRATE)
+}
+
 /// Only demote extreme bitrate/resolution mismatches. One bit per four pixels
 /// per second corresponds to about 0.5 Mbps at 1080p or 2 Mbps at 4K; this
 /// is a plausibility check, not an estimate of visual quality. Below 100 Kbps
@@ -1566,7 +1612,7 @@ impl MediaSourceCapabilityExt for MediaSourceInfo {
         } else if long_side >= 2300 {
             4 // 1440p
         } else if long_side >= 1600 {
-            3 // 1080p
+            RESOLUTION_TIER_1080P
         } else if long_side >= 1100 {
             2
         } else if long_side > 0 {
@@ -1594,7 +1640,7 @@ impl MediaSourceCapabilityExt for MediaSourceInfo {
         };
 
         MediaSourceRank {
-            resolution_fit_tier: resolution_fit_tier(self, profile, false),
+            four_k_fit: four_k_fit(self, profile, false),
             cached: stream_info
                 .as_ref()
                 .and_then(|info| info.service_cached)
@@ -1604,7 +1650,11 @@ impl MediaSourceCapabilityExt for MediaSourceInfo {
             resolution_tier: raw_resolution_tier,
             // HDR vs SDR matters; Dolby Vision vs HDR10 only breaks otherwise
             // equal ranks after release quality, bitrate, bit depth and audio.
-            hdr_class: if hdr_tier > 1 { 2 } else { 1 },
+            hdr_class: if hdr_tier > 1 && hdr_is_fed(self.bitrate) {
+                2
+            } else {
+                1
+            },
             hdr_tier,
             // A missing BitDepth is common for remote (RemuxDB-sourced)
             // probe data that never explicitly set it — fall back to
@@ -1632,11 +1682,10 @@ impl MediaSourceCapabilityExt for MediaSourceInfo {
 #[cfg(test)]
 mod tests {
     use super::{
-        CodecProfileExt, DeviceProfileExt, MediaSourceCapabilityExt, MediaSourceRank,
-        MediaSourceSortKey, SourceRankingContext, SubtitleCodec,
-        explicit_4k_resolution_support, failed_condition_reason,
-        keeps_embedded_subtitle, playback_decision_label, primary_video_stream,
-        resolution_fit_tier, subtitle_burn_reason, subtitle_codec_deliverable,
+        CodecProfileExt, DeviceProfileExt, FourKFit, MediaSourceCapabilityExt,
+        MediaSourceRank, MediaSourceSortKey, SourceRankingContext, SubtitleCodec,
+        explicit_4k_resolution_support, failed_condition_reason, four_k_fit,
+        keeps_embedded_subtitle, subtitle_burn_reason, subtitle_codec_deliverable,
         transcode_cost_tier,
     };
     use remux_sdks::remux::{
@@ -1664,9 +1713,9 @@ mod tests {
         );
     }
 
-    /// A codec profile without dimensions says nothing about 4K playback.
+    /// A codec profile without dimensions neither proves nor rules out 4K.
     #[test]
-    fn codec_profile_without_resolution_ceiling_does_not_prove_4k() {
+    fn codec_profile_without_resolution_ceiling_is_downscaled() {
         let profile = DeviceProfile {
             codec_profiles: vec![CodecProfile {
                 type_: Some(CodecProfileType::Video),
@@ -1685,11 +1734,14 @@ mod tests {
         video.height = Some(2160);
         video.codec = Some("hevc".to_string());
         let source = source_with(video, audio_stream("aac", 2), true);
-        assert_eq!(resolution_fit_tier(&source, Some(&profile), false), 0);
+        assert_eq!(
+            four_k_fit(&source, Some(&profile), false),
+            FourKFit::Downscaled
+        );
     }
 
     #[test]
-    fn codec_video_level_does_not_prove_4k() {
+    fn codec_video_level_is_downscaled() {
         let profile = DeviceProfile {
             codec_profiles: vec![CodecProfile {
                 type_: Some(CodecProfileType::Video),
@@ -1708,7 +1760,10 @@ mod tests {
         video.height = Some(2160);
         video.codec = Some("hevc".to_string());
         let source = source_with(video, audio_stream("aac", 2), true);
-        assert_eq!(resolution_fit_tier(&source, Some(&profile), false), 0);
+        assert_eq!(
+            four_k_fit(&source, Some(&profile), false),
+            FourKFit::Downscaled
+        );
     }
 
     #[test]
@@ -1739,7 +1794,10 @@ mod tests {
         video.height = Some(2160);
         video.codec = Some("hevc".to_string());
         let source = source_with(video, audio_stream("aac", 2), true);
-        assert_eq!(resolution_fit_tier(&source, Some(&profile), true), 0);
+        assert_eq!(
+            four_k_fit(&source, Some(&profile), true),
+            FourKFit::Unsupported
+        );
     }
 
     #[test]
@@ -1770,11 +1828,77 @@ mod tests {
         video.height = Some(2160);
         video.codec = Some("hevc".to_string());
         let source = source_with(video, audio_stream("aac", 2), true);
-        assert_eq!(resolution_fit_tier(&source, Some(&profile), false), 1);
+        assert_eq!(four_k_fit(&source, Some(&profile), false), FourKFit::Native);
         assert_eq!(
             explicit_4k_resolution_support(&profile, &source, &source.media_streams[0]),
             Some(true)
         );
+    }
+
+    fn hevc_resolution_ceiling(width: &str, height: &str) -> DeviceProfile {
+        let at_most =
+            |property: ProfileConditionProperty, value: &str| ProfileCondition {
+                condition: Some(ProfileConditionType::LessThanEqual),
+                property: Some(property),
+                value: Some(value.to_string()),
+                is_required: Some(true),
+            };
+        DeviceProfile {
+            codec_profiles: vec![CodecProfile {
+                type_: Some(CodecProfileType::Video),
+                codec: Some(vec!["hevc".to_string()]),
+                conditions: vec![
+                    at_most(ProfileConditionProperty::Width, width),
+                    at_most(ProfileConditionProperty::Height, height),
+                ],
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
+    }
+
+    /// A device's stored 4K value (unknown, supported, or not) counts only
+    /// where the profile states no resolution limit of its own.
+    #[test]
+    fn stored_4k_value_yields_to_an_explicit_profile() {
+        let silent = DeviceProfile::default();
+        let hd_ceiling = hevc_resolution_ceiling("1920", "1080");
+        let uhd_ceiling = hevc_resolution_ceiling("3840", "2160");
+        let mut video = video_stream(3840, Some(VideoRangeType::Sdr));
+        video.height = Some(2160);
+        video.codec = Some("hevc".to_string());
+        let source = source_with(video, audio_stream("aac", 2), true);
+
+        // (stored value, fit when the profile states no ceiling)
+        let cases = [
+            (None, FourKFit::Downscaled),
+            (Some(true), FourKFit::Native),
+            (Some(false), FourKFit::Downscaled),
+        ];
+        for (stored, without_ceiling) in cases {
+            // As the callers pass the session device's `is_4k_capable`.
+            let is_4k_capable = stored == Some(true);
+            assert_eq!(
+                four_k_fit(&source, Some(&silent), is_4k_capable),
+                without_ceiling,
+                "{stored:?}, no ceiling"
+            );
+            assert_eq!(
+                four_k_fit(&source, None, is_4k_capable),
+                without_ceiling,
+                "{stored:?}, no profile"
+            );
+            assert_eq!(
+                four_k_fit(&source, Some(&hd_ceiling), is_4k_capable),
+                FourKFit::Unsupported,
+                "{stored:?}, 1080p ceiling"
+            );
+            assert_eq!(
+                four_k_fit(&source, Some(&uhd_ceiling), is_4k_capable),
+                FourKFit::Native,
+                "{stored:?}, 4K ceiling"
+            );
+        }
     }
 
     #[test]
@@ -1798,19 +1922,19 @@ mod tests {
             media_streams: vec![
                 MediaStream {
                     codec: Some("h264".to_string()),
-                    type_: Some(MediaStreamType::Video),
+                    type_: MediaStreamType::Video,
                     index: 0,
                     ..Default::default()
                 },
                 MediaStream {
                     codec: Some("aac".to_string()),
-                    type_: Some(MediaStreamType::Audio),
+                    type_: MediaStreamType::Audio,
                     index: 1,
                     ..Default::default()
                 },
                 MediaStream {
                     codec: Some("hdmv_pgs_subtitle".to_string()),
-                    type_: Some(MediaStreamType::Subtitle),
+                    type_: MediaStreamType::Subtitle,
                     index: 2,
                     ..Default::default()
                 },
@@ -1849,19 +1973,19 @@ mod tests {
             media_streams: vec![
                 MediaStream {
                     codec: Some("h264".to_string()),
-                    type_: Some(MediaStreamType::Video),
+                    type_: MediaStreamType::Video,
                     index: 0,
                     ..Default::default()
                 },
                 MediaStream {
                     codec: Some("aac".to_string()),
-                    type_: Some(MediaStreamType::Audio),
+                    type_: MediaStreamType::Audio,
                     index: 1,
                     ..Default::default()
                 },
                 MediaStream {
                     codec: Some("hdmv_pgs_subtitle".to_string()),
-                    type_: Some(MediaStreamType::Subtitle),
+                    type_: MediaStreamType::Subtitle,
                     index: 2,
                     ..Default::default()
                 },
@@ -1909,14 +2033,14 @@ mod tests {
             media_streams: vec![
                 MediaStream {
                     codec: Some("h264".to_string()),
-                    type_: Some(MediaStreamType::Video),
+                    type_: MediaStreamType::Video,
                     index: 0,
                     profile: Some(profile.to_string()),
                     ..Default::default()
                 },
                 MediaStream {
                     codec: Some("aac".to_string()),
-                    type_: Some(MediaStreamType::Audio),
+                    type_: MediaStreamType::Audio,
                     index: 1,
                     ..Default::default()
                 },
@@ -2003,7 +2127,7 @@ mod tests {
         let video = source
             .media_streams
             .iter_mut()
-            .find(|stream| matches!(stream.type_, Some(MediaStreamType::Video)))
+            .find(|stream| matches!(stream.type_, MediaStreamType::Video))
             .expect("video stream");
         video.width = Some(width);
         video.ref_frames = ref_frames;
@@ -2098,7 +2222,7 @@ mod tests {
             .media_streams
             .push(MediaStream {
                 codec: Some("aac".to_string()),
-                type_: Some(MediaStreamType::Audio),
+                type_: MediaStreamType::Audio,
                 index: 2,
                 ..Default::default()
             });
@@ -2137,7 +2261,7 @@ mod tests {
         let source = MediaSourceInfo {
             media_streams: vec![MediaStream {
                 codec: Some("hevc".to_string()),
-                type_: Some(MediaStreamType::Video),
+                type_: MediaStreamType::Video,
                 video_range_type: Some(VideoRangeType::Hdr10Plus),
                 ..Default::default()
             }],
@@ -2164,11 +2288,11 @@ mod tests {
     #[test]
     fn failed_conditions_map_to_precise_transcode_reasons() {
         let video = MediaStream {
-            type_: Some(MediaStreamType::Video),
+            type_: MediaStreamType::Video,
             ..Default::default()
         };
         let audio = MediaStream {
-            type_: Some(MediaStreamType::Audio),
+            type_: MediaStreamType::Audio,
             ..Default::default()
         };
         let cases = [
@@ -2319,7 +2443,7 @@ mod tests {
             .media_streams
             .push(MediaStream {
                 codec: Some("aac".to_string()),
-                type_: Some(MediaStreamType::Audio),
+                type_: MediaStreamType::Audio,
                 index: 2,
                 ..Default::default()
             });
@@ -2364,7 +2488,7 @@ mod tests {
             .media_streams
             .push(MediaStream {
                 codec: Some("aac".to_string()),
-                type_: Some(MediaStreamType::Audio),
+                type_: MediaStreamType::Audio,
                 index: 2,
                 ..Default::default()
             });
@@ -2409,14 +2533,14 @@ mod tests {
             media_streams: vec![
                 MediaStream {
                     codec: Some("h264".to_string()),
-                    type_: Some(MediaStreamType::Video),
+                    type_: MediaStreamType::Video,
                     index: 0,
                     profile: Some("High".to_string()),
                     ..Default::default()
                 },
                 MediaStream {
                     codec: Some("aac".to_string()),
-                    type_: Some(MediaStreamType::Audio),
+                    type_: MediaStreamType::Audio,
                     index: 1,
                     channels: Some(6),
                     ..Default::default()
@@ -2465,7 +2589,7 @@ mod tests {
             media_streams: vec![MediaStream {
                 codec: Some("hevc".to_string()),
                 codec_tag: tag.map(str::to_string),
-                type_: Some(MediaStreamType::Video),
+                type_: MediaStreamType::Video,
                 index: 0,
                 ..Default::default()
             }],
@@ -2576,7 +2700,7 @@ mod tests {
         video_range_type: Option<VideoRangeType>,
     ) -> MediaStream {
         MediaStream {
-            type_: Some(MediaStreamType::Video),
+            type_: MediaStreamType::Video,
             index: 0,
             width: Some(width),
             video_range_type,
@@ -2586,7 +2710,7 @@ mod tests {
 
     fn audio_stream(codec: &str, channels: i64) -> MediaStream {
         MediaStream {
-            type_: Some(MediaStreamType::Audio),
+            type_: MediaStreamType::Audio,
             index: 1,
             codec: Some(codec.to_string()),
             channels: Some(channels),
@@ -2895,6 +3019,67 @@ mod tests {
     }
 
     #[test]
+    fn a_4k_source_the_device_scales_down_ranks_between_1080p_and_lower() {
+        // No numeric ceiling anywhere: the device decodes 4K and scales it.
+        let profile = DeviceProfile::default();
+        let rank = |width| {
+            let source = source_with(
+                video_stream(width, Some(VideoRangeType::Sdr)),
+                audio_stream("aac", 2),
+                true,
+            );
+            best(source.capability_rank(Some(&profile), &source.transcoding_reasons))
+        };
+
+        assert!(rank(1920) > rank(3840), "real 1080p wins the tie");
+        assert!(rank(3840) > rank(1280), "4K beats 720p");
+        assert!(rank(1280) > rank(720), "720p beats SD");
+        assert!(rank(3840) > rank(640), "4K beats SD");
+    }
+
+    #[test]
+    fn a_4k_source_above_the_profiles_ceiling_stays_last() {
+        let profile = DeviceProfile {
+            codec_profiles: vec![CodecProfile {
+                type_: Some(CodecProfileType::Video),
+                conditions: vec![ProfileCondition {
+                    condition: Some(ProfileConditionType::LessThanEqual),
+                    property: Some(ProfileConditionProperty::Width),
+                    value: Some("1920".to_string()),
+                    is_required: Some(true),
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let rank = |width| {
+            let source = source_with(
+                video_stream(width, Some(VideoRangeType::Sdr)),
+                audio_stream("aac", 2),
+                true,
+            );
+            best(source.capability_rank(Some(&profile), &source.transcoding_reasons))
+        };
+
+        assert!(rank(640) > rank(3840));
+    }
+
+    #[test]
+    fn quality_mode_still_prefers_4k() {
+        let profile = DeviceProfile::default();
+        let rank = |width| {
+            let source = source_with(
+                video_stream(width, Some(VideoRangeType::Sdr)),
+                audio_stream("aac", 2),
+                true,
+            );
+            quality(source.capability_rank(Some(&profile), &source.transcoding_reasons))
+        };
+
+        assert!(rank(3840) > rank(1920));
+    }
+
+    #[test]
     fn resolution_tiers_keep_1080p_above_720p() {
         let source_1080p = source_with(
             video_stream(1920, Some(VideoRangeType::Sdr)),
@@ -3013,6 +3198,34 @@ mod tests {
         assert!(best(healthy_rank) > best(tiny_rank));
         assert!(quality(healthy_rank) > quality(tiny_rank));
         assert!(compat(tiny_rank) > compat(healthy_rank));
+    }
+
+    #[test]
+    fn hdr_only_leads_when_it_has_the_bitrate_to_back_it() {
+        let ranked = |range: VideoRangeType, bitrate: Option<i64>| {
+            let mut source = source_with(
+                video_stream(1920, Some(range)),
+                audio_stream("aac", 2),
+                true,
+            );
+            source.bitrate = bitrate;
+            source.capability_rank(None, &source.transcoding_reasons)
+        };
+        let sdr_remux = ranked(VideoRangeType::Sdr, Some(36_000_000));
+        let thin_hdr = ranked(VideoRangeType::Hdr10, Some(4_292_766));
+        let fed_hdr = ranked(VideoRangeType::Hdr10, Some(12_000_000));
+        let unknown_hdr = ranked(VideoRangeType::Hdr10, None);
+
+        assert_eq!(thin_hdr.hdr_class, 1);
+        assert_eq!(fed_hdr.hdr_class, 2);
+        assert_eq!(unknown_hdr.hdr_class, 2);
+        assert_eq!(ranked(VideoRangeType::Hdr10, Some(10_000_000)).hdr_class, 2);
+        assert_eq!(ranked(VideoRangeType::Hdr10, Some(9_999_999)).hdr_class, 1);
+        // The thin HDR no longer beats a well-fed SDR release...
+        assert!(best(sdr_remux) > best(thin_hdr));
+        assert!(quality(sdr_remux) > quality(thin_hdr));
+        // ...while HDR with a real bitrate still does.
+        assert!(best(fed_hdr) > best(sdr_remux));
     }
 
     #[test]
@@ -3234,7 +3447,7 @@ mod tests {
         MediaSourceInfo {
             default_subtitle_stream_index: Some(index),
             media_streams: vec![MediaStream {
-                type_: Some(MediaStreamType::Subtitle),
+                type_: MediaStreamType::Subtitle,
                 index,
                 codec: Some(codec.to_string()),
                 is_external,
@@ -3303,7 +3516,7 @@ mod tests {
     fn keeps_embedded_subtitle_drops_text_subs_on_remote_sources_without_extraction() {
         let srt = MediaStream {
             index: 2,
-            type_: Some(MediaStreamType::Subtitle),
+            type_: MediaStreamType::Subtitle,
             codec: Some("subrip".to_string()),
             ..Default::default()
         };
@@ -3327,7 +3540,7 @@ mod tests {
         // `.sup` file: Burn keeps the track to burn it in, Strip drops it.
         let pgs = MediaStream {
             index: 2,
-            type_: Some(MediaStreamType::Subtitle),
+            type_: MediaStreamType::Subtitle,
             codec: Some("pgssub".to_string()),
             ..Default::default()
         };
@@ -3431,7 +3644,7 @@ mod tests {
         source
             .media_streams
             .push(MediaStream {
-                type_: Some(MediaStreamType::Subtitle),
+                type_: MediaStreamType::Subtitle,
                 index: 1,
                 codec: Some("pgssub".to_string()),
                 ..Default::default()
@@ -3782,7 +3995,7 @@ mod tests {
             let video = source
                 .media_streams
                 .iter()
-                .find(|stream| stream.type_ == Some(MediaStreamType::Video));
+                .find(|stream| stream.type_ == MediaStreamType::Video);
             println!(
                 "#{:02} key={:?} decision={} video={:?} {}x{} bitrate={:?} reasons={:?} name={name}",
                 position + 1,

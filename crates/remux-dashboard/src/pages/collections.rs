@@ -433,6 +433,7 @@ pub fn CollectionForm(
             return match mk {
                 remux_sdks::remux::MediaKind::Movie => "movies".to_string(),
                 remux_sdks::remux::MediaKind::Series => "tvshows".to_string(),
+                remux_sdks::remux::MediaKind::Episode => "episodes".to_string(),
                 remux_sdks::remux::MediaKind::Mixed => "mixed".to_string(),
                 remux_sdks::remux::MediaKind::Track => "music".to_string(),
                 remux_sdks::remux::MediaKind::Collection => "collections".to_string(),
@@ -1131,6 +1132,7 @@ pub fn CollectionForm(
                     },
                     option { value: "movies",      "Movies"      }
                     option { value: "tvshows",     "TV Shows"    }
+                    option { value: "episodes",    "Episodes"    }
                     option { value: "mixed",       "Mixed (Movies & Shows)" }
                     option { value: "music",       "Music"       }
                     option { value: "collections", "Collections" }
@@ -1541,12 +1543,14 @@ pub fn CollectionForm(
             if col_type.read().as_str() != "collections" {
                 ToggleRow {
                     label: "Latest: Unplayed Only",
+                    description: "Hides watched items from Latest, which clients usually show as a home row.",
                     checked: *latest_auto_unplayed.read(),
                     on_change: move |v| latest_auto_unplayed.set(v),
                 }
 
                 ToggleRow {
                     label: "Latest: Sort by Digital Release",
+                    description: "Sorts Latest by digital release date, which clients usually show as a home row.",
                     checked: *latest_sort_digital.read(),
                     on_change: move |v| latest_sort_digital.set(v),
                 }
@@ -1568,7 +1572,13 @@ pub fn CollectionForm(
                         }
                     }
                 } else {
-                    FilterRuleEditor { match_mode: sf_match, groups: sf_groups }
+                    // The collection's own type already says what it holds, so
+                    // "media kind" is only offered on a user's filters.
+                    FilterRuleEditor {
+                        match_mode: sf_match,
+                        groups: sf_groups,
+                        hidden_fields: vec!["media_kind"],
+                    }
 
                     div { class: "field",
                         label { class: "field-label", "Default Sort Override" }

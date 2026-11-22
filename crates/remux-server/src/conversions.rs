@@ -1,7 +1,7 @@
 use crate::{
     addons::SubtitleInfo,
     api, common,
-    common::{ToRunTimeTicks, get_uuid},
+    common::ToRunTimeTicks,
     db,
     playback::probe::{
         StreamMeta, display_title_audio, display_title_subtitle, display_title_video,
@@ -10,10 +10,7 @@ use crate::{
     stream::StreamDescriptor,
 };
 use anyhow::Result;
-use std::{
-    collections::HashMap,
-    convert::{TryFrom, TryInto},
-};
+use std::{collections::HashMap, convert::TryFrom};
 use tracing::warn;
 
 // Heuristic metadata fallback for remote source URLs when ffprobe metadata is
@@ -114,7 +111,8 @@ pub(crate) fn guess_media_source_from_filename(filename: &str) -> FilenameProbeG
     let video_codec = parsed
         .video_codec()
         .and_then(map_hunch_video_codec);
-    let (width, height) = crate::db::min_screen_size(&parsed)
+    let (width, height) = crate::db::normalized_screen_size(&parsed, filename)
+        .as_deref()
         .and_then(screen_size_to_dimensions)
         .map(|(w, h)| (Some(w), Some(h)))
         .unwrap_or((None, None));
@@ -142,7 +140,7 @@ pub(crate) fn guess_media_source_from_filename(filename: &str) -> FilenameProbeG
         });
         media_streams.push(api::MediaStream {
             index: 0,
-            type_: Some(api::MediaStreamType::Video),
+            type_: api::MediaStreamType::Video,
             codec: video_codec,
             width,
             height,
@@ -154,7 +152,7 @@ pub(crate) fn guess_media_source_from_filename(filename: &str) -> FilenameProbeG
             // resolve_default_streams() falls back to the first is_default
             // stream, which would otherwise stamp DefaultAudioStreamIndex from
             // pure guesswork.
-            is_default: Some(false),
+            is_default: false,
             ..Default::default()
         });
     }
@@ -173,11 +171,11 @@ pub(crate) fn guess_media_source_from_filename(filename: &str) -> FilenameProbeG
         });
         media_streams.push(api::MediaStream {
             index: media_streams.len() as i64,
-            type_: Some(api::MediaStreamType::Audio),
+            type_: api::MediaStreamType::Audio,
             codec: audio_codec,
             channels,
             display_title,
-            is_default: Some(false),
+            is_default: false,
             ..Default::default()
         });
     }
@@ -417,11 +415,18 @@ impl From<db::Media> for api::MediaSourceInfo {
             .probe_data
             .as_ref()
             .and_then(|p| p.size);
+        let media_attachments = source
+            .probe_data
+            .as_ref()
+            .and_then(|p| {
+                p.media_attachments
+                    .clone()
+            });
         let mut media_streams = source
             .probe_data
             .map(|mut p| {
                 for s in &mut p.media_streams {
-                    if matches!(s.type_, Some(api::MediaStreamType::Subtitle)) {
+                    if matches!(s.type_, api::MediaStreamType::Subtitle) {
                         s.is_text_subtitle_stream = s.is_text_subtitle_stream();
                     }
                 }
@@ -456,9 +461,7 @@ impl From<db::Media> for api::MediaSourceInfo {
                 width: stream.width,
                 height: stream.height,
                 video_range: None,
-                is_default: stream
-                    .is_default
-                    .unwrap_or(false),
+                is_default: stream.is_default,
                 is_forced: stream.is_forced,
                 is_external: stream.is_external,
                 is_hearing_impaired: stream.is_hearing_impaired,
@@ -467,9 +470,9 @@ impl From<db::Media> for api::MediaSourceInfo {
                     .as_deref(),
             };
             stream.display_title = match stream.type_ {
-                Some(api::MediaStreamType::Video) => display_title_video(&meta),
-                Some(api::MediaStreamType::Audio) => display_title_audio(&meta),
-                Some(api::MediaStreamType::Subtitle) => display_title_subtitle(&meta),
+                api::MediaStreamType::Video => display_title_video(&meta),
+                api::MediaStreamType::Audio => display_title_audio(&meta),
+                api::MediaStreamType::Subtitle => display_title_subtitle(&meta),
                 _ => None,
             };
         }
@@ -479,10 +482,10 @@ impl From<db::Media> for api::MediaSourceInfo {
         // don't reject unprobed tracks outright.
         if source.kind == db::MediaKind::Track && media_streams.is_empty() {
             media_streams = vec![api::MediaStream {
-                type_: Some(api::MediaStreamType::Audio),
+                type_: api::MediaStreamType::Audio,
                 codec: Some("aac".to_string()),
                 channels: Some(2),
-                is_default: Some(true),
+                is_default: true,
                 display_title: Some("Audio".to_string()),
                 index: 0,
                 ..Default::default()
@@ -508,6 +511,7 @@ impl From<db::Media> for api::MediaSourceInfo {
             bitrate: probe_bitrate,
             size: probe_size,
             media_streams,
+            media_attachments,
             // `default_audio_stream_index` / `default_subtitle_stream_index` are
             // derived per request via `MediaSourceInfo::resolve_default_streams`;
             // stored probe data never carries them.
@@ -549,9 +553,15 @@ impl TryFrom<stremio::Episode> for db::Media {
             runtime: meta
                 .runtime
                 .map(|d| d.num_seconds()),
+            // Cinemeta sends an empty overview for most episodes of daily
+            // shows, so an empty one falls through to the description.
             description: meta
                 .overview
-                .or(meta.description),
+                .and_then(|o| db::NonEmptyString::try_new(o).ok())
+                .or_else(|| {
+                    meta.description
+                        .and_then(|d| db::NonEmptyString::try_new(d).ok())
+                }),
             rating_audience: meta.rating,
             ..Default::default()
         };
@@ -614,7 +624,7 @@ pub fn subtitle_to_media_stream(sub: &SubtitleInfo) -> api::MediaStream {
     };
     api::MediaStream {
         index: 0,
-        type_: Some(api::MediaStreamType::Subtitle),
+        type_: api::MediaStreamType::Subtitle,
         codec: Some(codec.to_string()),
         language: sub
             .lang
@@ -626,7 +636,7 @@ pub fn subtitle_to_media_stream(sub: &SubtitleInfo) -> api::MediaStream {
                 .unwrap_or_else(|| "und".into());
             format!("{} - {} - External", lang, codec.to_uppercase())
         }),
-        is_default: Some(false),
+        is_default: false,
         is_forced: sub.is_forced,
         is_hearing_impaired: sub.is_hi,
         is_external: true,
@@ -643,36 +653,6 @@ pub fn subtitle_to_media_stream(sub: &SubtitleInfo) -> api::MediaStream {
         localized_external: Some("External".to_string()),
         localized_hearing_impaired: Some("Hearing Impaired".to_string()),
         ..Default::default()
-    }
-}
-
-pub fn stream_into_media_source_info(
-    id: String,
-    jellyfin_media_type: api::MediaType,
-    stream: stremio::Stream,
-) -> api::MediaSourceInfo {
-    let id = get_uuid();
-    api::MediaSourceInfo {
-        id: id.clone(),
-        e_tag: id.clone(),
-        path: stream.url,
-        protocol: api::MediaProtocol::File,
-        supports_transcoding: false,
-        supports_direct_stream: true,
-        supports_direct_play: true,
-        is_remote: false,
-        name: stream
-            .name
-            .clone(),
-        ..Default::default()
-    }
-}
-
-fn to_option_bool(flag: i64) -> Option<bool> {
-    match flag {
-        1 => Some(true),
-        0 => Some(false),
-        _ => None,
     }
 }
 
@@ -865,6 +845,29 @@ fn srt_timestamp_to_ticks(ts: &str) -> Option<i64> {
 mod tests {
     use super::*;
 
+    /// Cinemeta sends an empty overview for most episodes of daily shows: that
+    /// is no overview, and the description is used instead.
+    #[test]
+    fn an_empty_stremio_overview_is_no_overview() {
+        let episode = |v: serde_json::Value| {
+            db::Media::try_from(serde_json::from_value::<stremio::Episode>(v).unwrap())
+                .unwrap()
+                .description
+                .map(String::from)
+        };
+        let base = serde_json::json!({ "id": "tt1:1:1", "name": "Ep", "season": 1, "episode": 1 });
+        let mut v = base.clone();
+        v["overview"] = "".into();
+        assert_eq!(episode(v), None);
+        let mut v = base.clone();
+        v["overview"] = "".into();
+        v["description"] = "From description.".into();
+        assert_eq!(episode(v).as_deref(), Some("From description."));
+        let mut v = base;
+        v["overview"] = "Text.".into();
+        assert_eq!(episode(v).as_deref(), Some("Text."));
+    }
+
     #[test]
     fn guess_media_source_from_filename_parses_full_release_tags() {
         let guess = guess_media_source_from_filename(
@@ -880,7 +883,7 @@ mod tests {
         );
 
         let video = &guess.media_streams[0];
-        assert_eq!(video.type_, Some(api::MediaStreamType::Video));
+        assert_eq!(video.type_, api::MediaStreamType::Video);
         assert_eq!(
             video
                 .codec
@@ -893,8 +896,7 @@ mod tests {
         assert_eq!(video.video_range_type, Some(api::VideoRangeType::Hdr10));
         assert_eq!(video.video_range, Some(api::VideoRange::Hdr));
         assert_eq!(
-            video.is_default,
-            Some(false),
+            video.is_default, false,
             "a filename guess must never be flagged as the container default"
         );
         assert_eq!(
@@ -905,7 +907,7 @@ mod tests {
         );
 
         let audio = &guess.media_streams[1];
-        assert_eq!(audio.type_, Some(api::MediaStreamType::Audio));
+        assert_eq!(audio.type_, api::MediaStreamType::Audio);
         assert_eq!(
             audio
                 .codec
@@ -914,8 +916,7 @@ mod tests {
         );
         assert_eq!(audio.channels, Some(8));
         assert_eq!(
-            audio.is_default,
-            Some(false),
+            audio.is_default, false,
             "a filename guess must never be flagged as the container default"
         );
         assert_eq!(
@@ -1056,7 +1057,7 @@ mod tests {
             ..Default::default()
         };
         let real_stream = api::MediaStream {
-            type_: Some(api::MediaStreamType::Video),
+            type_: api::MediaStreamType::Video,
             codec: Some("av1".to_string()),
             ..Default::default()
         };

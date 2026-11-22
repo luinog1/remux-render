@@ -300,16 +300,6 @@ impl ImageProcessOptions {
                 .is_some()
     }
 
-    fn output_format(&self) -> ImageFormat {
-        match self
-            .format
-            .as_deref()
-        {
-            Some("png") => ImageFormat::Png,
-            _ => ImageFormat::Jpeg,
-        }
-    }
-
     pub fn content_type(&self) -> &'static str {
         match self
             .format
@@ -430,7 +420,7 @@ impl ImageService {
     /// on those ids means a stale composite is never served — a changed
     /// Backdrop or Logo naturally misses the old cache file and regenerates.
     /// Never registered in `media_images` — purely a cache entry, wiped like
-    /// any other by `ClearImageCacheTask`. Returns the derived cache key
+    /// any other by the Clear Cache and Clean Cache Directory tasks. Returns the derived cache key
     /// alongside the bytes so the caller can reuse it as `process_image`'s
     /// `source_key`, giving per-size variants the same change-detection.
     pub async fn cached_synthetic_thumb(
@@ -934,26 +924,6 @@ impl ImageService {
         let bytes = tokio::fs::read(path).await?;
         Ok(image::load_from_memory(&bytes)?.into_rgba8())
     }
-
-    async fn fetch_and_resize(url: &str) -> anyhow::Result<RgbImage> {
-        let img = Self::fetch_rgb(url).await?;
-        Ok(image::imageops::resize(
-            &img,
-            OUT_W,
-            OUT_H,
-            image::imageops::FilterType::Lanczos3,
-        ))
-    }
-
-    async fn read_local_and_resize(path: &str) -> anyhow::Result<RgbImage> {
-        let img = Self::read_rgb(path).await?;
-        Ok(image::imageops::resize(
-            &img,
-            OUT_W,
-            OUT_H,
-            image::imageops::FilterType::Lanczos3,
-        ))
-    }
 }
 
 /// Builds the query that finds a collection's own member items, for poster
@@ -990,6 +960,7 @@ fn collection_item_filter(
             let kinds = match &collection.collection_media_kind {
                 Some(db::CollectionMediaKind::Movie) => vec![db::MediaKind::Movie],
                 Some(db::CollectionMediaKind::Series) => vec![db::MediaKind::Series],
+                Some(db::CollectionMediaKind::Episode) => vec![db::MediaKind::Episode],
                 Some(db::CollectionMediaKind::Mixed) => {
                     vec![db::MediaKind::Movie, db::MediaKind::Series]
                 }
@@ -1035,6 +1006,18 @@ fn collection_item_filter(
     }
 }
 
+/// Whether the collection's items differ per user (favourites or watchlist
+/// rule). Its image is shared by everyone, so it must not show any one user's
+/// items.
+fn is_per_user(
+    collection: &db::Media,
+    smart_filter_override: Option<&CollectionFilter>,
+) -> bool {
+    smart_filter_override
+        .or_else(|| collection.parse_smart_filter())
+        .is_some_and(CollectionFilter::is_per_user)
+}
+
 /// Collect distinct poster image paths/URLs from collection items.
 async fn collect_poster_urls(
     _id: Uuid,
@@ -1043,6 +1026,9 @@ async fn collect_poster_urls(
     limit: u32,
     smart_filter_override: Option<&CollectionFilter>,
 ) -> Vec<String> {
+    if is_per_user(collection, smart_filter_override) {
+        return Vec::new();
+    }
     // Inspect extra records so duplicate artwork does not consume a grid cell.
     let filter = db::MediaFilter {
         limit: Some(limit.saturating_mul(2)),
@@ -1081,6 +1067,12 @@ async fn find_backdrop_url_from_collection(
     collection: &db::Media,
     db: &sqlx::SqlitePool,
 ) -> anyhow::Result<String> {
+    if is_per_user(collection, None) {
+        anyhow::bail!(
+            "collection {} lists different items per user",
+            collection.id
+        );
+    }
     let filter = db::MediaFilter {
         limit: Some(8),
         ..collection_item_filter(collection, None)
@@ -1893,6 +1885,28 @@ fn apply_sizing(img: DynamicImage, opts: &ImageProcessOptions) -> DynamicImage {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_watchlist_collection_is_not_drawn_from_anyones_items() {
+        use remux_sdks::remux::{CollectionFilter, FilterGroup, FilterRule};
+        let filter = |rule| CollectionFilter {
+            groups: vec![FilterGroup {
+                rules: vec![rule],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let collection = db::Media {
+            collection_smart_filter: Some(filter(FilterRule::Watchlist {
+                value: true,
+            })),
+            ..Default::default()
+        };
+        assert!(super::is_per_user(&collection, None));
+        // A preview of an edited filter is judged by that filter instead.
+        let edited = filter(FilterRule::HasTrailer { value: true });
+        assert!(!super::is_per_user(&collection, Some(&edited)));
+    }
+
     use super::*;
 
     #[test]

@@ -24,16 +24,26 @@ pub enum SegmentContainer {
 
 impl SegmentContainer {
     /// iOS Safari (and the HLS spec) require fMP4 for HEVC, so copied HEVC
-    /// video gets fMP4 segments; everything else uses MPEG-TS.
-    pub fn for_codecs(video_codec: &str, source_video_codec: Option<&str>) -> Self {
-        let hevc_copy = video_codec == "copy"
+    /// video gets fMP4 segments; everything else uses MPEG-TS. `hevc_in_ts` is
+    /// for clients that declare HEVC in TS only (webOS and Tizen play fMP4
+    /// HEVC badly), see `client_wants_hevc_in_ts`.
+    pub fn for_codecs(
+        copy_video: bool,
+        source_video_codec: Option<&str>,
+        hevc_in_ts: bool,
+    ) -> Self {
+        let hevc_copy = copy_video
             && source_video_codec
                 .and_then(|s| {
                     s.parse::<VideoCodec>()
                         .ok()
                 })
                 .is_some_and(|codec| codec.is_hevc());
-        if hevc_copy { Self::Fmp4 } else { Self::Ts }
+        if hevc_copy && !hevc_in_ts {
+            Self::Fmp4
+        } else {
+            Self::Ts
+        }
     }
 
     /// Whether source audio can be stream-copied into these segments.
@@ -55,6 +65,8 @@ impl SegmentContainer {
 
 pub struct TranscodeSession {
     pub id: String,
+    /// The user whose request created this transcode.
+    pub user_id: Uuid,
     pub item_id: Uuid,
     pub media_source_id: Uuid,
     pub output_dir: PathBuf,
@@ -63,9 +75,16 @@ pub struct TranscodeSession {
     /// Broadcasts state transitions so waiters can react immediately.
     pub state_tx: Arc<watch::Sender<TranscodeState>>,
     pub created_at: Instant,
-    pub video_codec: String,
-    pub audio_codec: String,
+    pub video_codec: crate::playback::codec::CodecTarget,
+    pub audio_codec: crate::playback::codec::CodecTarget,
     pub audio_stream_index: Option<i32>,
+    /// Channel count the audio is re-encoded to (None when the audio is copied).
+    pub audio_channels: Option<u32>,
+    /// Stream index of the audio track the session actually maps, which is the
+    /// source's default when the client named none.
+    pub source_audio_index: Option<i32>,
+    /// The client takes HEVC copies in MPEG-TS segments rather than fMP4.
+    pub hevc_in_ts: bool,
     pub subtitle_stream_index: Option<i32>,
     pub burn_subtitle: bool,
     pub segment_length: u32,
@@ -73,6 +92,9 @@ pub struct TranscodeSession {
     /// Kill channel and done notifier for the ffmpeg subprocess.
     pub kill_tx: Option<tokio::sync::oneshot::Sender<()>>,
     pub wait_done: Arc<Notify>,
+    /// Set when the session is stopped, so ffmpeg is never (re)spawned
+    /// afterwards.
+    pub stopped: bool,
     /// Index of the last segment the client has requested (0-based).
     pub last_segment_index: Arc<AtomicU32>,
     /// Start offset of this transcode in seconds (from start_time_ticks).
@@ -113,12 +135,13 @@ pub struct TranscodeSession {
 impl TranscodeSession {
     pub fn new(
         play_session_id: String,
+        user_id: Uuid,
         item_id: Uuid,
         media_source_id: Uuid,
         input_url: String,
         output_dir: PathBuf,
-        video_codec: String,
-        audio_codec: String,
+        video_codec: crate::playback::codec::CodecTarget,
+        audio_codec: crate::playback::codec::CodecTarget,
         audio_stream_index: Option<i32>,
         subtitle_stream_index: Option<i32>,
         burn_subtitle: bool,
@@ -142,6 +165,7 @@ impl TranscodeSession {
         let (state_tx, _) = watch::channel(TranscodeState::Starting);
         Arc::new(tokio::sync::RwLock::new(Self {
             id: play_session_id,
+            user_id,
             item_id,
             media_source_id,
             output_dir,
@@ -152,12 +176,16 @@ impl TranscodeSession {
             video_codec,
             audio_codec,
             audio_stream_index,
+            audio_channels: None,
+            source_audio_index: None,
+            hevc_in_ts: false,
             subtitle_stream_index,
             burn_subtitle,
             segment_length,
             transcode_reasons,
             kill_tx: None,
             wait_done: Arc::new(Notify::new()),
+            stopped: false,
             last_segment_index: Arc::new(AtomicU32::new(0)),
             start_time_secs: 0,
             playback_offset_secs: Arc::new(AtomicU32::new(0)),
@@ -189,9 +217,11 @@ impl TranscodeSession {
 
     pub fn segment_container(&self) -> SegmentContainer {
         SegmentContainer::for_codecs(
-            &self.video_codec,
+            self.video_codec
+                .is_copy(),
             self.source_video_codec
                 .as_deref(),
+            self.hevc_in_ts,
         )
     }
 

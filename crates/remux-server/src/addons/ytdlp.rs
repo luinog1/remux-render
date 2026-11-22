@@ -1,7 +1,6 @@
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
 use serde::Deserialize;
-use sqlx::types::Json;
 use std::{path::PathBuf, sync::Arc};
 use tokio::process::Command;
 use tracing::{debug, warn};
@@ -97,6 +96,13 @@ impl AddonPreset for YtDlpPreset {
             });
         let addon = Arc::new(YtDlpAddon {
             cookies,
+            extra_args: config
+                .ytdlp_extra_args
+                .as_deref()
+                .unwrap_or_default()
+                .split_whitespace()
+                .map(str::to_owned)
+                .collect(),
             executable: PathBuf::from("yt-dlp"),
             bgutil_script_path: config
                 .bgutil_script_path
@@ -153,6 +159,8 @@ inventory::submit! {
 
 pub struct YtDlpAddon {
     cookies: Option<String>,
+    /// `Config::ytdlp_extra_args`, split on whitespace.
+    extra_args: Vec<String>,
     executable: PathBuf,
     bgutil_script_path: PathBuf,
     cache_dir: PathBuf,
@@ -167,14 +175,6 @@ impl YtDlpAddon {
                 .into_owned(),
         ]
     }
-}
-
-fn ytdlp_extra_args() -> Vec<String> {
-    std::env::var("YTDLP_EXTRA_ARGS")
-        .unwrap_or_default()
-        .split_whitespace()
-        .map(str::to_owned)
-        .collect()
 }
 
 impl YtDlpAddon {
@@ -404,7 +404,7 @@ impl YtDlpAddon {
             ])
             .args(self.cookies_args())
             .args(self.cache_args())
-            .args(ytdlp_extra_args())
+            .args(&self.extra_args)
             .args(self.bgutil_args())
             .output()
             .await
@@ -486,7 +486,7 @@ impl YtDlpAddon {
             ])
             .args(self.cookies_args())
             .args(self.cache_args())
-            .args(ytdlp_extra_args())
+            .args(&self.extra_args)
             .args(self.bgutil_args())
             .output()
             .await
@@ -550,7 +550,7 @@ impl YtDlpAddon {
             ])
             .args(self.cookies_args())
             .args(self.cache_args())
-            .args(ytdlp_extra_args())
+            .args(&self.extra_args)
             .args(self.bgutil_args())
             .output()
             .await
@@ -592,7 +592,9 @@ impl YtDlpAddon {
             } else {
                 meta.title
             },
-            description: meta.description,
+            description: meta
+                .description
+                .and_then(|d| db::NonEmptyString::try_new(d).ok()),
             runtime: meta
                 .duration
                 .map(|d| d as i64),
@@ -701,7 +703,7 @@ impl YtDlpAddon {
             ])
             .args(self.cookies_args())
             .args(self.cache_args())
-            .args(ytdlp_extra_args())
+            .args(&self.extra_args)
             .args(self.bgutil_args())
             .output()
             .await
@@ -763,7 +765,7 @@ impl YtDlpAddon {
                             &url,
                         ])
                         .args(&cookies_args)
-                        .args(ytdlp_extra_args())
+                        .args(&self.extra_args)
                         .args(self.bgutil_args())
                         .output()
                         .await
@@ -881,7 +883,7 @@ impl YtDlpAddon {
                     bitrate: f.bitrate(),
                     media_streams: vec![api::MediaStream {
                         index: 0,
-                        type_: Some(api::MediaStreamType::Audio),
+                        type_: api::MediaStreamType::Audio,
                         codec,
                         channels: f
                             .audio_channels
@@ -889,7 +891,7 @@ impl YtDlpAddon {
                         sample_rate: f
                             .asr
                             .map(|r| r as i64),
-                        is_default: Some(true),
+                        is_default: true,
                         display_title: Some(display_title),
                         ..Default::default()
                     }],
@@ -1007,7 +1009,7 @@ mod tests {
     fn track(artist_name: Option<&str>, description: Option<&str>) -> db::Media {
         db::Media {
             title: "Hello".to_string(),
-            description: description.map(String::from),
+            description: description.and_then(|d| db::NonEmptyString::try_new(d).ok()),
             external_ids: db::ExternalIds {
                 artist_name: artist_name.map(String::from),
                 ..Default::default()

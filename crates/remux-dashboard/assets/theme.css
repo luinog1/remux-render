@@ -396,6 +396,8 @@ html, body {
 .btn-device-revoke:hover:not(:disabled) { background: var(--error); color: #fff; }
 .btn-device-revoke:disabled { opacity: .35; cursor: not-allowed; }
 
+.btn.btn-device-details { height: 28px; padding: 0 8px; font-size: .65rem; }
+
 /* ── Device rows (responsive) ────────────────────────────────────── */
 .device-row {
   display: flex;
@@ -407,7 +409,11 @@ html, body {
 .device-col-name   { flex: 1 1 0; min-width: 0; padding: 8px 12px 8px 20px; }
 .device-col-app    { flex: 0 0 auto; padding: 8px 12px; max-width: 180px; min-width: 0; }
 .device-col-time   { flex: 0 0 auto; padding: 8px 12px; text-align: right; font-family: var(--font-mono); font-size: .7rem; color: var(--text-dim); white-space: nowrap; }
-.device-col-action { flex: 0 0 auto; padding: 8px 20px 8px 12px; }
+.device-col-action { flex: 0 0 auto; padding: 8px 20px 8px 12px; display: flex; align-items: center; gap: 10px; }
+
+.field-hint.device-4k-on { color: var(--success); }
+
+.device-details .kv-value { text-align: right; overflow-wrap: anywhere; }
 
 /* Truncate long app version strings (e.g. git-hash builds) */
 .device-col-app .session-client-badge {
@@ -428,7 +434,7 @@ html, body {
     align-items: center;
   }
   .device-col-name   { grid-area: name;   padding: 8px 12px 2px 20px; }
-  .device-col-action { grid-area: action; padding: 8px 20px 2px 12px; align-self: center; }
+  .device-col-action { grid-area: action; padding: 8px 20px 2px 12px; align-self: center; flex-wrap: wrap; justify-content: flex-end; }
   .device-col-app    { grid-area: app;    padding: 2px 12px 8px; }
   .device-col-app .session-client-badge { display: inline-block; }
   .device-col-time   { grid-area: time;   padding: 2px 12px 8px; text-align: right; white-space: nowrap; }
@@ -2093,4 +2099,89 @@ html[data-theme="light"] [class~="dxc-system"] {
   --contrast-error-color: var(--dark, var(--secondary-color-3)) var(--light, var(--primary-color));
   --primary-info-color: var(--dark, var(--primary-color-5)) var(--light, var(--primary-color));
   --secondary-info-color: var(--dark, var(--primary-color-7)) var(--light, var(--secondary-color-3));
+}
+
+/* ── Server log controls ─────────────────────────────────────────── */
+.logs-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+  padding: 14px 20px;
+  border-bottom: 1px solid var(--border);
+}
+
+.logs-search {
+  flex: 1 1 260px;
+  min-width: min(220px, 100%);
+  height: 38px;
+}
+
+.logs-level-field {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  flex: 0 0 auto;
+}
+
+.logs-level-select {
+  width: auto;
+  min-width: 120px;
+  height: 38px;
+  padding: 8px 12px;
+}
+
+.logs-refresh {
+  flex: 0 0 auto;
+}
+
+.logs-disclaimer {
+  margin: 12px 20px;
+  color: var(--text-dim);
+  font-size: .72rem;
+  line-height: 1.5;
+}
+
+.logs-list {
+  max-height: 70vh;
+  overflow: auto;
+  margin: 0 20px 16px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg-elevated);
+}
+
+.logs-load-older {
+  display: flex;
+  justify-content: center;
+  margin: 0 20px 16px;
+}
+
+.logs-row {
+  display: grid;
+  grid-template-columns: minmax(150px, 190px) 64px minmax(0, 1fr);
+  align-items: start;
+  gap: 12px;
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--border);
+  color: var(--text);
+  font-family: var(--font-mono);
+  font-size: .76rem;
+  line-height: 1.45;
+}
+
+.logs-row:last-child { border-bottom: 0; }
+.logs-row:hover { background: var(--bg); }
+.logs-timestamp { color: var(--text-dim); font-size: .7rem; white-space: nowrap; }
+.logs-level { color: var(--text-secondary); font-size: .7rem; font-weight: 700; text-transform: uppercase; }
+.logs-message { min-width: 0; white-space: pre-wrap; overflow-wrap: anywhere; }
+
+@media (max-width: 640px) {
+  .logs-toolbar { gap: 10px; padding: 12px 16px; }
+  .logs-search { flex-basis: 100%; }
+  .logs-refresh { margin-left: auto; }
+  .logs-disclaimer { margin: 10px 16px; }
+  .logs-list { margin: 0 16px 14px; }
+  .logs-load-older { margin: 0 16px 14px; }
+  .logs-row { grid-template-columns: minmax(0, 1fr); gap: 4px; padding: 10px; }
 }

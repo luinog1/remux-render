@@ -32,7 +32,9 @@ fn rule_values(rule: &FilterRule) -> Vec<String> {
             .collect(),
         FilterRule::MediaKind { values, .. } => values.clone(),
         FilterRule::Favorite { .. } => vec![],
+        FilterRule::Watchlist { .. } => vec![],
         FilterRule::Played { .. } => vec![],
+        FilterRule::Upcoming { .. } => vec![],
         _ => vec![],
     }
 }
@@ -235,7 +237,9 @@ fn field_label(key: &str) -> &'static str {
         "collection_id" => "Collection",
         "collection_member" => "Collection",
         "favorite" => "Favorite",
+        "watchlist" => "Watchlist",
         "played" => "Played",
+        "upcoming" => "Upcoming",
         "media_kind" => "Media Kind",
         _ => "",
     }
@@ -246,7 +250,10 @@ fn ops_for_field(field_key: &str) -> Vec<(&'static str, &'static str)> {
         "year" | "rating_audience" | "rating_critic" => {
             vec![("eq", "is"), ("not_eq", "is not"), ("gt", ">"), ("lt", "<")]
         }
-        "parental_rating" | "has_trailer" | "favorite" | "played" => vec![],
+        "parental_rating" | "has_trailer" | "favorite" | "watchlist" | "played"
+        | "upcoming" => {
+            vec![]
+        }
         _ => vec![("is", "is"), ("is_not", "is not")],
     }
 }
@@ -361,8 +368,14 @@ fn rule_to_raw(rule: &FilterRule) -> (String, String, String) {
         FilterRule::Favorite { value } => {
             ("favorite".into(), String::new(), value.to_string())
         }
+        FilterRule::Watchlist { value } => {
+            ("watchlist".into(), String::new(), value.to_string())
+        }
         FilterRule::Played { value } => {
             ("played".into(), String::new(), value.to_string())
+        }
+        FilterRule::Upcoming { value } => {
+            ("upcoming".into(), String::new(), value.to_string())
         }
     }
 }
@@ -477,7 +490,13 @@ fn raw_to_rule(field: &str, op: &str, value_str: &str) -> FilterRule {
         "favorite" => FilterRule::Favorite {
             value: value_str == "true",
         },
+        "watchlist" => FilterRule::Watchlist {
+            value: value_str == "true",
+        },
         "played" => FilterRule::Played {
+            value: value_str == "true",
+        },
+        "upcoming" => FilterRule::Upcoming {
             value: value_str == "true",
         },
         _ => FilterRule::Genre {
@@ -870,10 +889,12 @@ pub fn FilterRuleRow(
     let is_trailer = field_val == "has_trailer";
     let is_parental_rating = field_val == "parental_rating";
     let is_catalog = field_val == "catalog";
-    let is_favorite = field_val == "favorite";
-    let is_watched = field_val == "played";
+    // Yes/No fields: one rule per field, no operator.
+    let boolean_field = ["favorite", "watchlist", "played", "upcoming"]
+        .into_iter()
+        .find(|field| *field == field_val);
     let is_media_kind = field_val == "media_kind";
-    let hide_operator = is_trailer || is_parental_rating || is_favorite || is_watched;
+    let hide_operator = is_trailer || is_parental_rating || boolean_field.is_some();
 
     let fv1 = field_val.clone();
     let fv2 = field_val.clone();
@@ -922,9 +943,12 @@ pub fn FilterRuleRow(
             .collect()
     };
 
+    let current_field = field_val.clone();
     let show_field = move |key: &'static str| {
         (allowed_fields.is_empty() || allowed_fields.contains(&key))
-            && !hidden_fields.contains(&key)
+            // A hidden field stays selectable on a rule that already uses it,
+            // so an old rule doesn't silently show as another field.
+            && (!hidden_fields.contains(&key) || current_field == key)
     };
 
     let field_style = if hide_operator {
@@ -965,7 +989,9 @@ pub fn FilterRuleRow(
                 // stay visible everywhere else they'd otherwise appear.
                 if show_field("collection_id")   { option { value: "collection_id",    selected: field_val == "collection_id",    { field_label("collection_id") } } }
                 if show_field("favorite")        { option { value: "favorite",         selected: field_val == "favorite",         { field_label("favorite") } } }
+                if show_field("watchlist")       { option { value: "watchlist",        selected: field_val == "watchlist",        { field_label("watchlist") } } }
                 if show_field("played")         { option { value: "played",          selected: field_val == "played",          { field_label("played") } } }
+                if show_field("upcoming")        { option { value: "upcoming",         selected: field_val == "upcoming",         { field_label("upcoming") } } }
                 if show_field("media_kind")      { option { value: "media_kind",       selected: field_val == "media_kind",       { field_label("media_kind") } } }
             }
             if !hide_operator {
@@ -1059,27 +1085,14 @@ pub fn FilterRuleRow(
                     rules,
                     value_labels: Some(collection_options),
                 }
-            } else if is_favorite {
+            } else if let Some(field) = boolean_field {
                 select {
                     class: "select-input",
                     style: "flex:2 1 130px;min-width:130px",
                     value: "{value_val}",
                     onchange: move |e| {
                         if let Some(row) = rules.write().get_mut(idx) {
-                            *row = raw_to_rule("favorite", "", &e.value());
-                        }
-                    },
-                    option { value: "true",  selected: value_val == "true",  "Yes" }
-                    option { value: "false", selected: value_val == "false", "No" }
-                }
-            } else if is_watched {
-                select {
-                    class: "select-input",
-                    style: "flex:2 1 130px;min-width:130px",
-                    value: "{value_val}",
-                    onchange: move |e| {
-                        if let Some(row) = rules.write().get_mut(idx) {
-                            *row = raw_to_rule("played", "", &e.value());
+                            *row = raw_to_rule(field, "", &e.value());
                         }
                     },
                     option { value: "true",  selected: value_val == "true",  "Yes" }

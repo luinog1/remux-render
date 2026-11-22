@@ -1,5 +1,5 @@
 use crate::{
-    IntoApiError, ResultExt, api,
+    ResultExt, api,
     common::{HideConsole, TickUnit, ToRunTimeTicks},
     conversions::apply_filename_guess,
     db,
@@ -12,10 +12,6 @@ use serde::Deserialize;
 use std::{collections::HashMap, str::FromStr};
 use tracing::{debug, info, warn};
 use uuid::Uuid;
-
-fn ffprobe_bin() -> String {
-    std::env::var("FFPROBE_PATH").unwrap_or_else(|_| "ffprobe".into())
-}
 
 fn should_retry_with_relaxed_hls_extensions(stderr: &str) -> bool {
     stderr.contains("allowed_segment_extensions")
@@ -355,6 +351,8 @@ struct FfprobeDisposition {
     #[serde(default)]
     hearing_impaired: i64,
     #[serde(default)]
+    original: i64,
+    #[serde(default)]
     attached_pic: i64,
 }
 
@@ -574,7 +572,7 @@ fn apply_video_bitrate_fallback(
         .iter()
         .enumerate()
         .filter(|(_, s)| {
-            matches!(s.type_, Some(api::MediaStreamType::Video))
+            matches!(s.type_, api::MediaStreamType::Video)
                 && s.bit_rate
                     .is_none()
         })
@@ -587,13 +585,11 @@ fn apply_video_bitrate_fallback(
     // audioBitratesKnown check: all audio streams must have a known bitrate.
     let non_video: Vec<&api::MediaStream> = streams
         .iter()
-        .filter(|s| {
-            !matches!(s.type_, Some(api::MediaStreamType::Video)) && !s.is_external
-        })
+        .filter(|s| !matches!(s.type_, api::MediaStreamType::Video) && !s.is_external)
         .collect();
     let audio_all_known = non_video
         .iter()
-        .filter(|s| matches!(s.type_, Some(api::MediaStreamType::Audio)))
+        .filter(|s| matches!(s.type_, api::MediaStreamType::Audio))
         .all(|s| {
             s.bit_rate
                 .is_some()
@@ -631,6 +627,40 @@ pub(crate) fn redact_url(url: &str) -> String {
     }
 }
 
+/// [`redact_url`] for every HTTP(S) URL inside a command line or a line of
+/// tool output, e.g. ffmpeg's `Input #0, …, from 'http://…'`.
+pub(crate) fn redact_urls_in(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(start) = ["http://", "https://"]
+        .iter()
+        .filter_map(|scheme| rest.find(scheme))
+        .min()
+    {
+        out.push_str(&rest[..start]);
+        let tail = &rest[start..];
+        let end = tail
+            .find(|c: char| c.is_whitespace() || matches!(c, '\'' | '"' | ','))
+            .unwrap_or(tail.len());
+        let url = &tail[..end];
+        let shown = redact_url(url);
+        // An unparseable URL comes back as is; never let it through.
+        if shown == url {
+            out.push_str(
+                &url[..url
+                    .find("//")
+                    .map_or(0, |i| i + 2)],
+            );
+            out.push('…');
+        } else {
+            out.push_str(&shown);
+        }
+        rest = &tail[end..];
+    }
+    out.push_str(rest);
+    out
+}
+
 /// Runs ffprobe to completion, killing the process once `deadline` passes so a
 /// hung source can't leave it running after the caller has given up.
 fn run_ffprobe(
@@ -639,7 +669,7 @@ fn run_ffprobe(
 ) -> Result<std::process::Output> {
     use std::{io::Read, process::Stdio};
 
-    let mut child = std::process::Command::new(ffprobe_bin())
+    let mut child = std::process::Command::new(crate::tools::ffprobe())
         .args(args)
         .hide_console()
         .stdin(Stdio::null())
@@ -788,8 +818,7 @@ pub fn probe_media_with(
 
     let mut streams: Vec<api::MediaStream> = Vec::new();
     let mut video_idx: i64 = 0;
-    let mut audio_idx: i64 = 0;
-    let mut sub_idx: i64 = 0;
+    let mut attachments: Vec<api::MediaAttachment> = Vec::new();
 
     for s in &probe.streams {
         let codec_type = s
@@ -900,7 +929,7 @@ pub fn probe_media_with(
                             .and_then(bit_depth_from_pix_fmt)
                     });
                 streams.push(api::MediaStream {
-                    type_: Some(api::MediaStreamType::Video),
+                    type_: api::MediaStreamType::Video,
                     index: s.index,
                     codec: Some(codec.clone()),
                     codec_tag: s
@@ -926,7 +955,7 @@ pub fn probe_media_with(
                     real_frame_rate: fps
                         .map(|f| f as f32)
                         .and_then(nonzero),
-                    is_default: Some(is_default),
+                    is_default: is_default,
                     is_forced,
                     is_avc: s
                         .is_avc
@@ -1021,7 +1050,7 @@ pub fn probe_media_with(
                 };
 
                 streams.push(api::MediaStream {
-                    type_: Some(api::MediaStreamType::Audio),
+                    type_: api::MediaStreamType::Audio,
                     index: s.index,
                     codec: Some(codec.clone()),
                     channels,
@@ -1032,8 +1061,12 @@ pub fn probe_media_with(
                     profile: s
                         .profile
                         .clone(),
-                    is_default: Some(is_default),
+                    is_default: is_default,
                     is_forced,
+                    is_original: s
+                        .disposition
+                        .original
+                        != 0,
                     is_avc: Some(false),
                     time_base: Some("1/1000".to_string()),
                     video_range: Some(api::VideoRange::Other),
@@ -1046,7 +1079,6 @@ pub fn probe_media_with(
                     title: None,
                     ..Default::default()
                 });
-                audio_idx += 1;
             }
             "subtitle" => {
                 let raw_codec = s
@@ -1101,12 +1133,16 @@ pub fn probe_media_with(
                 };
 
                 let mut stream = api::MediaStream {
-                    type_: Some(api::MediaStreamType::Subtitle),
+                    type_: api::MediaStreamType::Subtitle,
                     index: s.index,
                     codec: Some(codec.clone()),
-                    is_default: Some(is_default),
+                    is_default: is_default,
                     is_forced,
                     is_hearing_impaired,
+                    is_original: s
+                        .disposition
+                        .original
+                        != 0,
                     is_avc: Some(false),
                     time_base: Some("1/1000".to_string()),
                     video_range: Some(api::VideoRange::Other),
@@ -1126,7 +1162,30 @@ pub fn probe_media_with(
                 };
                 stream.is_text_subtitle_stream = stream.is_text_subtitle_stream();
                 streams.push(stream);
-                sub_idx += 1;
+            }
+            "attachment" => {
+                attachments.push(api::MediaAttachment {
+                    index: s.index,
+                    codec: s
+                        .codec_name
+                        .clone(),
+                    codec_tag: s
+                        .codec_tag_string
+                        .clone(),
+                    file_name: s
+                        .tags
+                        .get("filename")
+                        .cloned(),
+                    mime_type: s
+                        .tags
+                        .get("mimetype")
+                        .cloned(),
+                    comment: s
+                        .tags
+                        .get("comment")
+                        .cloned(),
+                    ..Default::default()
+                });
             }
             _ => {}
         }
@@ -1145,6 +1204,7 @@ pub fn probe_media_with(
     Ok((
         api::MediaSourceInfo {
             media_streams: streams,
+            media_attachments: Some(attachments),
             container,
             run_time_ticks,
             bitrate: overall_bitrate,
@@ -1518,7 +1578,7 @@ where
             info!(
                 failed_id = %primary.id,
                 next_id = %stream.id,
-                next_url = %url,
+                next_url = %redact_url(&url),
                 "probe failed, trying next matching stream"
             );
         }
@@ -1538,10 +1598,12 @@ where
                 // relative to the known metadata runtime (or absolutely < 3 min
                 // when unknown) — these are typically error/copyright-strike
                 // placeholder videos, not real content. Skip for audio-only
-                // streams since short songs are legitimate.
-                if probed
-                    .video_stream()
-                    .is_some()
+                // streams since short songs are legitimate, and for trailers,
+                // which are short by nature.
+                if stream.kind != db::MediaKind::Trailer
+                    && probed
+                        .video_stream()
+                        .is_some()
                     && let Some(probed_ticks) = probed.run_time_ticks
                 {
                     let max_threshold = 5_i64
@@ -1559,7 +1621,7 @@ where
                     if probed_ticks < threshold_ticks {
                         warn!(
                             id = %stream.id,
-                            url = %url,
+                            url = %redact_url(&url),
                             probed_ticks,
                             threshold_ticks,
                             known_runtime_secs = ?stream.runtime,
@@ -1589,7 +1651,7 @@ where
                 }
                 if is_retry {
                     info!(
-                        fallback_url = %url,
+                        fallback_url = %redact_url(&url),
                         attempt = attempts,
                         "probe succeeded on fallback stream"
                     );
@@ -1597,13 +1659,13 @@ where
                 return Ok((probed, stream));
             }
             Ok(Ok(Err(e))) => {
-                warn!(url = %url, error = %e, "probe failed");
+                warn!(url = %redact_url(&url), error = %e, "probe failed");
             }
             Ok(Err(e)) => {
-                warn!(url = %url, error = %e, "probe task panicked");
+                warn!(url = %redact_url(&url), error = %e, "probe task panicked");
             }
             Err(_) => {
-                warn!(url = %url, timeout = timeout_secs, "probe timed out");
+                warn!(url = %redact_url(&url), timeout = timeout_secs, "probe timed out");
             }
         }
     }
@@ -1618,6 +1680,32 @@ where
 #[cfg(test)]
 mod probe_tests {
     use super::*;
+
+    #[test]
+    fn media_stream_always_reports_its_required_fields() {
+        // Jellyfin 12 clients (SDK 1.9) fail to decode a MediaStream without them.
+        let value = serde_json::to_value(api::MediaStream::default()).unwrap();
+        for field in ["IsOriginal", "IsDefault"] {
+            assert_eq!(
+                value.get(field),
+                Some(&serde_json::Value::Bool(false)),
+                "{field}"
+            );
+        }
+        assert_eq!(value.get("Type"), Some(&serde_json::json!("Audio")));
+        // A stored stream saved without a type reads back as data.
+        let stored: api::MediaStream = serde_json::from_str(r#"{"Index":2}"#).unwrap();
+        assert_eq!(stored.type_, api::MediaStreamType::Data);
+    }
+
+    #[test]
+    fn ffprobe_original_disposition_is_read() {
+        let disposition: FfprobeDisposition =
+            serde_json::from_str(r#"{"default":0,"original":1}"#).unwrap();
+        assert_eq!(disposition.original, 1);
+        let missing: FfprobeDisposition = serde_json::from_str("{}").unwrap();
+        assert_eq!(missing.original, 0);
+    }
 
     #[test]
     fn bit_depth_from_pix_fmt_known_formats() {
@@ -1673,7 +1761,7 @@ mod probe_tests {
     fn is_reusable_probe_cache_accepts_real_probe_with_video() {
         let real = api::MediaSourceInfo {
             media_streams: vec![api::MediaStream {
-                type_: Some(api::MediaStreamType::Video),
+                type_: api::MediaStreamType::Video,
                 ..Default::default()
             }],
             remux: Some(api::MediaSourceRemuxInfo {
@@ -1683,6 +1771,75 @@ mod probe_tests {
             ..Default::default()
         };
         assert!(is_reusable_probe_cache(&real));
+    }
+
+    #[test]
+    fn a_probe_stored_without_attachments_reads_as_unknown() {
+        // RemuxDB records and probes from before attachments were recorded
+        // carry no list: that's "never read", not "the file has none".
+        let stored: api::MediaSourceInfo =
+            serde_json::from_str(r#"{"MediaStreams":[]}"#).unwrap();
+        assert_eq!(stored.media_attachments, None);
+    }
+
+    #[test]
+    fn probe_lists_mkv_attachments() {
+        // Needs ffmpeg/ffprobe on PATH; skip where they aren't.
+        let ffmpeg = crate::tools::ffmpeg();
+        if std::process::Command::new(&ffmpeg)
+            .arg("-version")
+            .output()
+            .is_err()
+        {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let font = dir
+            .path()
+            .join("Gandhi Sans.ttf");
+        std::fs::write(&font, b"font bytes").unwrap();
+        let mkv = dir
+            .path()
+            .join("in.mkv");
+        let status = std::process::Command::new(&ffmpeg)
+            .args([
+                "-y", "-v", "error", "-f", "lavfi", "-i", "anullsrc", "-t", "1",
+            ])
+            .arg("-attach")
+            .arg(&font)
+            .args(["-metadata:s:t", "mimetype=font/ttf", "-c:a", "pcm_s16le"])
+            .arg(&mkv)
+            .status()
+            .unwrap();
+        assert!(status.success());
+
+        let (info, _) = probe_media(
+            mkv.to_str()
+                .unwrap(),
+        )
+        .unwrap();
+        let attachments = info
+            .media_attachments
+            .expect("an ffprobe result records its attachments");
+        assert_eq!(attachments.len(), 1);
+        let a = &attachments[0];
+        assert_eq!(a.index, 1);
+        assert_eq!(
+            a.file_name
+                .as_deref(),
+            Some("Gandhi Sans.ttf")
+        );
+        assert_eq!(
+            a.mime_type
+                .as_deref(),
+            Some("font/ttf")
+        );
+        // Attachments are not media streams.
+        assert!(
+            info.media_streams
+                .iter()
+                .all(|s| s.index != 1)
+        );
     }
 
     #[test]
@@ -1737,7 +1894,7 @@ mod probe_tests {
     fn is_reusable_probe_cache_accepts_remuxdb_match_with_video() {
         let remuxdb = api::MediaSourceInfo {
             media_streams: vec![api::MediaStream {
-                type_: Some(api::MediaStreamType::Video),
+                type_: api::MediaStreamType::Video,
                 ..Default::default()
             }],
             remux: Some(api::MediaSourceRemuxInfo {
@@ -1760,7 +1917,7 @@ mod probe_tests {
         ] {
             let incomplete = api::MediaSourceInfo {
                 media_streams: vec![api::MediaStream {
-                    type_: Some(api::MediaStreamType::Video),
+                    type_: api::MediaStreamType::Video,
                     codec: Some(codec.to_string()),
                     ref_frames,
                     ..Default::default()
@@ -1782,7 +1939,7 @@ mod probe_tests {
     fn failed_refresh_can_fall_back_to_real_but_stale_probe_data() {
         let stale = api::MediaSourceInfo {
             media_streams: vec![api::MediaStream {
-                type_: Some(api::MediaStreamType::Video),
+                type_: api::MediaStreamType::Video,
                 codec: Some("h264".to_string()),
                 ..Default::default()
             }],
@@ -1803,7 +1960,7 @@ mod probe_tests {
 
         let local_probe = api::MediaSourceInfo {
             media_streams: vec![api::MediaStream {
-                type_: Some(api::MediaStreamType::Video),
+                type_: api::MediaStreamType::Video,
                 codec: Some("h264".to_string()),
                 ..Default::default()
             }],
@@ -1823,7 +1980,7 @@ mod probe_tests {
         // a completed probe, or a real ffprobe never runs for this source.
         let guess = api::MediaSourceInfo {
             media_streams: vec![api::MediaStream {
-                type_: Some(api::MediaStreamType::Video),
+                type_: api::MediaStreamType::Video,
                 codec: Some("hevc".to_string()),
                 ..Default::default()
             }],
@@ -1840,7 +1997,7 @@ mod probe_tests {
     fn is_reusable_probe_cache_rejects_no_video_stream() {
         let audio_only = api::MediaSourceInfo {
             media_streams: vec![api::MediaStream {
-                type_: Some(api::MediaStreamType::Audio),
+                type_: api::MediaStreamType::Audio,
                 ..Default::default()
             }],
             remux: Some(api::MediaSourceRemuxInfo {
@@ -1898,7 +2055,7 @@ mod probe_tests {
         Ok((
             api::MediaSourceInfo {
                 media_streams: vec![MediaStream {
-                    type_: Some(MediaStreamType::Video),
+                    type_: MediaStreamType::Video,
                     ..Default::default()
                 }],
                 ..Default::default()
@@ -2135,7 +2292,7 @@ mod probe_tests {
             api::MediaSourceInfo {
                 run_time_ticks: Some(short_ticks),
                 media_streams: vec![MediaStream {
-                    type_: Some(MediaStreamType::Video),
+                    type_: MediaStreamType::Video,
                     ..Default::default()
                 }],
                 ..Default::default()
@@ -2164,6 +2321,43 @@ mod probe_tests {
             effective.id, fallback_id,
             "short primary skipped — effective stream must be the fallback"
         );
+    }
+
+    /// A trailer is short by nature, so its length doesn't mark it as a
+    /// placeholder: a 2-minute trailer plays.
+    #[tokio::test]
+    async fn a_short_trailer_is_not_rejected() {
+        let db = test_db().await;
+        let short_probe = Ok((
+            api::MediaSourceInfo {
+                run_time_ticks: Some(120_i64 * 10_000_000),
+                media_streams: vec![MediaStream {
+                    type_: MediaStreamType::Video,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+            MediaSegments::default(),
+        ));
+        let mut trailer = http_media("http://a.example.com");
+        trailer.kind = db::MediaKind::Trailer;
+        let trailer_id = trailer.id;
+        let all = vec![trailer.clone()];
+        let (_, effective) = probe_with_fallback(
+            trailer,
+            Some("http://a.example.com".to_string()),
+            10,
+            true,
+            5,
+            &all,
+            false,
+            3000,
+            &db,
+            queued_probe(vec![short_probe]),
+        )
+        .await
+        .unwrap();
+        assert_eq!(effective.id, trailer_id);
     }
 
     #[tokio::test]
@@ -2450,7 +2644,7 @@ mod timeout_tests {
 
 #[cfg(test)]
 mod redact_tests {
-    use super::redact_url;
+    use super::{redact_url, redact_urls_in};
 
     #[test]
     fn http_urls_lose_credentials_path_and_query() {
@@ -2459,6 +2653,21 @@ mod redact_tests {
             "https://cdn.example:8443/…"
         );
         assert_eq!(redact_url("http://host/a.mkv"), "http://host/…");
+    }
+
+    #[test]
+    fn urls_inside_tool_output_are_redacted() {
+        assert_eq!(
+            redact_urls_in(
+                "Input #0, matroska, from 'http://127.0.0.1:3000/stream/abc?token=s3cret':"
+            ),
+            "Input #0, matroska, from 'http://127.0.0.1:3000/…':"
+        );
+        assert_eq!(
+            redact_urls_in("-i https://cdn/x.mkv?sig=1 -c:v copy"),
+            "-i https://cdn/… -c:v copy"
+        );
+        assert_eq!(redact_urls_in("http://[bad/s3cret"), "http://…");
     }
 
     #[test]

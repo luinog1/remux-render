@@ -2,7 +2,6 @@ use anyhow::Result;
 use async_trait::async_trait;
 use futures::{Stream, StreamExt};
 use std::{pin::Pin, sync::Arc, time::Duration};
-use tokio::sync::Mutex;
 use tracing::{debug, warn};
 use uuid::Uuid;
 
@@ -79,14 +78,25 @@ inventory::submit! {
 
 pub struct TmdbAddon;
 
+/// The path of a TMDB image file as a bitmap. A logo may be an SVG, which
+/// some clients cannot display; TMDB serves the same logo as a PNG when the
+/// path ends `.png`.
+fn tmdb_file(path: &str) -> std::borrow::Cow<'_, str> {
+    match path.strip_suffix(".svg") {
+        Some(stem) => format!("{stem}.png").into(),
+        None => path.into(),
+    }
+}
+
 fn tmdb_image(path: Option<&str>, kind: db::ImageKind) -> Option<String> {
     let size = match kind {
-        db::ImageKind::Backdrop => "w1280",
-        db::ImageKind::Logo => "w500",
+        // A logo is proxied as is, never resized for the client, so it has
+        // to be sharp on a 4K screen: 500px was visibly soft there.
+        db::ImageKind::Backdrop | db::ImageKind::Logo => "w1280",
         db::ImageKind::Primary | db::ImageKind::Thumb => "w780",
     };
     path.filter(|p| !p.is_empty())
-        .map(|p| format!("https://image.tmdb.org/t/p/{}{}", size, p))
+        .map(|p| format!("https://image.tmdb.org/t/p/{}{}", size, tmdb_file(p)))
 }
 
 #[async_trait]
@@ -516,7 +526,7 @@ impl From<&sdks::tmdb::Season> for db::Media {
             description: s
                 .overview
                 .clone()
-                .filter(|o| !o.is_empty()),
+                .and_then(|o| db::NonEmptyString::try_new(o).ok()),
             idx: Some(s.season_number),
             external_ids: tmdb_external_ids(
                 s.id,
@@ -559,7 +569,7 @@ impl From<&sdks::tmdb::Episode> for db::Media {
             description: ep
                 .overview
                 .clone()
-                .filter(|o| !o.is_empty()),
+                .and_then(|o| db::NonEmptyString::try_new(o).ok()),
             idx: Some(ep.episode_number),
             parent_idx: Some(ep.season_number),
             external_ids: tmdb_external_ids(
@@ -686,6 +696,9 @@ async fn tmdb_series_seasons(
                 .with_cache(Duration::from_secs(360)),
         )
         .await?;
+    // Fetched once here, before the seasons below list their episodes
+    // concurrently and would each miss the cache at the same time.
+    cinemeta_episodes(series, ctx).await;
 
     let series_key = series.series_canonical_key();
 
@@ -731,25 +744,22 @@ async fn tmdb_season_episodes(
         .await
         .ok()
         .and_then(|c| c.preferred_metadata_language);
-    let season_details = client
-        .execute(
-            sdks::tmdb::SeasonEndpoint {
-                series_id: series_tmdb_id,
-                season_number: season_number as i64,
-                language: preferred_language,
-                append_to_response: None,
-            }
-            .with_cache(Duration::from_secs(360)),
-        )
-        .await?;
+    let season_details = localized_season(
+        &client,
+        series_tmdb_id,
+        season_number as i64,
+        preferred_language,
+    )
+    .await?;
 
     let anchor = gp.series_canonical_key();
-    let episodes: Vec<db::Media> = season_details
+    let mut episodes: Vec<db::Media> = season_details
         .episodes
+        .as_deref()
         .unwrap_or_default()
-        .into_iter()
+        .iter()
         .map(|ep| {
-            let mut stub = db::Media::from(&ep);
+            let mut stub = db::Media::from(ep);
             stub.id =
                 db::Media::episode_id(&anchor, ep.season_number, ep.episode_number);
             stub.parent_id = Some(db::Media::season_id(&anchor, ep.season_number));
@@ -757,11 +767,226 @@ async fn tmdb_season_episodes(
             stub
         })
         .collect::<Vec<_>>();
+    add_episode_external_ids(&client, series_tmdb_id, season_number, &mut episodes)
+        .await;
+    if let (Some(cinemeta), Some(imdb)) = (
+        cinemeta_episodes(gp, ctx).await,
+        gp.external_ids
+            .imdb
+            .as_deref(),
+    ) {
+        add_stremio_ids(&cinemeta, imdb, &mut episodes);
+    }
 
     if episodes.is_empty() {
         Ok(None)
     } else {
         Ok(Some(episodes))
+    }
+}
+
+/// A season in the metadata language. TMDB answers an episode nobody
+/// translated with a made-up name ("Folge 26") and an empty overview, so an
+/// episode without an overview takes its name and overview from TMDB's
+/// default-language answer. That answer has the real name even when nobody
+/// wrote an overview yet, as for new episodes and specials. That is one more
+/// call, cached, and only for a season with such an episode.
+async fn localized_season(
+    client: &sdks::RestClient<sdks::BearerAuth>,
+    series_id: i64,
+    season_number: i64,
+    language: Option<String>,
+) -> Result<Arc<sdks::tmdb::Season>> {
+    let season = |language| {
+        client.execute_arc(
+            sdks::tmdb::SeasonEndpoint {
+                series_id,
+                season_number,
+                language,
+                append_to_response: None,
+            }
+            .with_cache(Duration::from_secs(360)),
+        )
+    };
+    let has_language = language
+        .as_deref()
+        .is_some_and(|l| !l.is_empty());
+    let localized = season(language).await?;
+    let untranslated = |e: &sdks::tmdb::Episode| {
+        e.overview
+            .as_deref()
+            .is_none_or(|o| {
+                o.trim()
+                    .is_empty()
+            })
+    };
+    if !has_language
+        || !localized
+            .episodes
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .any(untranslated)
+    {
+        return Ok(localized);
+    }
+    let default = match season(None).await {
+        Ok(default) => default,
+        Err(e) => {
+            debug!(series_id, season_number, error = %e, "default-language season failed");
+            return Ok(localized);
+        }
+    };
+    let mut merged = (*localized).clone();
+    for episode in merged
+        .episodes
+        .iter_mut()
+        .flatten()
+        .filter(|e| untranslated(e))
+    {
+        if let Some(fallback) = default
+            .episodes
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .find(|d| d.episode_number == episode.episode_number)
+        {
+            episode.name = fallback
+                .name
+                .clone();
+            episode.overview = fallback
+                .overview
+                .clone();
+        }
+    }
+    Ok(Arc::new(merged))
+}
+
+/// Gives each episode of a season its own TVDB and IMDb id. TMDB's season
+/// listing has none, and they are what pins an episode to the right video of
+/// an addon that numbers the show differently (Cinemeta follows IMDb/TVDB):
+/// see `match_episode_video`. Asked [`MAX_APPENDS`] episodes per call rather
+/// than one call per episode, and cached for a day since they don't change.
+/// A failed call leaves those episodes without, to be matched by title.
+///
+/// [`MAX_APPENDS`]: sdks::tmdb::series::MAX_APPENDS
+async fn add_episode_external_ids(
+    client: &sdks::RestClient<sdks::BearerAuth>,
+    series_tmdb_id: i64,
+    season_number: i64,
+    episodes: &mut [db::Media],
+) {
+    let numbers: Vec<i64> = episodes
+        .iter()
+        .filter_map(|e| e.idx)
+        .collect();
+    let batches = futures::future::join_all(
+        numbers
+            .chunks(sdks::tmdb::series::MAX_APPENDS)
+            .map(|chunk| {
+                client.execute(
+                    sdks::tmdb::series::EpisodeExternalIdsBatchEndpoint {
+                        series_id: series_tmdb_id,
+                        season_number,
+                        episode_numbers: chunk.to_vec(),
+                    }
+                    .with_cache(Duration::from_secs(86400)),
+                )
+            }),
+    )
+    .await;
+    for batch in batches {
+        let batch = match batch {
+            Ok(batch) => batch,
+            Err(e) => {
+                debug!(series_tmdb_id, season_number, error = %e, "episode external ids failed");
+                continue;
+            }
+        };
+        for episode in episodes.iter_mut() {
+            let Some(ids) = episode
+                .idx
+                .and_then(|idx| batch.get(season_number, idx))
+            else {
+                continue;
+            };
+            episode
+                .external_ids
+                .tvdb = ids.tvdb_id;
+            episode
+                .external_ids
+                .imdb = ids
+                .imdb_id
+                .clone()
+                .and_then(|s| db::NonEmptyString::try_new(s).ok());
+        }
+    }
+}
+
+/// Cinemeta's episodes of `series`, by its IMDb id: TVDB's aired order,
+/// which stream addons read episode ids in. `None` without an IMDb id or
+/// when Cinemeta can't be reached; the episodes are then asked for by our
+/// own numbers, as before.
+async fn cinemeta_episodes(
+    series: &db::Media,
+    ctx: &AppContext,
+) -> Option<Arc<sdks::cinemeta::SeriesEpisodes>> {
+    let imdb_id = series
+        .external_ids
+        .imdb
+        .as_deref()?
+        .to_string();
+    let client = sdks::cinemeta::client(
+        &ctx.config
+            .cinemeta_base_url,
+    )
+    .ok()?;
+    match client
+        .execute_arc(
+            sdks::cinemeta::SeriesEpisodesEndpoint {
+                imdb_id: imdb_id.clone(),
+            }
+            .with_cache(Duration::from_secs(6 * 3600)),
+        )
+        .await
+    {
+        Ok(episodes) => Some(episodes),
+        Err(e) => {
+            debug!(imdb_id, error = %e, "cinemeta episodes failed");
+            None
+        }
+    }
+}
+
+/// Gives each episode the Stremio id stream addons know it by: the series'
+/// IMDb id with the season and episode in TVDB's aired order, as Cinemeta
+/// lists it. Ours are TMDB's, which can differ (PAW Patrol's S2E14 is their
+/// S2E9), and asking by them gets another episode's streams. Found by TVDB
+/// id, or for an episode TMDB has none for, by a title no other episode
+/// shares, ignoring case. Set even when the numbers agree, so a stored one
+/// can't go stale.
+fn add_stremio_ids(
+    cinemeta: &sdks::cinemeta::SeriesEpisodes,
+    series_imdb: &str,
+    episodes: &mut [db::Media],
+) {
+    for episode in episodes.iter_mut() {
+        let listed = match episode
+            .external_ids
+            .tvdb
+        {
+            Some(id) => cinemeta.by_tvdb_id(id),
+            None => cinemeta.by_name(&episode.title),
+        };
+        let Some(listed) = listed else {
+            continue;
+        };
+        episode
+            .external_ids
+            .custom_stremio_id = Some(format!(
+            "{series_imdb}:{}:{}",
+            listed.season, listed.episode
+        ));
     }
 }
 
@@ -826,75 +1051,12 @@ fn rating_age(label: &str, country: &str) -> Option<i32> {
         .or_else(|| crate::localization::ratings::resolve_rating_age(Some(label), None))
 }
 
-fn build_crew_relations(
-    left_media_id: uuid::Uuid,
-    credits: &sdks::tmdb::Credits,
-) -> Vec<(db::MediaRelation, db::Media)> {
-    let mut relations = Vec::new();
-    for (i, member) in credits
-        .crew
-        .iter()
-        .enumerate()
-    {
-        let role = match member
-            .job
-            .as_str()
-        {
-            "Director" => Some(db::RelationRole::Director),
-            "Writer" | "Screenplay" | "Author" => Some(db::RelationRole::Writer),
-            "Producer" | "Executive Producer" | "Co-Producer" => {
-                Some(db::RelationRole::Producer)
-            }
-            _ => None,
-        };
-        if let Some(role) = role {
-            let person_id = common::stable_media_uuid(
-                &db::MediaKind::Person,
-                &member
-                    .id
-                    .to_string(),
-            );
-            let mut person = db::Media {
-                id: person_id,
-                title: member
-                    .name
-                    .clone(),
-                kind: db::MediaKind::Person,
-                external_ids: db::ExternalIds {
-                    tmdb: Some(member.id),
-                    ..Default::default()
-                },
-                ..Default::default()
-            };
-            if let Some(url) = tmdb_image(
-                member
-                    .profile_path
-                    .as_deref(),
-                db::ImageKind::Primary,
-            ) {
-                person.set_image(db::ImageKind::Primary, url);
-            }
-            relations.push((
-                db::MediaRelation {
-                    left_media_id,
-                    right_media_id: person_id,
-                    weight: Some(i as i64),
-                    role: Some(role),
-                    ..Default::default()
-                },
-                person,
-            ));
-        }
-    }
-    relations
-}
-
 fn build_person_relations(
     left_media_id: uuid::Uuid,
     credits: &sdks::tmdb::Credits,
 ) -> Vec<(db::MediaRelation, db::Media)> {
     let mut relations = Vec::new();
-    for (i, member) in credits
+    for (_i, member) in credits
         .cast
         .iter()
         .enumerate()
@@ -1203,6 +1365,7 @@ fn watch_provider_tags(
 /// Without `include_image_language`, TMDB restricts `images.backdrops`/
 /// `logos` to the request's `language` plus untagged entries, so an "en"
 /// entry never comes back unless the configured language already is "en".
+/// Videos are requested in the same languages, for the same reason.
 fn thumb_and_logo_languages(preferred_language: Option<&str>) -> String {
     let mut langs = vec!["en", "null"];
     if let Some(primary) = preferred_language.and_then(|l| {
@@ -1214,6 +1377,38 @@ fn thumb_and_logo_languages(preferred_language: Option<&str>) -> String {
         langs.insert(0, primary);
     }
     langs.join(",")
+}
+
+/// At most this many TMDB trailers per item; the rest are mostly the same
+/// trailer in other cuts or languages.
+const MAX_TMDB_TRAILERS: usize = 5;
+
+/// The YouTube trailers of a movie or series, best first. `None` when TMDB
+/// sent no videos, so the trailers other addons found are kept.
+fn tmdb_trailers(
+    videos: Option<&sdks::tmdb::Videos>,
+    preferred_language: Option<&str>,
+) -> Option<Vec<db::Trailer>> {
+    let language = preferred_language.and_then(|l| {
+        l.split('-')
+            .next()
+    });
+    Some(
+        videos?
+            .youtube_trailers(language)
+            .into_iter()
+            .take(MAX_TMDB_TRAILERS)
+            .map(|v| db::Trailer {
+                source: db::TrailerSource::Youtube(
+                    v.key
+                        .clone(),
+                ),
+                name: v
+                    .name
+                    .clone(),
+            })
+            .collect(),
+    )
 }
 
 async fn fetch_tmdb_meta(
@@ -1253,6 +1448,11 @@ async fn fetch_tmdb_meta(
                                 .clone(),
                         )
                         .with_image_languages(thumb_and_logo_languages(
+                            config
+                                .preferred_metadata_language
+                                .as_deref(),
+                        ))
+                        .with_videos(thumb_and_logo_languages(
                             config
                                 .preferred_metadata_language
                                 .as_deref(),
@@ -1349,7 +1549,9 @@ async fn fetch_tmdb_meta(
                 };
                 let mut patch = db::Media {
                     title: movie_details.title,
-                    description: movie_details.overview,
+                    description: movie_details
+                        .overview
+                        .and_then(|o| db::NonEmptyString::try_new(o).ok()),
                     released_at: movie_details
                         .release_date
                         .and_then(|d| d.and_hms_opt(0, 0, 0)),
@@ -1366,6 +1568,14 @@ async fn fetch_tmdb_meta(
                         movie_details
                             .original_language
                             .clone(),
+                    ),
+                    trailers: tmdb_trailers(
+                        movie_details
+                            .videos
+                            .as_ref(),
+                        config
+                            .preferred_metadata_language
+                            .as_deref(),
                     ),
                     ..Default::default()
                 };
@@ -1435,6 +1645,11 @@ async fn fetch_tmdb_meta(
                                 .clone(),
                         )
                         .with_image_languages(thumb_and_logo_languages(
+                            config
+                                .preferred_metadata_language
+                                .as_deref(),
+                        ))
+                        .with_videos(thumb_and_logo_languages(
                             config
                                 .preferred_metadata_language
                                 .as_deref(),
@@ -1538,7 +1753,9 @@ async fn fetch_tmdb_meta(
                 };
                 let mut patch = db::Media {
                     title: tv_details.name,
-                    description: tv_details.overview,
+                    description: tv_details
+                        .overview
+                        .and_then(|o| db::NonEmptyString::try_new(o).ok()),
                     released_at: tv_details
                         .first_air_date
                         .and_then(|d| d.and_hms_opt(0, 0, 0)),
@@ -1555,6 +1772,14 @@ async fn fetch_tmdb_meta(
                     ),
                     status,
                     end_date,
+                    trailers: tmdb_trailers(
+                        tv_details
+                            .videos
+                            .as_ref(),
+                        config
+                            .preferred_metadata_language
+                            .as_deref(),
+                    ),
                     ..Default::default()
                 };
                 if let Some(url) = tmdb_image(
@@ -1660,19 +1885,15 @@ async fn fetch_tmdb_meta(
                 // Borrow the cached season rather than taking it by value: this runs
                 // once per episode, and copying every episode's overview/credits/
                 // guest stars just to read one of them is quadratic per season.
-                let season = client
-                    .execute_arc(
-                        sdks::tmdb::SeasonEndpoint {
-                            series_id: tmdb_id,
-                            season_number: s_n,
-                            language: config
-                                .preferred_metadata_language
-                                .clone(),
-                            append_to_response: None,
-                        }
-                        .with_cache(Duration::from_secs(360)),
-                    )
-                    .await?;
+                let season = localized_season(
+                    &client,
+                    tmdb_id,
+                    s_n,
+                    config
+                        .preferred_metadata_language
+                        .clone(),
+                )
+                .await?;
                 let Some(ep) = season
                     .episodes
                     .as_deref()
@@ -1729,7 +1950,7 @@ async fn fetch_tmdb_meta(
             let mut patch = db::Media {
                 description: details
                     .biography
-                    .filter(|b| !b.is_empty()),
+                    .and_then(|b| db::NonEmptyString::try_new(b).ok()),
                 released_at,
                 country: details
                     .place_of_birth
@@ -1965,8 +2186,9 @@ fn map_remote_image(
     type_label: &str,
     entry: &sdks::tmdb::ImageEntry,
 ) -> api::RemoteImageInfo {
-    let url = format!("https://image.tmdb.org/t/p/original{}", entry.file_path);
-    let thumb = format!("https://image.tmdb.org/t/p/w300{}", entry.file_path);
+    let file = tmdb_file(&entry.file_path);
+    let url = format!("https://image.tmdb.org/t/p/original{file}");
+    let thumb = format!("https://image.tmdb.org/t/p/w300{file}");
     api::RemoteImageInfo {
         provider_name: Some("TheMovieDb".to_string()),
         url: Some(url),
@@ -2274,6 +2496,76 @@ mod tests {
     use remux_sdks::Endpoint;
 
     #[test]
+    fn episodes_get_the_stremio_id_of_their_tvdb_numbering() {
+        let cinemeta: sdks::cinemeta::SeriesEpisodes =
+            serde_json::from_value(serde_json::json!({"meta": {"videos": [
+                {"season": 2, "episode": 9, "tvdb_id": 5050934},
+                {"season": 12, "episode": 1, "name": "Pups Save a Pop Star", "tvdb_id": 11754905}
+            ]}}))
+            .unwrap();
+        let episode = |idx, tvdb, title: &str| db::Media {
+            kind: db::MediaKind::Episode,
+            title: title.to_string(),
+            parent_idx: Some(2),
+            idx: Some(idx),
+            external_ids: db::ExternalIds {
+                tvdb,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut episodes = vec![
+            episode(14, Some(5050934), "The New Pup"),
+            episode(15, Some(1), "Pups Save a Pop Star"),
+            episode(16, None, "Pups Save a Pop Star"),
+            episode(17, None, "Unknown"),
+        ];
+        add_stremio_ids(&cinemeta, "tt3121722", &mut episodes);
+        let ids: Vec<_> = episodes
+            .iter()
+            .map(|e| {
+                e.external_ids
+                    .custom_stremio_id
+                    .as_deref()
+            })
+            .collect();
+        assert_eq!(
+            ids,
+            [Some("tt3121722:2:9"), None, Some("tt3121722:12:1"), None]
+        );
+    }
+
+    #[test]
+    fn tmdb_trailers_are_youtube_trailers_and_absent_without_videos() {
+        assert!(tmdb_trailers(None, Some("en-US")).is_none());
+        let videos: sdks::tmdb::Videos = serde_json::from_value(serde_json::json!({"results": [
+            {"key": "abc", "site": "YouTube", "type": "Trailer", "name": "Official Trailer"}
+        ]}))
+        .unwrap();
+        assert_eq!(
+            tmdb_trailers(Some(&videos), Some("en-US")),
+            Some(vec![db::Trailer {
+                source: db::TrailerSource::Youtube("abc".to_string()),
+                name: Some("Official Trailer".to_string()),
+            }])
+        );
+    }
+
+    #[test]
+    fn detail_requests_ask_for_videos_in_the_image_languages() {
+        let endpoint = sdks::tmdb::MovieEndpoint::new(1, Some("de-DE".to_string()))
+            .with_videos(thumb_and_logo_languages(Some("de-DE")));
+        let query = serde_json::to_value(endpoint.query_params()).unwrap();
+        assert_eq!(query["include_video_language"], "de,en,null");
+        assert!(
+            query["append_to_response"]
+                .as_str()
+                .unwrap()
+                .ends_with(",videos")
+        );
+    }
+
+    #[test]
     fn season_and_episode_external_ids_are_mapped() {
         let ids = sdks::tmdb::ExternalIds {
             imdb_id: Some("tt1234567".into()),
@@ -2389,6 +2681,36 @@ mod tests {
             iso_639_1: language.map(str::to_string),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn an_svg_logo_is_asked_for_as_png() {
+        assert_eq!(
+            tmdb_image(Some("/logo.svg"), db::ImageKind::Logo).as_deref(),
+            Some("https://image.tmdb.org/t/p/w1280/logo.png")
+        );
+        assert_eq!(
+            tmdb_image(Some("/logo.png"), db::ImageKind::Logo).as_deref(),
+            Some("https://image.tmdb.org/t/p/w1280/logo.png")
+        );
+        assert_eq!(
+            tmdb_image(Some("/poster.jpg"), db::ImageKind::Primary).as_deref(),
+            Some("https://image.tmdb.org/t/p/w780/poster.jpg")
+        );
+
+        let remote = map_remote_image("Logo", &image_entry("/logo.svg", Some("en")));
+        assert_eq!(
+            remote
+                .url
+                .as_deref(),
+            Some("https://image.tmdb.org/t/p/original/logo.png")
+        );
+        assert_eq!(
+            remote
+                .thumbnail_url
+                .as_deref(),
+            Some("https://image.tmdb.org/t/p/w300/logo.png")
+        );
     }
 
     #[test]
@@ -2585,7 +2907,8 @@ mod tests {
         assert_eq!(
             patch
                 .description
-                .as_deref(),
+                .as_deref()
+                .map(String::as_str),
             Some("From the surviving entry.")
         );
 
@@ -2695,5 +3018,122 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    fn season_json(episodes: &[(i64, &str, &str)]) -> serde_json::Value {
+        serde_json::json!({
+            "id": 1, "season_number": 1, "name": "Season 1",
+            "episodes": episodes.iter().map(|(n, name, overview)| serde_json::json!({
+                "id": n, "name": name, "overview": overview, "season_number": 1, "episode_number": n
+            })).collect::<Vec<_>>()
+        })
+    }
+
+    /// An episode without an overview in the metadata language takes its name
+    /// and overview from TMDB's default-language answer, also when that has no
+    /// overview either. A translated one keeps its own.
+    #[tokio::test]
+    async fn untranslated_episodes_fall_back_to_the_default_language() {
+        let tmdb = httpmock::MockServer::start();
+        tmdb.mock(|when, then| {
+            when.path("/tv/900301/season/1")
+                .query_param("language", "de");
+            then.status(200)
+                .json_body(season_json(&[
+                    (1, "Der Anfang", "Es beginnt."),
+                    (2, "Folge 2", ""),
+                    (3, "Folge 3", ""),
+                    (4, "Folge 4", ""),
+                ]));
+        });
+        let default = tmdb.mock(|when, then| {
+            when.path("/tv/900301/season/1")
+                .matches(|req| {
+                    !req.query_params
+                        .as_ref()
+                        .is_some_and(|q| {
+                            q.iter()
+                                .any(|(k, _)| k == "language")
+                        })
+                });
+            then.status(200)
+                .json_body(season_json(&[
+                    (1, "The Beginning", "It begins."),
+                    (2, "The Promise", "Subaru wakes up."),
+                    (3, "Curb Your Expectations", ""),
+                    (4, "Episode 4", ""),
+                ]));
+        });
+        let client = tmdb_client("test", &tmdb.base_url()).unwrap();
+        let season = localized_season(&client, 900301, 1, Some("de".into()))
+            .await
+            .unwrap();
+        let got: Vec<(&str, Option<&str>)> = season
+            .episodes
+            .as_deref()
+            .unwrap()
+            .iter()
+            .map(|e| {
+                (
+                    e.name
+                        .as_str(),
+                    e.overview
+                        .as_deref(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                ("Der Anfang", Some("Es beginnt.")),
+                ("The Promise", Some("Subaru wakes up.")),
+                ("Curb Your Expectations", Some("")),
+                ("Episode 4", Some("")),
+            ]
+        );
+        default.assert_hits(1);
+    }
+
+    /// The default-language answer is asked only when it can help: never
+    /// without a metadata language, nor for a season fully translated.
+    #[tokio::test]
+    async fn the_default_language_is_asked_only_for_a_gap() {
+        let tmdb = httpmock::MockServer::start();
+        tmdb.mock(|when, then| {
+            when.path("/tv/900302/season/1")
+                .query_param("language", "de");
+            then.status(200)
+                .json_body(season_json(&[(1, "Der Anfang", "Es beginnt.")]));
+        });
+        let default = tmdb.mock(|when, then| {
+            when.path_contains("/tv/900302/season/1")
+                .matches(|req| {
+                    !req.query_params
+                        .as_ref()
+                        .is_some_and(|q| {
+                            q.iter()
+                                .any(|(k, _)| k == "language")
+                        })
+                });
+            then.status(200)
+                .json_body(season_json(&[(1, "Episode 1", "")]));
+        });
+        let client = tmdb_client("test", &tmdb.base_url()).unwrap();
+        localized_season(&client, 900302, 1, Some("de".into()))
+            .await
+            .unwrap();
+        default.assert_hits(0);
+        let season = localized_season(&client, 900302, 1, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            season
+                .episodes
+                .as_deref()
+                .unwrap()[0]
+                .name,
+            "Episode 1"
+        );
+        default.assert_hits(1);
     }
 }
